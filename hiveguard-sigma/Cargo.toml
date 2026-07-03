@@ -1,0 +1,18 @@
+[package]
+name = "hiveguard-sigma"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hiveguard-core = { path = "../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+regex = "1"
+ipnet = "2"
+blake3 = "1"
+arc-swap = "1"
+notify = "6"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }

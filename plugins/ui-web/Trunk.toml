@@ -1,0 +1,20 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Limit the build to the wasm bin target — the lib target compiles for native.
+filehash = true
+
+[serve]
+# `trunk serve` runs a dev server with autoreload. The daemon should be
+# reachable at ws://localhost:8443/api/stream — see src/web/ws.rs.
+address = "127.0.0.1"
+port = 8080
+open = false
+
+[clean]
+dist = "dist"
+cargo = false
+
+[tools]
+# Pin tools to reproducible versions. Trunk auto-downloads them.
+wasm_bindgen = "0.2.100"

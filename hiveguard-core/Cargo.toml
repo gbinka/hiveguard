@@ -1,0 +1,38 @@
+[package]
+name = "hiveguard-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Default keeps the legacy behaviour — all modules compiled in.
+default = ["cluster"]
+
+# `cluster` — gates modules that are only useful when running in a multi-node
+# deployment: peer-trust scoring, anti-poisoning rate limits, and hashcash
+# proof-of-work for signed gossip records. Disabled in `distribution-minimal`
+# (fail2ban-style standalone) builds.
+#
+# Note: `crdt` and `hlc` deliberately stay unconditional — they are part of
+# the persisted WAL/snapshot v2 format and are needed even by single-node
+# deployments to read/write their own data.
+cluster = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+postcard = { version = "1", features = ["alloc"] }
+bincode = "1"
+crc32fast = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ipnet = { version = "2", features = ["serde"] }
+thiserror = "2"
+blake3 = "1"
+flate2 = "1"
+tracing = "0.1"
+dashmap = "5"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+regex = "1"

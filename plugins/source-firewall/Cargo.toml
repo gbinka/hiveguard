@@ -1,0 +1,21 @@
+[package]
+name = "hiveguard-plugin-source-firewall"
+version = "0.1.0"
+edition = "2021"
+description = "Firewall log source plugin (UFW/iptables) emitting PortAccess events for the port-scan detector"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tokio = { version = "1", features = ["fs", "rt", "sync"] }
+notify = "6"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

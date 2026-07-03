@@ -1,0 +1,6 @@
+# Pinned because current AWS SDK deps (aws-smithy-* via aws-config =1.8.11)
+# have an MSRV of 1.91.1. CI and local builds must use this or newer.
+[toolchain]
+channel = "1.91.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,17 @@
+[package]
+name = "hiveguard-plugin-scoring-default"
+version = "0.1.0"
+edition = "2021"
+description = "Default weighted-accumulator scoring engine plugin for HiveGuard"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ipnet = "2"
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

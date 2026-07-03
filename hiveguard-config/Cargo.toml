@@ -1,0 +1,17 @@
+[package]
+name = "hiveguard-config"
+version = "0.1.0"
+edition = "2021"
+description = "Core HiveGuard configuration (node, scoring, persistence, cluster) — plugin sections live with their plugins"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../hiveguard-plugin-api" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

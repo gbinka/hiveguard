@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "source.firewall",
+  "description": "Tail a firewall log (UFW/iptables kernel BLOCK entries) and emit PortAccess events for the port-scan detector.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "adapter": {
+      "type": "string",
+      "enum": ["ufw_file"],
+      "default": "ufw_file",
+      "description": "Data-source adapter. Currently only 'ufw_file' (tails a UFW/iptables log file) is implemented."
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "default": "/var/log/ufw.log",
+      "description": "Path to the firewall log file to tail."
+    },
+    "seek_to_end": {
+      "type": "boolean",
+      "default": true,
+      "description": "Start at end of file (follow new entries only). Keep true on first run so the existing backlog of BLOCK entries is NOT replayed into the detector."
+    },
+    "event_type": {
+      "type": "string",
+      "default": "PortAccess",
+      "description": "EventType to label emitted events. Defaults to PortAccess, which is what detector.port_scan consumes."
+    },
+    "block_marker": {
+      "type": "string",
+      "minLength": 1,
+      "default": "[UFW BLOCK]",
+      "description": "Substring a line must contain to be treated as a blocked connection. Use '[UFW BLOCK]' for UFW; set to your iptables LOG prefix otherwise."
+    },
+    "protocols": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Optional protocol allow-list (e.g. [\"TCP\", \"UDP\"]). When set, lines whose PROTO is not listed are skipped. Empty/omitted = all protocols."
+    }
+  }
+}

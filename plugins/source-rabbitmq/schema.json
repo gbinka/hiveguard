@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "source.rabbitmq",
+  "description": "RabbitMQ AMQP consumer log source. Full schema delegated to hiveguard_core::config::RabbitMqSourceConfig.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["amqp_url", "queue"],
+  "properties": {
+    "amqp_url": { "type": "string", "minLength": 1 },
+    "queue":    { "type": "string", "minLength": 1 }
+  }
+}

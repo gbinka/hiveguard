@@ -1,0 +1,23 @@
+[package]
+name = "hiveguard-migrate-config"
+version = "0.1.0"
+edition = "2021"
+description = "Convert legacy HiveGuard YAML configs into the new plugin-aware format with a `plugins:` list"
+
+[[bin]]
+name = "hiveguard-migrate-config"
+path = "src/main.rs"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../hiveguard-plugin-api" }
+hiveguard-config = { path = "../hiveguard-config" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+hiveguard-config = { path = "../hiveguard-config" }
+serde_yaml = "0.9"

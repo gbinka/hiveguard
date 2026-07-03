@@ -1,0 +1,14 @@
+[package]
+name = "hiveguard-plugin-enforcer-nftables"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-enforce = { path = "../../hiveguard-enforce" }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "source.cloudwatch",
+  "description": "AWS CloudWatch Logs poller. Full schema delegated to hiveguard_core::config::CloudWatchSourceConfig.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["log_group_names", "region"],
+  "properties": {
+    "log_group_names": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "region":          { "type": "string", "minLength": 1 }
+  }
+}

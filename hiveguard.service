@@ -1,0 +1,53 @@
+[Unit]
+Description=HiveGuard Intrusion Detection & Auto-Ban Daemon
+After=network.target
+Documentation=https://github.com/hiveguard/hiveguard
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/hiveguard -c /etc/hiveguard/config.yaml
+User=hiveguard
+Group=hiveguard
+RuntimeDirectory=hiveguard
+StateDirectory=hiveguard
+
+# Capabilities
+AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/hiveguard /run/hiveguard
+
+# Kernel hardening
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+
+# Device and process isolation
+PrivateDevices=true
+ProtectProc=invisible
+
+# Security restrictions
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+# Syscall filtering (seccomp) — allow only necessary syscalls
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @obsolete @cpu-emulation @debug
+SystemCallErrorNumber=EPERM
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+
+[Install]
+WantedBy=multi-user.target

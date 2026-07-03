@@ -1,0 +1,401 @@
+/*
+ * HiveGuard Web UI — Phase 5 styles.
+ *
+ * Hand-rolled minimal CSS. Tailwind / pico.css can be slotted in later;
+ * for now we keep the bundle dependency-free so `trunk build` is fast.
+ */
+
+:root {
+  --bg: #0f1419;
+  --bg-elev: #1a2029;
+  --bg-elev-2: #232a36;
+  --fg: #e6e6e6;
+  --muted: #8a96a3;
+  --accent: #ffb454;
+  --border: #2a313c;
+
+  --success: #1f9d55;
+  --info: #1e88e5;
+  --warning: #c97f1c;
+  --danger: #d83a3a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1rem 0;
+}
+
+/* ---------------------------------------------------------- Layout */
+
+.container {
+  max-width: 1200px;
+  margin: 1.5rem auto;
+  padding: 0 1rem;
+}
+
+/* ---------------------------------------------------------- Nav */
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-brand {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.nav-links {
+  list-style: none;
+  display: flex;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+}
+
+.nav-links a {
+  color: var(--fg);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+
+.nav-links a:hover { background: rgba(255, 255, 255, 0.05); }
+
+/* ---------------------------------------------------------- Dashboard */
+
+.dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.dashboard-header h1 { margin: 0; }
+
+.dashboard-actions {
+  margin-top: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.card h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.metric {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* ---------------------------------------------------------- Badges */
+
+.badge {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+
+.badge-success { background: rgba(31, 157, 85, 0.15); color: var(--success); border-color: var(--success); }
+.badge-info    { background: rgba(30, 136, 229, 0.15); color: var(--info);    border-color: var(--info); }
+.badge-warning { background: rgba(201, 127, 28, 0.15); color: var(--warning); border-color: var(--warning); }
+.badge-danger  { background: rgba(216, 58, 58, 0.15);  color: var(--danger);  border-color: var(--danger); }
+
+/* ---------------------------------------------------------- Buttons */
+
+.btn {
+  display: inline-block;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  cursor: pointer;
+  transition: filter 0.1s ease-in-out;
+}
+
+.btn:hover { filter: brightness(1.15); }
+.btn:active { filter: brightness(0.9); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  color: #1f1500;
+  border-color: var(--accent);
+}
+
+.btn-danger {
+  background: rgba(216, 58, 58, 0.15);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* ---------------------------------------------------------- Views */
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.view-header h1 { margin: 0 0 0.25rem 0; }
+
+.view-body {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.view-body-full {
+  display: block;
+}
+
+@media (max-width: 800px) {
+  .view-body { grid-template-columns: 1fr; }
+}
+
+/* ---------------------------------------------------------- Filters panel */
+
+.filters {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  position: sticky;
+  top: 1rem;
+}
+
+.filters h2 {
+  margin: 0;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.filter-field input[type="text"],
+.filter-field input[type="number"],
+.filter-field select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+}
+
+.filter-field input[type="range"] {
+  accent-color: var(--accent);
+}
+
+.filter-field input:focus,
+.filter-field select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ban-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+/* ---------------------------------------------------------- Tables */
+
+.table-wrap {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem;
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.data-table th {
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  background: var(--bg-elev-2);
+  position: sticky;
+  top: 0;
+}
+
+.data-table tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.data-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.data-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.data-table th.sortable:hover { color: var(--fg); }
+
+.sort-arrow {
+  margin-left: 0.25rem;
+  color: var(--accent);
+  font-size: 0.75rem;
+}
+
+.col-actions { width: 1%; white-space: nowrap; }
+
+/* ---------------------------------------------------------- Plugins view */
+
+.plugin-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.plugin-group {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem 1rem 1rem;
+}
+
+.plugin-group h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1rem;
+}
+
+.plugin-group .data-table th { background: transparent; }
+
+/* ---------------------------------------------------------- Config view */
+
+.config-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 1rem;
+  row-gap: 0.4rem;
+}
+
+.kv dt {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.kv dd {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* ---------------------------------------------------------- Empty state */
+
+.empty-state {
+  padding: 2rem;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty-state p { margin: 0.25rem 0; }
+
+/* ---------------------------------------------------------- Placeholder (404) */
+
+.placeholder {
+  background: var(--bg-elev);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+}

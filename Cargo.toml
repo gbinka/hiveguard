@@ -1,0 +1,89 @@
+[workspace]
+members = [
+    "hiveguard-core",
+    "hiveguard-ingest",
+    "hiveguard-net",
+    "hiveguard-enforce",
+    "hiveguard-daemon",
+    "hiveguard-bench",
+    # "hiveguard-tui" — legacy ratatui binary moved to obsolete/crates/.
+    # Replaced by `plugins/ui-tui/` (in development by parallel agent).
+    # "hiveguard-web" — legacy rust-embed SPA wrapper removed. The React panel
+    # now lives as a standalone project in ../hiveguard-web/ and talks to the
+    # ui.rest API over HTTP (CORS + Bearer). Serve its dist/ via ui.rest static_dir.
+    "hiveguard-cti",
+    "hiveguard-sigma",
+    "hiveguard-queue",
+    # Phase 0 — plugin architecture foundation.
+    "hiveguard-plugin-api",
+    "hiveguard-config",
+    "hiveguard-host",
+    "hiveguard-migrate-config",
+    # PREP phase — utilities + reference plugin.
+    "hiveguard-plugin-utils",
+    "plugins/notifier-webhook",
+    # Phase A3 — built-in detectors + scoring.
+    "plugins/detector-ssh-bruteforce",
+    "plugins/detector-path-probe",
+    "plugins/detector-http-4xx-flood",
+    "plugins/detector-http-login-bruteforce",
+    "plugins/detector-scanner-fingerprint",
+    "plugins/detector-smtp-bruteforce",
+    "plugins/detector-honeypot",
+    "plugins/detector-entropy",
+    "plugins/detector-timing",
+    "plugins/detector-port-scan",
+    "plugins/detector-distributed-slow",
+    "plugins/scoring-default",
+    # Phase A1 — log source plugins.
+    "plugins/source-file",
+    "plugins/source-firewall",
+    "plugins/source-syslog",
+    "plugins/source-journald",
+    "plugins/source-kafka",
+    "plugins/source-nats",
+    "plugins/source-rabbitmq",
+    "plugins/source-kinesis",
+    "plugins/source-cloudwatch",
+    # Phase B1 — render-agnostic UI library + UI plugin scaffolds.
+    "hiveguard-ui",
+    "plugins/ui-rest",
+    "plugins/ui-tui",
+    "plugins/ui-web",
+    # Phase B2 — SIEM sinks + extra notifier plugins.
+    "plugins/sink-syslog",
+    "plugins/sink-elastic",
+    "plugins/sink-splunk",
+    "plugins/sink-datadog",
+    "plugins/notifier-slack",
+    "plugins/notifier-teams",
+    "plugins/notifier-discord",
+    "plugins/notifier-telegram",
+    "plugins/notifier-pagerduty",
+    "plugins/notifier-email",
+    # Phase A2 — enforcery + CTI + Sigma plugins.
+    "plugins/enforcer-nftables",
+    "plugins/enforcer-cloudflare",
+    "plugins/enforcer-observe",
+    "plugins/enforcer-ipset",
+    "plugins/cti-abuseipdb",
+    "plugins/cti-spamhaus",
+    "plugins/cti-tor",
+    "plugins/cti-otx",
+    "plugins/cti-geoip",
+    "plugins/detector-sigma",
+]
+resolver = "2"
+exclude = ["fuzz"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
+[workspace.metadata]
+# AWS SDK 1.x requires Rust 1.88+ in newer versions.
+# The installed toolchain is 1.87.0. Use --ignore-rust-version when building.
+# Pinned AWS SDK versions in hiveguard-queue/Cargo.toml are compatible.
+
+# Pin minimum versions for security fixes (F-6)
+[workspace.dependencies]
+time = ">=0.3.47"

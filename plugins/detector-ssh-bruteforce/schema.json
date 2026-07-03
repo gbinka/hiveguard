@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "threshold": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "window_secs": { "type": "integer", "minimum": 1, "maximum": 604800 },
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "enum_threshold": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "enum_window_secs": { "type": "integer", "minimum": 1, "maximum": 604800 },
+    "enum_ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+  }
+}

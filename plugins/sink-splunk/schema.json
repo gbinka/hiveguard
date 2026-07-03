@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "sink.splunk",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["url", "token"],
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "Splunk HEC endpoint base URL (e.g. https://splunk.example.com:8088)."
+    },
+    "token": {
+      "type": "string",
+      "description": "Splunk HEC token. Supports ${env:VAR} secret resolution."
+    },
+    "index": { "type": ["string", "null"] },
+    "source": { "type": "string", "default": "hiveguard" },
+    "sourcetype": { "type": "string", "default": "_json" },
+    "batch_size": { "type": "integer", "default": 100, "minimum": 1 },
+    "flush_interval_secs": { "type": "integer", "default": 10, "minimum": 1 },
+    "timeout_secs": { "type": "integer", "default": 30, "minimum": 1 },
+    "verify_tls": { "type": "boolean", "default": true }
+  }
+}

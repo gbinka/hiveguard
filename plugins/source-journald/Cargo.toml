@@ -1,0 +1,19 @@
+[package]
+name = "hiveguard-plugin-source-journald"
+version = "0.1.0"
+edition = "2021"
+description = "systemd journal log source for HiveGuard (subprocess-backed journalctl follower)"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tokio = { version = "1", features = ["process", "io-util", "macros", "rt", "sync", "time"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

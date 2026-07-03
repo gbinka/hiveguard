@@ -1,0 +1,10 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules_dir"],
+  "properties": {
+    "rules_dir": { "type": "string", "minLength": 1 },
+    "hot_reload": { "type": "boolean" }
+  }
+}

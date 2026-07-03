@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "sink.syslog",
+  "description": "Forward HiveGuard events to a remote syslog server using RFC 5424.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["host"],
+  "properties": {
+    "host":       { "type": "string", "minLength": 1, "description": "host:port of the remote syslog daemon" },
+    "protocol":   { "type": "string", "enum": ["tcp", "udp"], "default": "tcp" },
+    "facility":   { "type": "integer", "minimum": 0, "maximum": 23, "default": 1, "description": "syslog facility, default 1 (user)" },
+    "severity":   { "type": "integer", "minimum": 0, "maximum": 7, "default": 5, "description": "syslog severity, default 5 (notice)" },
+    "hostname":   { "type": "string", "description": "Override hostname in syslog header (default: local hostname)" },
+    "app_name":   { "type": "string", "default": "hiveguard" }
+  }
+}

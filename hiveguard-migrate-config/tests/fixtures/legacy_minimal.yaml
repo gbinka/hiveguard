@@ -1,0 +1,51 @@
+node:
+  name: "fixture-node"
+  data_dir: "/var/lib/hiveguard"
+
+whitelist:
+  - "127.0.0.0/8"
+
+scoring:
+  ban_severity_threshold: 100
+
+sources:
+  ssh:
+    use_journald: true
+  nginx:
+    access_log: "/var/log/nginx/access.log"
+
+detectors:
+  ssh_bruteforce:
+    enabled: true
+    threshold: 5
+    window: "5m"
+    ban_duration: "24h"
+  ssh_user_enum:
+    enabled: true
+    threshold: 3
+    window: "2m"
+    ban_duration: "48h"
+  path_probe:
+    enabled: true
+    paths:
+      - "/wp-login.php"
+      - "/.env"
+    ban_duration: "72h"
+  honeypot:
+    enabled: true
+    paths:
+      - "/backup.sql"
+    ban_duration: "permanent"
+    severity: 250
+
+enforcement:
+  backend: "nftables"
+  nftables_set_name: "hiveguard_blocklist"
+  nftables_table: "hiveguard"
+
+alerting:
+  destinations:
+    - name: "slack-ops"
+      type: slack
+      url: "https://hooks.slack.com/services/AAA/BBB/CCC"
+      channel: "ops"

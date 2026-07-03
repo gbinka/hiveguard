@@ -1,0 +1,31 @@
+# === Rust build artifacts ===
+/target/
+**/target/
+*.rs.bk
+*.pdb
+
+# === Test data / fixtures ===
+test_data/
+
+# === Fuzzing artifacts (auto-generated inputs; keep fuzz_targets + Cargo.*) ===
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# === Frontend build artifacts (Trunk WASM in plugins/ui-*) ===
+# NOTE: The React panel is now a standalone project in ../hiveguard-web/.
+node_modules/
+**/node_modules/
+**/dist/
+
+# === Local secrets / runtime config (never commit) ===
+node.key
+*.key
+*.pem
+config.local.yaml
+config.yaml
+!config.example.yaml
+
+# === Editor / OS ===
+.DS_Store
+*.swp

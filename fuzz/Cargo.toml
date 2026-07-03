@@ -1,0 +1,69 @@
+[package]
+name = "hiveguard-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hiveguard-core = { path = "../hiveguard-core" }
+hiveguard-ingest = { path = "../hiveguard-ingest" }
+hiveguard-net = { path = "../hiveguard-net" }
+ipnet = "2"
+chrono = "0.4"
+tempfile = "3"
+postcard = { version = "1", features = ["alloc"] }
+regex = "1"
+
+[[bin]]
+name = "fuzz_ssh_parser"
+path = "fuzz_targets/fuzz_ssh_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_nginx_parser"
+path = "fuzz_targets/fuzz_nginx_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ban_store"
+path = "fuzz_targets/fuzz_ban_store.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_postfix_parser"
+path = "fuzz_targets/fuzz_postfix_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_custom_parser"
+path = "fuzz_targets/fuzz_custom_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_replay"
+path = "fuzz_targets/fuzz_wal_replay.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_snapshot_load"
+path = "fuzz_targets/fuzz_snapshot_load.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_crdt_merge"
+path = "fuzz_targets/fuzz_crdt_merge.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cluster_message"
+path = "fuzz_targets/fuzz_cluster_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_syslog_parser"
+path = "fuzz_targets/fuzz_syslog_parser.rs"
+doc = false

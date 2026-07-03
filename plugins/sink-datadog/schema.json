@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "sink.datadog",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["api_key"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "Datadog API key. Supports ${env:VAR} secret resolution."
+    },
+    "site": { "type": "string", "default": "datadoghq.com" },
+    "service": { "type": "string", "default": "hiveguard" },
+    "source": { "type": "string", "default": "hiveguard" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "batch_size": { "type": "integer", "default": 100, "minimum": 1 },
+    "flush_interval_secs": { "type": "integer", "default": 10, "minimum": 1 },
+    "timeout_secs": { "type": "integer", "default": 30, "minimum": 1 }
+  }
+}

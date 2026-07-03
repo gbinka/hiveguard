@@ -1,0 +1,773 @@
+openapi: 3.1.0
+info:
+  title: HiveGuard ui.rest API
+  version: "1.0.0"
+  description: |
+    HTTP + WebSocket management and telemetry API exposed by the `ui.rest`
+    plugin of the HiveGuard daemon. This is the consolidated REST surface
+    (legacy `api.*` + `ui.rest` merged — see API_REFACTOR.md).
+
+    ## Authentication
+    All endpoints under `/api/*` require a bearer token **except** the public
+    endpoints `GET /api/health`, `GET /api/stream` (WS) and `GET /metrics`.
+    Present it as `Authorization: Bearer <auth_token>` where `auth_token` is
+    the value configured for the plugin.
+
+    ## CORS
+    The server emits CORS headers only for the origins listed in the plugin's
+    `cors_origins` config. A standalone frontend (see `../hiveguard-web/`) must
+    have its origin whitelisted there, or be served same-origin via `static_dir`.
+
+    ## Schema source of truth
+    Response/request shapes mirror the Rust wire types in
+    `hiveguard-plugin-api/src/traits/ui_server.rs` 1:1.
+
+servers:
+  - url: http://127.0.0.1:8443
+    description: Default local bind (see plugin `bind_addr`).
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: telemetry
+  - name: bans
+  - name: whitelist
+  - name: cluster
+  - name: bots
+  - name: config
+  - name: sigma
+  - name: fail2ban
+  - name: plugins
+  - name: public
+
+paths:
+  /api/info:
+    get:
+      tags: [telemetry]
+      summary: Node metadata
+      operationId: getInfo
+      responses:
+        "200":
+          description: Node info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/stats:
+    get:
+      tags: [telemetry]
+      summary: Daemon-wide counters
+      operationId: getStats
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatsInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/threats:
+    get:
+      tags: [telemetry]
+      summary: Recent threat signals (ring buffer)
+      operationId: getThreats
+      responses:
+        "200":
+          description: Threat list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ThreatInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/bans:
+    get:
+      tags: [bans]
+      summary: List all active bans
+      description: Returns a bare array. The daemon does not paginate server-side.
+      operationId: listBans
+      responses:
+        "200":
+          description: Ban list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/BanInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [bans]
+      summary: Create a ban
+      operationId: createBan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BanRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/bans/{cidr}:
+    delete:
+      tags: [bans]
+      summary: Remove a ban
+      operationId: deleteBan
+      parameters:
+        - $ref: "#/components/parameters/Cidr"
+      responses:
+        "204": { description: Removed }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/whitelist:
+    get:
+      tags: [whitelist]
+      summary: List whitelist entries
+      operationId: getWhitelist
+      responses:
+        "200":
+          description: Whitelist
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WhitelistResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [whitelist]
+      summary: Add a whitelist entry
+      operationId: addWhitelist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cidr]
+              properties:
+                cidr: { type: string, examples: ["1.2.3.0/24"] }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/whitelist/{cidr}:
+    delete:
+      tags: [whitelist]
+      summary: Remove a whitelist entry
+      operationId: deleteWhitelist
+      parameters:
+        - $ref: "#/components/parameters/Cidr"
+      responses:
+        "204": { description: Removed }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/peers:
+    get:
+      tags: [cluster]
+      summary: Federation peers
+      operationId: getPeers
+      responses:
+        "200":
+          description: Peers
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PeersResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/bots:
+    get:
+      tags: [bots]
+      summary: Known/observed bot activity
+      operationId: getBots
+      responses:
+        "200":
+          description: Bot list (wrapped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bots:
+                    type: array
+                    items: { $ref: "#/components/schemas/BotStats" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/bots/{name}/policy:
+    post:
+      tags: [bots]
+      summary: Set a bot's policy
+      operationId: setBotPolicy
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policy]
+              properties:
+                policy: { type: string, enum: [allow, block, monitor] }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/config:
+    get:
+      tags: [config]
+      summary: Raw config.yaml content
+      operationId: getConfig
+      responses:
+        "200":
+          description: Config content
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigContentResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [config]
+      summary: Replace config.yaml content
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/config/detectors:
+    get:
+      tags: [config]
+      summary: Structured detector configuration
+      operationId: getDetectors
+      responses:
+        "200":
+          description: Detectors config
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetectorsConfig" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [config]
+      summary: Update detector configuration
+      operationId: putDetectors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DetectorsConfig" }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/fail2ban/preview:
+    get:
+      tags: [fail2ban]
+      summary: Preview bans in a fail2ban SQLite DB
+      operationId: fail2banPreview
+      parameters:
+        - name: db
+          in: query
+          required: false
+          schema: { type: string }
+          description: Path to fail2ban.sqlite3 (defaults to the daemon's configured path).
+        - name: jail
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Preview
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fail2banPreviewResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/fail2ban/import:
+    post:
+      tags: [fail2ban]
+      summary: Import bans from a fail2ban DB
+      operationId: fail2banImport
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                db: { type: string }
+                jail: { type: string }
+      responses:
+        "200":
+          description: Import outcome
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fail2banImportInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/sigma/rules:
+    get:
+      tags: [sigma]
+      summary: List loaded Sigma rules
+      operationId: listSigmaRules
+      responses:
+        "200":
+          description: Rule summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SigmaRuleSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [sigma]
+      summary: Upload a Sigma rule (YAML)
+      operationId: uploadSigmaRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [yaml]
+              properties:
+                yaml: { type: string }
+      responses:
+        "201":
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/sigma/rules/{id}:
+    get:
+      tags: [sigma]
+      summary: Full detail of one Sigma rule
+      operationId: getSigmaRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Rule detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SigmaRuleDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [sigma]
+      summary: Delete a Sigma rule
+      operationId: deleteSigmaRule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/sigma/stats:
+    get:
+      tags: [sigma]
+      summary: Aggregate Sigma statistics
+      operationId: getSigmaStats
+      responses:
+        "200":
+          description: Sigma stats
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SigmaStatsInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/plugins:
+    get:
+      tags: [plugins]
+      summary: Loaded plugin registry
+      operationId: getPlugins
+      responses:
+        "200":
+          description: Plugin list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PluginInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/ingest/logs:
+    post:
+      tags: [telemetry]
+      summary: HTTP-push log ingest (mounted only when ingest is enabled)
+      description: |
+        Carries its own bearer gate (`ingest.token`, falling back to
+        `auth_token`), a per-second rate limit, and a body-size cap.
+      operationId: ingestLogs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: Log line(s) in the daemon's accepted ingest format.
+              type: object
+      responses:
+        "202": { description: Accepted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { description: Payload too large }
+        "429": { description: Rate limited }
+
+  /api/health:
+    get:
+      tags: [public]
+      summary: Liveness probe (no auth)
+      operationId: getHealth
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                  uptime_secs: { type: integer, format: int64 }
+
+  /api/stream:
+    get:
+      tags: [public]
+      summary: WebSocket telemetry stream
+      description: |
+        WebSocket upgrade. The bearer token is validated on upgrade (query or
+        header, per deployment). Server pushes frames tagged by `type` with a
+        `data` payload — e.g. `bans_snapshot`, `plugins_snapshot`, `tick`
+        (keepalive ~30s). See the `WsFrame` enum in `ui_server.rs`.
+      operationId: stream
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /metrics:
+    get:
+      tags: [public]
+      summary: Prometheus / OpenMetrics exposition (no auth)
+      operationId: getMetrics
+      security: []
+      responses:
+        "200":
+          description: Metrics
+          content:
+            application/openmetrics-text:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Value of the plugin's `auth_token`.
+
+  parameters:
+    Cidr:
+      name: cidr
+      in: path
+      required: true
+      description: URL-encoded IP or CIDR (e.g. `1.2.3.4%2F32`).
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    BadRequest:
+      description: Malformed input
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+
+  schemas:
+    ApiError:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+
+    MessageResponse:
+      type: object
+      properties:
+        message: { type: string }
+      required: [message]
+
+    NodeInfo:
+      type: object
+      properties:
+        node_name: { type: string }
+        daemon_version: { type: string }
+        uptime_secs: { type: integer, format: int64, description: Seconds since daemon start. }
+        total_bans: { type: integer }
+      required: [node_name, daemon_version, uptime_secs, total_bans]
+
+    StatsInfo:
+      type: object
+      properties:
+        uptime_secs: { type: integer, format: int64 }
+        total_bans: { type: integer }
+        total_whitelisted: { type: integer }
+        version: { type: string }
+      required: [uptime_secs, total_bans, total_whitelisted, version]
+
+    ThreatInfo:
+      type: object
+      properties:
+        ip: { type: string }
+        severity: { type: integer, minimum: 0, maximum: 255 }
+        confidence: { type: integer, minimum: 0, maximum: 100 }
+        detector: { type: string }
+        reason: { type: string }
+        timestamp: { type: string, format: date-time }
+      required: [ip, severity, confidence, detector, reason, timestamp]
+
+    BanInfo:
+      type: object
+      properties:
+        subject: { type: string, description: "CIDR, e.g. 1.2.3.4/32 or 1.2.3.0/24." }
+        severity: { type: integer, minimum: 0, maximum: 255 }
+        reason: { type: string }
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: ISO 8601; null for permanent bans.
+        source: { type: string, description: "e.g. detector:ssh_bruteforce, peer:node-2, admin." }
+      required: [subject, severity, reason, expires_at, source]
+
+    BanRequest:
+      type: object
+      description: |
+        Server-side contract. `subject` is a CIDR string; `duration` uses serde's
+        default `std::time::Duration` encoding (`{secs, nanos}`).
+      properties:
+        subject: { type: string, examples: ["1.2.3.4/32"] }
+        duration:
+          type: object
+          properties:
+            secs: { type: integer, format: int64 }
+            nanos: { type: integer, format: int32 }
+          required: [secs, nanos]
+        reason: { type: string }
+      required: [subject, duration, reason]
+
+    WhitelistResponse:
+      type: object
+      properties:
+        entries:
+          type: array
+          items: { type: string }
+      required: [entries]
+
+    PeerInfo:
+      type: object
+      properties:
+        node_id: { type: string }
+        address: { type: string }
+        trust_score: { type: number, format: double }
+        state: { type: string }
+      required: [node_id, address, trust_score, state]
+
+    PeersResponse:
+      type: object
+      properties:
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerInfo" }
+      required: [peers]
+
+    BotStats:
+      type: object
+      description: Shape produced by the daemon's dynamic bots snapshot.
+      properties:
+        name: { type: string }
+        org: { type: string }
+        policy: { type: string, enum: [allow, block, monitor] }
+        request_count: { type: integer }
+        last_seen_ip: { type: string }
+        last_seen_ua: { type: string }
+        known: { type: boolean }
+      required: [name, org, policy, request_count, known]
+
+    ConfigContentResponse:
+      type: object
+      properties:
+        content: { type: string }
+      required: [content]
+
+    DetectorBase:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        threshold: { type: number }
+        window: { type: string, description: "Duration string, e.g. 60s, 5m." }
+        ban_duration: { type: string }
+        paths:
+          type: array
+          items: { type: string }
+      required: [enabled]
+
+    DetectorsConfig:
+      type: object
+      properties:
+        ssh_bruteforce: { $ref: "#/components/schemas/DetectorBase" }
+        ssh_user_enum: { $ref: "#/components/schemas/DetectorBase" }
+        path_probe: { $ref: "#/components/schemas/DetectorBase" }
+        http_4xx_flood: { $ref: "#/components/schemas/DetectorBase" }
+        http_login_bruteforce: { $ref: "#/components/schemas/DetectorBase" }
+        scanner_fingerprint: { $ref: "#/components/schemas/DetectorBase" }
+        smtp_bruteforce: { $ref: "#/components/schemas/DetectorBase" }
+        port_scan: { $ref: "#/components/schemas/DetectorBase" }
+        distributed_slow: { $ref: "#/components/schemas/DetectorBase" }
+        honeypot: { $ref: "#/components/schemas/DetectorBase" }
+        entropy: { $ref: "#/components/schemas/DetectorBase" }
+        timing: { $ref: "#/components/schemas/DetectorBase" }
+
+    SigmaLogSource:
+      type: object
+      properties:
+        category: { type: [string, "null"] }
+        product: { type: [string, "null"] }
+        service: { type: [string, "null"] }
+
+    SigmaRuleSummary:
+      type: object
+      properties:
+        id: { type: [string, "null"] }
+        title: { type: string }
+        status: { type: string }
+        level: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        hit_count: { type: integer, format: int64 }
+      required: [title, status, level, tags, hit_count]
+
+    SigmaRuleDetail:
+      type: object
+      properties:
+        id: { type: [string, "null"] }
+        title: { type: string }
+        status: { type: string }
+        level: { type: string }
+        description: { type: [string, "null"] }
+        author: { type: [string, "null"] }
+        date: { type: [string, "null"] }
+        tags:
+          type: array
+          items: { type: string }
+        references:
+          type: array
+          items: { type: string }
+        logsource: { $ref: "#/components/schemas/SigmaLogSource" }
+        condition: { type: string }
+        hit_count: { type: integer, format: int64 }
+      required: [title, status, level, tags, references, logsource, condition, hit_count]
+
+    SigmaStatsInfo:
+      type: object
+      properties:
+        total_rules: { type: integer }
+        hit_counts:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+      required: [total_rules, hit_counts]
+
+    Fail2banBanInfo:
+      type: object
+      properties:
+        jail: { type: string }
+        ip: { type: string }
+        banned_at: { type: string, format: date-time }
+        expires_at: { type: [string, "null"], format: date-time }
+      required: [jail, ip, banned_at, expires_at]
+
+    Fail2banPreviewResponse:
+      type: object
+      properties:
+        bans:
+          type: array
+          items: { $ref: "#/components/schemas/Fail2banBanInfo" }
+        total: { type: integer }
+      required: [bans, total]
+
+    Fail2banImportInfo:
+      type: object
+      properties:
+        imported: { type: integer }
+        skipped: { type: integer }
+        errors:
+          type: array
+          items: { type: string }
+      required: [imported, skipped, errors]
+
+    PluginInfo:
+      type: object
+      properties:
+        id: { type: string }
+        kind:
+          type: string
+          description: One of Source, Detector, Enforcer, Notifier, SiemSink, Cti, ScoringEngine, UiServer.
+        health:
+          type: string
+          enum: [Healthy, Degraded, Failed]
+        version: { type: string }
+      required: [id, kind, health, version]

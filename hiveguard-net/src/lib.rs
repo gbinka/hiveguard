@@ -1,0 +1,21 @@
+pub mod ca;
+pub mod gossip;
+pub mod identity;
+pub mod membership;
+pub mod merkle;
+pub mod messages;
+pub mod peer;
+pub mod signed_record;
+pub mod sync;
+pub mod transport;
+
+pub use gossip::{GossipAction, GossipConfig, GossipEngine};
+pub use identity::NodeIdentity;
+pub use membership::{SwimAction, SwimConfig, SwimMembership};
+pub use messages::ClusterMessage;
+pub use peer::{PeerInfo, PeerManager, PeerState};
+pub use signed_record::SignedBanRecord;
+pub use sync::SyncCoordinator;
+pub use transport::QuicTransport;
+pub use transport::{read_bounded_message, send_message, decode_message, extract_peer_fingerprint, extract_peer_fingerprint_and_key, extract_fingerprint_from_cert_der};
+pub use merkle::MerkleDigest;

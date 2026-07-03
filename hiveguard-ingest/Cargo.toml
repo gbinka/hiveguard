@@ -1,0 +1,20 @@
+[package]
+name = "hiveguard-ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hiveguard-core = { path = "../hiveguard-core" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+notify = "6"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# Phase 5.1 — syslog TLS (RFC 5425)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"

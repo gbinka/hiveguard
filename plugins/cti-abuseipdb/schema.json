@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_key"],
+  "properties": {
+    "api_key": { "type": "string", "minLength": 1 },
+    "confidence_threshold": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "ban_on_first_hit": { "type": "boolean" },
+    "cache_ttl_hours": { "type": "integer", "minimum": 1, "maximum": 720 },
+    "max_cache_entries": { "type": "integer", "minimum": 100, "maximum": 1000000 }
+  }
+}

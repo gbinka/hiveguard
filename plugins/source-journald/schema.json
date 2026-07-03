@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "source.journald",
+  "description": "Tail systemd journal via journalctl -f -o json (subprocess).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "units": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Optional list of systemd units to filter (--unit=...). Empty = all units."
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 7,
+      "description": "syslog priority threshold (0=emerg ... 7=debug). Lower number = more severe. Default: 7 (all)."
+    },
+    "ip_field": {
+      "type": "string",
+      "minLength": 1,
+      "default": "MESSAGE",
+      "description": "Journal field to scan for the source IP. Default 'MESSAGE'. Use 'SYSLOG_IDENTIFIER' or any other field name."
+    },
+    "ip_pattern": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Optional regex with named capture (?P<ip>...) to extract the source IP. If omitted, the first IPv4/IPv6 substring is used."
+    },
+    "since_boot": {
+      "type": "boolean",
+      "default": false,
+      "description": "Replay entries since current boot before following. Default false = follow new entries only."
+    },
+    "event_type": {
+      "type": "string",
+      "default": "ConnectionEvent",
+      "description": "EventType to label emitted events. One of AuthFailure, AuthSuccess, HttpRequest, Http4xx, Http5xx, SmtpAuthFailure, PortAccess, ConnectionEvent, or Custom name."
+    }
+  }
+}

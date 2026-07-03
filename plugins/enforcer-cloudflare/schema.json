@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_token", "zone_id", "account_id"],
+  "properties": {
+    "api_token": { "type": "string", "minLength": 1 },
+    "zone_id": { "type": "string", "minLength": 1 },
+    "account_id": { "type": "string", "minLength": 1 },
+    "list_name": { "type": "string", "minLength": 1 },
+    "min_severity": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "zones": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

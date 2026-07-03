@@ -1,0 +1,14 @@
+Apr  8 14:30:22 mailhost postfix/smtpd[12345]: warning: unknown[203.0.113.50]: SASL PLAIN authentication failed: UGFzc3dvcmQ=
+Apr  8 14:31:00 mailhost postfix/smtpd[12345]: warning: mail.example.com[198.51.100.20]: SASL LOGIN authentication failed: authentication failure
+Apr  8 14:32:00 mailhost postfix/smtpd[12346]: SASL LOGIN authentication failed, client=unknown[10.20.30.40]
+Apr  8 14:33:00 mailhost postfix/smtpd[12347]: warning: spammer.example.net[172.16.0.100]: SASL CRAM-MD5 authentication failed
+Apr  8 14:34:00 mailhost postfix/smtpd[12348]: warning: unknown[2001:db8::1]: SASL LOGIN authentication failed: authentication failure
+Apr  8 14:35:00 mailhost postfix/smtpd[12349]: connect from unknown[192.168.1.1]
+Apr  8 14:36:00 mailhost postfix/qmgr[1234]: ABC123: from=<user@example.com>, size=1234, nrcpt=1 (queue active)
+Apr  8 14:37:00 mailhost dovecot: imap-login: Disconnected (no auth attempts): rip=192.168.1.1
+Apr  8 14:38:00 mailhost postfix/smtpd[12350]: disconnect from unknown[192.168.1.1]
+Apr  8 14:39:00 mailhost postfix/smtpd[12351]: warning: brute.force.host[45.33.32.156]: SASL LOGIN authentication failed: UGFzc3dvcmQ=
+Apr  8 14:40:00 mailhost postfix/smtp[12352]: ABC456: to=<recipient@example.com>, relay=mail.example.com, status=sent
+Apr  8 14:41:00 mailhost postfix/smtpd[12353]: warning: unknown[45.33.32.156]: SASL PLAIN authentication failed
+Apr  8 14:42:00 mailhost postfix/cleanup[12354]: DEF789: message-id=<123@example.com>
+Apr  8 14:43:00 mailhost postfix/smtpd[12355]: SASL LOGIN authentication failed, client=relay.example.net[2001:db8::cafe]

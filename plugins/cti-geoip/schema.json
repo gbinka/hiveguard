@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "database_path": { "type": "string", "minLength": 1 },
+    "data_dir": { "type": "string", "minLength": 1 },
+    "trusted_asns": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+    },
+    "datacenter_confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "ban_on_first_hit": { "type": "boolean" },
+    "recommend_ban_datacenter": { "type": "boolean" }
+  }
+}

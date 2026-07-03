@@ -1,0 +1,16 @@
+[package]
+name = "hiveguard-plugin-detector-ssh-bruteforce"
+version = "0.1.0"
+edition = "2021"
+description = "SSH brute-force and user-enumeration detector plugin for HiveGuard"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

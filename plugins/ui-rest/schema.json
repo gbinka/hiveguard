@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ui.rest",
+  "type": "object",
+  "properties": {
+    "bind_addr": {
+      "type": "string",
+      "default": "127.0.0.1:8443",
+      "description": "Socket address the HTTP server binds to (e.g. '0.0.0.0:8443')."
+    },
+    "auth_token": {
+      "type": "string",
+      "description": "Bearer token clients must present on REST endpoints and WS upgrades."
+    },
+    "static_dir": {
+      "type": "string",
+      "description": "Path to ui-web's `dist/` directory (optional). Enables SPA serving with fallback to index.html."
+    },
+    "cors_origins": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Allowed CORS origins. If empty, no CORS middleware is installed."
+    },
+    "tick_interval_secs": {
+      "type": "integer",
+      "default": 30,
+      "minimum": 1,
+      "description": "How often the WebSocket sends a UiEvent::Tick keepalive."
+    },
+    "ingest": {
+      "type": "object",
+      "description": "Optional HTTP-push log ingest receiver (POST /api/ingest/logs). Migrated from legacy api.http_push.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Mount the /api/ingest/logs route. When false the route returns 404."
+        },
+        "token": {
+          "type": "string",
+          "description": "Bearer token for the ingest endpoint. Falls back to auth_token when omitted."
+        },
+        "parser": {
+          "type": "string",
+          "enum": ["auto", "ssh", "nginx", "postfix"],
+          "default": "auto",
+          "description": "Parser applied to each ingested line."
+        },
+        "rate_limit_per_sec": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "description": "Maximum accepted requests per second (per-process sliding window)."
+        },
+        "max_request_size_mb": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "description": "Maximum request body size in megabytes."
+        }
+      }
+    }
+  },
+  "required": ["auth_token"]
+}

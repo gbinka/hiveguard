@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "score_threshold": { "type": "number", "minimum": 0.0, "maximum": 100.0 },
+    "benign_penalty": { "type": "number", "minimum": 0.0, "maximum": 100.0 },
+    "error_response_multiplier": { "type": "number", "minimum": 0.0, "maximum": 10.0 },
+    "min_entropy": { "type": "number", "minimum": 0.0, "maximum": 8.0 },
+    "max_entropy": { "type": "number", "minimum": 0.0, "maximum": 8.0 }
+  }
+}

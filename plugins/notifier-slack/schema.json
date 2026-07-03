@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "notifier.slack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["webhook_url"],
+  "properties": {
+    "webhook_url":  { "type": "string", "format": "uri" },
+    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "default": 10 },
+    "channel":      { "type": "string", "description": "Override default channel (without #)" },
+    "username":     { "type": "string", "default": "HiveGuard" },
+    "icon_emoji":   { "type": "string", "default": ":no_entry:" }
+  }
+}

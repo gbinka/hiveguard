@@ -1,0 +1,232 @@
+[package]
+name = "hiveguard-daemon"
+version = "0.1.0"
+edition = "2021"
+
+# ---------------------------------------------------------------------------
+# Distribution features
+# ---------------------------------------------------------------------------
+#
+# `cargo build --features distribution-minimal` → fail2ban-style single-node
+# `cargo build --features distribution-standard` → default deployment
+# `cargo build --features distribution-enterprise` → full stack
+#
+# Plugin-level features are kept as a flat namespace so admins can also mix
+# and match (e.g. `--features minimal,notifier-slack,cti-abuseipdb`).
+[features]
+default = ["distribution-standard"]
+
+# --- Bundles -------------------------------------------------------------
+distribution-minimal = [
+    "source-file",
+    "source-firewall",
+    "enforcer-nftables",
+    "detectors-builtin",
+    "scoring-default",
+]
+distribution-standard = [
+    "distribution-minimal",
+    "cluster",
+    "source-syslog",
+    "source-journald",
+    "notifier-webhook",
+    "enforcer-observe",
+    "cti-geoip",
+    "ui-rest",
+    "ui-tui",
+    "ui-web",
+]
+distribution-enterprise = [
+    "distribution-standard",
+    "source-kafka",
+    "source-nats",
+    "source-rabbitmq",
+    "source-kinesis",
+    "source-cloudwatch",
+    "enforcer-cloudflare",
+    "enforcer-ipset",
+    "cti-abuseipdb",
+    "cti-spamhaus",
+    "cti-tor",
+    "cti-otx",
+    "detector-sigma",
+    "sink-elastic",
+    "sink-splunk",
+    "sink-datadog",
+    "sink-syslog",
+]
+
+# --- Cluster gossip (always-on for standard+, disabled for minimal) -----
+cluster = ["hiveguard-core/cluster", "dep:hiveguard-net", "dep:quinn"]
+
+# --- Sources -------------------------------------------------------------
+source-file       = ["dep:hiveguard-plugin-source-file"]
+source-firewall   = ["dep:hiveguard-plugin-source-firewall"]
+source-syslog     = ["dep:hiveguard-plugin-source-syslog"]
+source-journald   = ["dep:hiveguard-plugin-source-journald"]
+source-kafka      = ["dep:hiveguard-plugin-source-kafka"]
+source-nats       = ["dep:hiveguard-plugin-source-nats"]
+source-rabbitmq   = ["dep:hiveguard-plugin-source-rabbitmq"]
+source-kinesis    = ["dep:hiveguard-plugin-source-kinesis"]
+source-cloudwatch = ["dep:hiveguard-plugin-source-cloudwatch"]
+
+# --- Enforcers -----------------------------------------------------------
+enforcer-nftables   = ["dep:hiveguard-plugin-enforcer-nftables"]
+enforcer-ipset      = ["dep:hiveguard-plugin-enforcer-ipset"]
+enforcer-cloudflare = ["dep:hiveguard-plugin-enforcer-cloudflare"]
+enforcer-observe    = ["dep:hiveguard-plugin-enforcer-observe"]
+
+# --- Notifiers -----------------------------------------------------------
+notifier-webhook = ["dep:hiveguard-plugin-notifier-webhook"]
+
+# --- SIEM sinks ----------------------------------------------------------
+sink-elastic = ["dep:hiveguard-plugin-sink-elastic"]
+sink-splunk  = ["dep:hiveguard-plugin-sink-splunk"]
+sink-datadog = ["dep:hiveguard-plugin-sink-datadog"]
+sink-syslog  = ["dep:hiveguard-plugin-sink-syslog"]
+
+# --- CTI providers -------------------------------------------------------
+cti-abuseipdb = ["dep:hiveguard-plugin-cti-abuseipdb"]
+cti-spamhaus  = ["dep:hiveguard-plugin-cti-spamhaus"]
+cti-tor       = ["dep:hiveguard-plugin-cti-tor"]
+cti-otx       = ["dep:hiveguard-plugin-cti-otx"]
+cti-geoip     = ["dep:hiveguard-plugin-cti-geoip"]
+
+# --- Detectors ------------------------------------------------------------
+# `detectors-builtin` is a bundle for the 11 default detectors. Individual
+# crates can also be enabled à la carte.
+detectors-builtin = [
+    "detector-ssh-bruteforce",
+    "detector-path-probe",
+    "detector-http-4xx-flood",
+    "detector-http-login-bruteforce",
+    "detector-scanner-fingerprint",
+    "detector-smtp-bruteforce",
+    "detector-honeypot",
+    "detector-entropy",
+    "detector-timing",
+    "detector-port-scan",
+    "detector-distributed-slow",
+]
+detector-ssh-bruteforce       = ["dep:hiveguard-plugin-detector-ssh-bruteforce"]
+detector-path-probe           = ["dep:hiveguard-plugin-detector-path-probe"]
+detector-http-4xx-flood       = ["dep:hiveguard-plugin-detector-http-4xx-flood"]
+detector-http-login-bruteforce = ["dep:hiveguard-plugin-detector-http-login-bruteforce"]
+detector-scanner-fingerprint  = ["dep:hiveguard-plugin-detector-scanner-fingerprint"]
+detector-smtp-bruteforce      = ["dep:hiveguard-plugin-detector-smtp-bruteforce"]
+detector-honeypot             = ["dep:hiveguard-plugin-detector-honeypot"]
+detector-entropy              = ["dep:hiveguard-plugin-detector-entropy"]
+detector-timing               = ["dep:hiveguard-plugin-detector-timing"]
+detector-port-scan            = ["dep:hiveguard-plugin-detector-port-scan"]
+detector-distributed-slow     = ["dep:hiveguard-plugin-detector-distributed-slow"]
+detector-sigma                = ["dep:hiveguard-plugin-detector-sigma"]
+
+# --- Scoring engine ------------------------------------------------------
+scoring-default = ["dep:hiveguard-plugin-scoring-default"]
+
+# --- UI server plugins ---------------------------------------------------
+ui-rest = ["dep:hiveguard-plugin-ui-rest"]
+ui-tui  = ["dep:hiveguard-plugin-ui-tui"]
+ui-web  = ["dep:hiveguard-ui-web"]
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+[dependencies]
+# Core (cluster feature gated)
+hiveguard-core   = { path = "../hiveguard-core", default-features = false }
+
+# Legacy crates — kept for the parts of main.rs / pipeline not yet migrated.
+# Many plugins (source-kafka, source-nats, etc.) still depend on
+# `hiveguard-ingest` for shared types (`LogSource` trait), so it stays in the
+# workspace. Daemon's direct use was removed in Stage 2.
+hiveguard-ingest = { path = "../hiveguard-ingest" }
+hiveguard-enforce = { path = "../hiveguard-enforce" }
+hiveguard-cti    = { path = "../hiveguard-cti" }
+hiveguard-sigma  = { path = "../hiveguard-sigma" }
+hiveguard-queue  = { path = "../hiveguard-queue" }
+
+# Plugin runtime
+hiveguard-plugin-api = { path = "../hiveguard-plugin-api" }
+hiveguard-config     = { path = "../hiveguard-config" }
+hiveguard-host       = { path = "../hiveguard-host" }
+
+# Cluster (optional)
+hiveguard-net    = { path = "../hiveguard-net", optional = true }
+quinn            = { version = "0.11", optional = true }
+
+# --- First-party plugin crates (all optional, gated by features above) ---
+hiveguard-plugin-source-file       = { path = "../plugins/source-file", optional = true }
+hiveguard-plugin-source-firewall   = { path = "../plugins/source-firewall", optional = true }
+hiveguard-plugin-source-syslog     = { path = "../plugins/source-syslog", optional = true }
+hiveguard-plugin-source-journald   = { path = "../plugins/source-journald", optional = true }
+hiveguard-plugin-source-kafka      = { path = "../plugins/source-kafka", optional = true }
+hiveguard-plugin-source-nats       = { path = "../plugins/source-nats", optional = true }
+hiveguard-plugin-source-rabbitmq   = { path = "../plugins/source-rabbitmq", optional = true }
+hiveguard-plugin-source-kinesis    = { path = "../plugins/source-kinesis", optional = true }
+hiveguard-plugin-source-cloudwatch = { path = "../plugins/source-cloudwatch", optional = true }
+
+hiveguard-plugin-enforcer-nftables   = { path = "../plugins/enforcer-nftables", optional = true }
+hiveguard-plugin-enforcer-ipset      = { path = "../plugins/enforcer-ipset", optional = true }
+hiveguard-plugin-enforcer-cloudflare = { path = "../plugins/enforcer-cloudflare", optional = true }
+hiveguard-plugin-enforcer-observe    = { path = "../plugins/enforcer-observe", optional = true }
+
+hiveguard-plugin-notifier-webhook = { path = "../plugins/notifier-webhook", optional = true }
+
+hiveguard-plugin-sink-elastic = { path = "../plugins/sink-elastic", optional = true }
+hiveguard-plugin-sink-splunk  = { path = "../plugins/sink-splunk", optional = true }
+hiveguard-plugin-sink-datadog = { path = "../plugins/sink-datadog", optional = true }
+hiveguard-plugin-sink-syslog  = { path = "../plugins/sink-syslog", optional = true }
+
+hiveguard-plugin-cti-abuseipdb = { path = "../plugins/cti-abuseipdb", optional = true }
+hiveguard-plugin-cti-spamhaus  = { path = "../plugins/cti-spamhaus", optional = true }
+hiveguard-plugin-cti-tor       = { path = "../plugins/cti-tor", optional = true }
+hiveguard-plugin-cti-otx       = { path = "../plugins/cti-otx", optional = true }
+hiveguard-plugin-cti-geoip     = { path = "../plugins/cti-geoip", optional = true }
+
+hiveguard-plugin-detector-ssh-bruteforce        = { path = "../plugins/detector-ssh-bruteforce", optional = true }
+hiveguard-plugin-detector-path-probe            = { path = "../plugins/detector-path-probe", optional = true }
+hiveguard-plugin-detector-http-4xx-flood        = { path = "../plugins/detector-http-4xx-flood", optional = true }
+hiveguard-plugin-detector-http-login-bruteforce = { path = "../plugins/detector-http-login-bruteforce", optional = true }
+hiveguard-plugin-detector-scanner-fingerprint   = { path = "../plugins/detector-scanner-fingerprint", optional = true }
+hiveguard-plugin-detector-smtp-bruteforce       = { path = "../plugins/detector-smtp-bruteforce", optional = true }
+hiveguard-plugin-detector-honeypot              = { path = "../plugins/detector-honeypot", optional = true }
+hiveguard-plugin-detector-entropy               = { path = "../plugins/detector-entropy", optional = true }
+hiveguard-plugin-detector-timing                = { path = "../plugins/detector-timing", optional = true }
+hiveguard-plugin-detector-port-scan             = { path = "../plugins/detector-port-scan", optional = true }
+hiveguard-plugin-detector-distributed-slow      = { path = "../plugins/detector-distributed-slow", optional = true }
+hiveguard-plugin-detector-sigma                 = { path = "../plugins/detector-sigma", optional = true }
+
+hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default", optional = true }
+
+hiveguard-plugin-ui-rest = { path = "../plugins/ui-rest", optional = true }
+hiveguard-plugin-ui-tui  = { path = "../plugins/ui-tui", optional = true }
+hiveguard-ui-web         = { path = "../plugins/ui-web", optional = true }
+
+# --- Async + framework deps ---------------------------------------------
+arc-swap = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = "0.4"
+ipnet = "2"
+async-trait = "0.1"
+sd-notify = "0.5"
+axum = "0.8"
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = { version = "1", features = ["full"] }
+prometheus-client = "0.23"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+futures = "0.3"
+ipnet = "2"
+hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default" }

@@ -1,0 +1,13 @@
+[package]
+name = "hiveguard-plugin-detector-sigma"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-sigma = { path = "../../hiveguard-sigma" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }

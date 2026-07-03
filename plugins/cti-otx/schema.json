@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_key"],
+  "properties": {
+    "api_key": { "type": "string", "minLength": 1 },
+    "min_pulse_count": { "type": "integer", "minimum": 1, "maximum": 1000 },
+    "ban_on_first_hit": { "type": "boolean" }
+  }
+}

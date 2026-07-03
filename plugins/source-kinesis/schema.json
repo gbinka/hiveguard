@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "source.kinesis",
+  "description": "AWS Kinesis Data Streams consumer. Full schema delegated to hiveguard_core::config::KinesisSourceConfig.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["stream_name", "region"],
+  "properties": {
+    "stream_name": { "type": "string", "minLength": 1 },
+    "region":      { "type": "string", "minLength": 1 }
+  }
+}
