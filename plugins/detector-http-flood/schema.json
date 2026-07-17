@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "window_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+    "ip_threshold": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+    "subnet_threshold": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "ignore_extensions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 2, "maxLength": 16 }
+    }
+  }
+}

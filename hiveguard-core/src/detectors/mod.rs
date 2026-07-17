@@ -10,6 +10,7 @@ pub mod entropy_analysis;
 pub mod timing;
 pub mod port_scan;
 pub mod distributed_slow;
+pub mod http_flood;
 pub mod factory;
 
 pub use ssh_bruteforce::SshBruteforceDetector;
@@ -23,4 +24,5 @@ pub use entropy::EntropyDetector;
 pub use timing::TimingDetector;
 pub use port_scan::PortScanDetector;
 pub use distributed_slow::DistributedSlowDetector;
+pub use http_flood::HttpFloodDetector;
 pub use factory::create_detectors;
