@@ -630,10 +630,18 @@ impl ClusterActor {
     /// the ban arrived via gossip rather than local detection. These are **not**
     /// re-announced (no echo).
     async fn apply_bans(&self, from: &str, records: Vec<BanRecord>) {
+        let now = chrono::Utc::now();
         let mut to_enforce: Vec<IpNet> = Vec::new();
         {
             let mut st = self.state.lock().await;
             for mut rec in records {
+                // Peers running older builds keep re-announcing bans that have
+                // already expired; persisting them just re-creates entries the
+                // expiry sweep removes again, looping forever.
+                if rec.expires_at.is_some_and(|exp| exp <= now) {
+                    debug!(subject = %rec.subject, peer = %from, "cluster: remote ban already expired — skipping");
+                    continue;
+                }
                 let addr = rec.subject.addr();
                 if st.whitelist().is_whitelisted(&addr) {
                     debug!(subject = %rec.subject, peer = %from, "cluster: remote ban hits whitelist — skipping");
