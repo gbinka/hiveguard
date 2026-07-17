@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use notify::{EventKind, RecursiveMode, Watcher};
+use prometheus_client::metrics::gauge::Gauge;
 use regex::Regex;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -27,6 +29,10 @@ struct FileConfig {
     path: PathBuf,
     #[serde(default = "default_seek_to_end")]
     seek_to_end: bool,
+    #[serde(default = "default_max_chunk_bytes")]
+    max_chunk_bytes: u64,
+    #[serde(default = "default_max_lag_bytes")]
+    max_lag_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,9 +42,41 @@ struct CustomConfig {
     pattern: String,
     #[serde(default = "default_seek_to_end")]
     seek_to_end: bool,
+    #[serde(default = "default_max_chunk_bytes")]
+    max_chunk_bytes: u64,
+    #[serde(default = "default_max_lag_bytes")]
+    max_lag_bytes: u64,
 }
 
 fn default_seek_to_end() -> bool { true }
+
+/// Max bytes parsed per read batch. Bounds both memory use and the time the
+/// source spends inside a single blocking read while the file keeps growing.
+fn default_max_chunk_bytes() -> u64 { 8 * 1024 * 1024 }
+
+/// If the unread backlog exceeds this, skip ahead to the tail of the file.
+/// Losing history is preferable to being blind to live traffic (during the
+/// 2026-07-11 bot flood the access log outgrew the reader by gigabytes and
+/// no event reached the detectors for 17 hours).
+fn default_max_lag_bytes() -> u64 { 128 * 1024 * 1024 }
+
+/// How the per-source read limits travel together.
+#[derive(Debug, Clone, Copy)]
+struct ReadLimits {
+    max_chunk_bytes: u64,
+    max_lag_bytes: u64,
+}
+
+/// Offset-file key + metric suffix unique per watched path, so two instances
+/// of the same plugin (e.g. nginx access + error logs) never share state.
+fn source_key(kind: &str, path: &Path) -> String {
+    let sanitized: String = path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    format!("{kind}_{sanitized}")
+}
 
 #[derive(Debug)]
 enum SourceConfig {
@@ -51,6 +89,7 @@ enum SourceConfig {
 pub struct FileSourcePlugin {
     manifest: PluginManifest,
     data_dir: PathBuf,
+    metrics: PluginMetrics,
     config: Option<SourceConfig>,
 }
 
@@ -75,6 +114,7 @@ impl FileSourcePlugin {
             let mut plugin = FileSourcePlugin {
                 manifest,
                 data_dir: ctx.data_dir,
+                metrics: ctx.metrics,
                 config: None,
             };
             <FileSourcePlugin as Plugin>::init(&mut plugin, cfg).await?;
@@ -188,9 +228,11 @@ impl LogSourcePlugin for FileSourcePlugin {
         match config {
             SourceConfig::Ssh(cfg) => run_file_source(
                 cfg.path.clone(),
-                "ssh",
+                &source_key("ssh", &cfg.path),
                 cfg.seek_to_end,
+                ReadLimits { max_chunk_bytes: cfg.max_chunk_bytes, max_lag_bytes: cfg.max_lag_bytes },
                 self.data_dir.clone(),
+                self.metrics.clone(),
                 sink,
                 shutdown,
                 parse_ssh_normalized,
@@ -198,9 +240,11 @@ impl LogSourcePlugin for FileSourcePlugin {
             .await,
             SourceConfig::Nginx(cfg) => run_file_source(
                 cfg.path.clone(),
-                "nginx",
+                &source_key("nginx", &cfg.path),
                 cfg.seek_to_end,
+                ReadLimits { max_chunk_bytes: cfg.max_chunk_bytes, max_lag_bytes: cfg.max_lag_bytes },
                 self.data_dir.clone(),
+                self.metrics.clone(),
                 sink,
                 shutdown,
                 parse_nginx_normalized,
@@ -208,9 +252,11 @@ impl LogSourcePlugin for FileSourcePlugin {
             .await,
             SourceConfig::Postfix(cfg) => run_file_source(
                 cfg.path.clone(),
-                "postfix",
+                &source_key("postfix", &cfg.path),
                 cfg.seek_to_end,
+                ReadLimits { max_chunk_bytes: cfg.max_chunk_bytes, max_lag_bytes: cfg.max_lag_bytes },
                 self.data_dir.clone(),
+                self.metrics.clone(),
                 sink,
                 shutdown,
                 parse_postfix_normalized,
@@ -220,12 +266,14 @@ impl LogSourcePlugin for FileSourcePlugin {
                 let pattern = Arc::new(Regex::new(&cfg.pattern)
                     .map_err(|e| PluginError::ConfigValidation(format!("invalid custom regex pattern: {e}")))?);
                 let detector = cfg.detector.clone();
-                let offset_key = format!("custom_{}", detector);
+                let offset_key = source_key(&format!("custom_{}", detector), &cfg.path);
                 run_file_source(
                     cfg.path.clone(),
                     &offset_key,
                     cfg.seek_to_end,
+                    ReadLimits { max_chunk_bytes: cfg.max_chunk_bytes, max_lag_bytes: cfg.max_lag_bytes },
                     self.data_dir.clone(),
+                    self.metrics.clone(),
                     sink,
                     shutdown,
                     move |line| parse_custom_normalized(line, &pattern, &detector),
@@ -236,11 +284,18 @@ impl LogSourcePlugin for FileSourcePlugin {
     }
 }
 
+/// How often the current offset is persisted while the source is running, so
+/// an ungraceful shutdown loses at most this much progress.
+const OFFSET_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[allow(clippy::too_many_arguments)]
 async fn run_file_source<F>(
     path: PathBuf,
     offset_key: &str,
     seek_to_end: bool,
+    limits: ReadLimits,
     data_dir: PathBuf,
+    metrics: PluginMetrics,
     sink: EventSink,
     shutdown: CancellationToken,
     parser: F,
@@ -263,12 +318,22 @@ where
         FileWatcher::new(path.clone(), seek_to_end).await.map_err(PluginError::from)?
     };
 
+    let lag_gauge = Gauge::<i64>::default();
+    metrics.registry.with_registry(|registry| {
+        registry.register(
+            format!("source_lag_bytes_{offset_key}"),
+            "Unread bytes between the watched file's end and the source's read offset",
+            lag_gauge.clone(),
+        );
+    });
+
     let (notify_tx, mut notify_rx) = mpsc::channel::<()>(16);
     let notify_tx_clone = notify_tx.clone();
     let mut fs_watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            if matches!(event.kind, EventKind::Modify(_)) {
-                let _ = notify_tx_clone.blocking_send(());
+            // Modify = new data; Create = log file recreated after rotation.
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                let _ = notify_tx_clone.try_send(());
             }
         }
     })
@@ -279,9 +344,11 @@ where
         .watch(watch_path, RecursiveMode::NonRecursive)
         .map_err(|e| PluginError::Runtime(format!("failed to watch {}: {e}", watch_path.display())))?;
 
+    let mut last_save = Instant::now();
+
     // Drain once on startup so `seek_to_end: false` really replays existing content
     // and saved offsets pick up unread lines after restart.
-    emit_new_lines(&mut watcher, &sink, &parser).await?;
+    drain_to_eof(&mut watcher, limits, &sink, &shutdown, &parser, &lag_gauge).await?;
 
     loop {
         tokio::select! {
@@ -292,29 +359,46 @@ where
             }
             Some(()) = notify_rx.recv() => {
                 while notify_rx.try_recv().is_ok() {}
-                emit_new_lines(&mut watcher, &sink, &parser).await?;
+                drain_to_eof(&mut watcher, limits, &sink, &shutdown, &parser, &lag_gauge).await?;
+                if last_save.elapsed() >= OFFSET_SAVE_INTERVAL {
+                    save_offset(&data_dir, offset_key, watcher.offset()).await.map_err(PluginError::from)?;
+                    last_save = Instant::now();
+                }
             }
         }
     }
 }
 
-async fn emit_new_lines<F>(
+/// Read and emit in bounded chunks until the reader has caught up with the
+/// end of the file (or shutdown is requested). Keeping each chunk small means
+/// steady event flow to the detectors even while the file is being flooded.
+async fn drain_to_eof<F>(
     watcher: &mut FileWatcher,
+    limits: ReadLimits,
     sink: &EventSink,
+    shutdown: &CancellationToken,
     parser: &F,
+    lag_gauge: &Gauge<i64>,
 ) -> PluginResult<()>
 where
     F: Fn(&str) -> Option<NormalizedEvent> + Send + Sync + 'static,
 {
-    let lines = watcher.read_new_lines().await.map_err(PluginError::from)?;
-    for line in lines {
-        if let Some(event) = parser(&line) {
-            sink.send(event)
-                .await
-                .map_err(|_| PluginError::Runtime("event sink closed".into()))?;
+    loop {
+        let outcome = watcher.read_new_lines(limits).await.map_err(PluginError::from)?;
+        lag_gauge.set(outcome.file_len.saturating_sub(outcome.offset) as i64);
+
+        for line in &outcome.lines {
+            if let Some(event) = parser(line) {
+                sink.send(event)
+                    .await
+                    .map_err(|_| PluginError::Runtime("event sink closed".into()))?;
+            }
+        }
+
+        if !outcome.more || shutdown.is_cancelled() {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 struct FileWatcher {
@@ -340,12 +424,13 @@ impl FileWatcher {
         Self { path: path.into(), offset }
     }
 
-    async fn read_new_lines(&mut self) -> std::io::Result<Vec<String>> {
+    async fn read_new_lines(&mut self, limits: ReadLimits) -> std::io::Result<ReadOutcome> {
         let path = self.path.clone();
         let offset = self.offset;
-        let read_result = tokio::task::spawn_blocking(move || read_new_lines_blocking(path, offset))
-            .await
-            .map_err(|error| std::io::Error::other(format!("blocking read task failed: {error}")))?;
+        let read_result =
+            tokio::task::spawn_blocking(move || read_new_lines_blocking(path, offset, limits))
+                .await
+                .map_err(|error| std::io::Error::other(format!("blocking read task failed: {error}")))?;
 
         let read_outcome = read_result?;
         if read_outcome.rotated {
@@ -356,10 +441,18 @@ impl FileWatcher {
                 "file truncated, resetting offset"
             );
         }
+        if read_outcome.skipped_bytes > 0 {
+            warn!(
+                path = %self.path.display(),
+                skipped_bytes = read_outcome.skipped_bytes,
+                max_lag_bytes = limits.max_lag_bytes,
+                "file source lag exceeded limit — skipping ahead to file tail (backlog dropped)"
+            );
+        }
 
         self.offset = read_outcome.offset;
         debug!(path = %self.path.display(), lines = read_outcome.lines.len(), offset = self.offset, "read new log lines");
-        Ok(read_outcome.lines)
+        Ok(read_outcome)
     }
 
     fn offset(&self) -> u64 {
@@ -372,45 +465,119 @@ struct ReadOutcome {
     offset: u64,
     file_len: u64,
     rotated: bool,
+    /// Backlog bytes dropped because the lag limit was exceeded.
+    skipped_bytes: u64,
+    /// True when unread data remains past this chunk (caller should read again).
+    more: bool,
 }
 
-fn read_new_lines_blocking(path: PathBuf, offset: u64) -> std::io::Result<ReadOutcome> {
-    let mut file = std::fs::File::open(&path)?;
+fn read_new_lines_blocking(path: PathBuf, offset: u64, limits: ReadLimits) -> std::io::Result<ReadOutcome> {
+    // During log rotation (mv + create) the file briefly doesn't exist. That
+    // must not kill the source — report "nothing to read" and let the next
+    // notification (or the recreated file's first write) resume tailing.
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReadOutcome {
+                lines: Vec::new(),
+                offset,
+                file_len: offset,
+                rotated: false,
+                skipped_bytes: 0,
+                more: false,
+            });
+        }
+        Err(e) => return Err(e),
+    };
     let file_len = file.metadata()?.len();
-    let start_offset = if file_len < offset { 0 } else { offset };
+    let rotated = file_len < offset;
+    let mut start_offset = if rotated { 0 } else { offset };
+
+    // Backlog cap: when the file has outgrown the reader beyond the limit,
+    // jump close to the tail instead of chewing through gigabytes of history.
+    let mut skipped_bytes = 0_u64;
+    let backlog = file_len.saturating_sub(start_offset);
+    if limits.max_lag_bytes > 0 && backlog > limits.max_lag_bytes {
+        let new_start = file_len.saturating_sub(limits.max_chunk_bytes.max(1));
+        skipped_bytes = new_start - start_offset;
+        start_offset = new_start;
+    }
 
     if file_len == start_offset {
         return Ok(ReadOutcome {
             lines: Vec::new(),
             offset: start_offset,
             file_len,
-            rotated: file_len < offset,
+            rotated,
+            skipped_bytes,
+            more: false,
         });
     }
 
     file.seek(SeekFrom::Start(start_offset))?;
-    let reader = BufReader::new(&file);
+    let mut reader = BufReader::new(&file);
     let mut lines = Vec::new();
     let mut bytes_read = 0_u64;
+    let mut buf: Vec<u8> = Vec::new();
 
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
-                bytes_read += line.len() as u64 + 1;
-                lines.push(line);
-            }
-            Err(error) => {
-                warn!(error = %error, "error reading line from watched file");
-                break;
-            }
+    // After a skip-ahead we usually land mid-line; drop the partial first line
+    // so the parser only ever sees whole records.
+    if skipped_bytes > 0 {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 || buf.last() != Some(&b'\n') {
+            // No complete line yet — retry from the same spot next round.
+            return Ok(ReadOutcome {
+                lines,
+                offset: start_offset,
+                file_len,
+                rotated,
+                skipped_bytes,
+                more: false,
+            });
         }
+        bytes_read += n as u64;
     }
 
+    let mut stopped_at_line_boundary = false;
+    while bytes_read < limits.max_chunk_bytes {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                warn!(error = %error, "error reading line from watched file");
+                stopped_at_line_boundary = true;
+                break;
+            }
+        };
+        if n == 0 {
+            stopped_at_line_boundary = true;
+            break; // clean EOF
+        }
+        if buf.last() != Some(&b'\n') {
+            // Partial line still being written — don't advance past it; it
+            // will be re-read complete on the next notification.
+            stopped_at_line_boundary = true;
+            break;
+        }
+        bytes_read += n as u64;
+        let mut end = buf.len() - 1; // strip '\n'
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+        lines.push(String::from_utf8_lossy(&buf[..end]).into_owned());
+    }
+
+    let new_offset = start_offset + bytes_read;
     Ok(ReadOutcome {
         lines,
-        offset: start_offset + bytes_read,
+        offset: new_offset,
         file_len,
-        rotated: file_len < offset,
+        rotated,
+        skipped_bytes,
+        // Only signal "read again immediately" when we stopped because of the
+        // chunk limit — a partial trailing line or EOF means wait for notify.
+        more: !stopped_at_line_boundary && new_offset < file_len,
     })
 }
 
@@ -554,8 +721,13 @@ fn parse_ssh_line(line: &str, patterns: &SshPatterns) -> Option<SshEvent> {
     None
 }
 
+fn ssh_patterns() -> &'static SshPatterns {
+    static PATTERNS: OnceLock<SshPatterns> = OnceLock::new();
+    PATTERNS.get_or_init(SshPatterns::new)
+}
+
 fn parse_ssh_normalized(line: &str) -> Option<NormalizedEvent> {
-    let event = parse_ssh_line(line, &SshPatterns::new())?;
+    let event = parse_ssh_line(line, ssh_patterns())?;
     let mut metadata = HashMap::new();
     metadata.insert("user".to_string(), event.user);
     if event.invalid_user {
@@ -628,8 +800,13 @@ fn parse_nginx_line(line: &str, pattern: &NginxPattern) -> Option<NginxEvent> {
     })
 }
 
+fn nginx_pattern() -> &'static NginxPattern {
+    static PATTERN: OnceLock<NginxPattern> = OnceLock::new();
+    PATTERN.get_or_init(NginxPattern::new)
+}
+
 fn parse_nginx_normalized(line: &str) -> Option<NormalizedEvent> {
-    let event = parse_nginx_line(line, &NginxPattern::new())?;
+    let event = parse_nginx_line(line, nginx_pattern())?;
     let event_type = match event.status_code {
         400..=499 => EventType::Http4xx,
         500..=599 => EventType::Http5xx,
@@ -705,8 +882,13 @@ fn parse_postfix_line(line: &str, patterns: &PostfixPatterns) -> Option<PostfixE
     None
 }
 
+fn postfix_patterns() -> &'static PostfixPatterns {
+    static PATTERNS: OnceLock<PostfixPatterns> = OnceLock::new();
+    PATTERNS.get_or_init(PostfixPatterns::new)
+}
+
 fn parse_postfix_normalized(line: &str) -> Option<NormalizedEvent> {
-    let event = parse_postfix_line(line, &PostfixPatterns::new())?;
+    let event = parse_postfix_line(line, postfix_patterns())?;
     let mut metadata = HashMap::new();
     metadata.insert("mechanism".to_string(), event.mechanism);
 
@@ -835,9 +1017,15 @@ mod tests {
         let mut plugin = FileSourcePlugin {
             manifest: FileSourcePlugin::manifest_for(SSH_PLUGIN_ID, "File-backed SSH auth.log source."),
             data_dir: tempdir.path().join("state"),
+            metrics: PluginMetrics {
+                registry: Arc::new(RegistryHandle::default()),
+                plugin_id: SSH_PLUGIN_ID.to_string(),
+            },
             config: Some(SourceConfig::Ssh(FileConfig {
                 path: log_path.clone(),
                 seek_to_end: false,
+                max_chunk_bytes: default_max_chunk_bytes(),
+                max_lag_bytes: default_max_lag_bytes(),
             })),
         };
 
@@ -881,6 +1069,119 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, PluginError::ConfigValidation(_)));
+    }
+
+    #[test]
+    fn chunked_read_respects_limit_and_reports_more() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("big.log");
+        let mut content = String::new();
+        for i in 0..1000 {
+            content.push_str(&format!("line number {i}\n"));
+        }
+        std::fs::write(&log_path, &content).unwrap();
+
+        let limits = ReadLimits { max_chunk_bytes: 1024, max_lag_bytes: 0 };
+        let first = read_new_lines_blocking(log_path.clone(), 0, limits).unwrap();
+        assert!(first.more, "large file should require another read");
+        assert!(!first.lines.is_empty());
+        assert!(first.offset < content.len() as u64);
+
+        // Continue until fully drained; total must equal the original file.
+        let mut offset = first.offset;
+        let mut total = first.lines.len();
+        loop {
+            let out = read_new_lines_blocking(log_path.clone(), offset, limits).unwrap();
+            total += out.lines.len();
+            offset = out.offset;
+            if !out.more {
+                break;
+            }
+        }
+        assert_eq!(total, 1000);
+        assert_eq!(offset, content.len() as u64);
+    }
+
+    #[test]
+    fn lag_cap_skips_to_tail_on_whole_lines() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("lagged.log");
+        let mut content = String::new();
+        for i in 0..2000 {
+            content.push_str(&format!("old backlog line {i}\n"));
+        }
+        content.push_str("freshest line\n");
+        std::fs::write(&log_path, &content).unwrap();
+
+        let limits = ReadLimits { max_chunk_bytes: 512, max_lag_bytes: 4096 };
+        let out = read_new_lines_blocking(log_path.clone(), 0, limits).unwrap();
+        assert!(out.skipped_bytes > 0, "backlog beyond limit must be skipped");
+        // Partial first line after the jump is dropped; remaining are intact.
+        assert!(out.lines.iter().all(|l| l.starts_with("old backlog line") || l == "freshest line"));
+        assert_eq!(out.lines.last().unwrap(), "freshest line");
+    }
+
+    #[test]
+    fn partial_trailing_line_is_not_consumed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("partial.log");
+        std::fs::write(&log_path, "complete line\nincomplete without newline").unwrap();
+
+        let limits = ReadLimits { max_chunk_bytes: 1 << 20, max_lag_bytes: 0 };
+        let out = read_new_lines_blocking(log_path.clone(), 0, limits).unwrap();
+        assert_eq!(out.lines, vec!["complete line".to_string()]);
+        assert_eq!(out.offset, "complete line\n".len() as u64);
+        assert!(!out.more, "waiting for the rest of a partial line must not busy-loop");
+
+        // Once the newline arrives the line is picked up from the same offset.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        std::fs::write(&log_path, "complete line\nincomplete without newline\n").unwrap();
+        let out2 = read_new_lines_blocking(log_path, out.offset, limits).unwrap();
+        assert_eq!(out2.lines, vec!["incomplete without newline".to_string()]);
+    }
+
+    #[test]
+    fn missing_file_returns_empty_instead_of_error() {
+        let limits = ReadLimits { max_chunk_bytes: 1 << 20, max_lag_bytes: 0 };
+        let out = read_new_lines_blocking(PathBuf::from("/nonexistent/rotating.log"), 42, limits).unwrap();
+        assert!(out.lines.is_empty());
+        assert_eq!(out.offset, 42, "offset must survive the rotation gap");
+        assert!(!out.more);
+    }
+
+    #[test]
+    fn rotation_sequence_resumes_on_recreated_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("rotating.log");
+        let limits = ReadLimits { max_chunk_bytes: 1 << 20, max_lag_bytes: 0 };
+
+        std::fs::write(&log_path, "before rotation\n").unwrap();
+        let out = read_new_lines_blocking(log_path.clone(), 0, limits).unwrap();
+        assert_eq!(out.lines, vec!["before rotation".to_string()]);
+
+        // logrotate: mv + brief gap
+        let rotated_path = tempdir.path().join("rotating.log.1");
+        std::fs::rename(&log_path, &rotated_path).unwrap();
+        let gap = read_new_lines_blocking(log_path.clone(), out.offset, limits).unwrap();
+        assert!(gap.lines.is_empty());
+        assert_eq!(gap.offset, out.offset);
+
+        // new file created — smaller than the old offset → offset resets
+        std::fs::write(&log_path, "after rotation\n").unwrap();
+        let resumed = read_new_lines_blocking(log_path, gap.offset, limits).unwrap();
+        assert!(resumed.rotated);
+        assert_eq!(resumed.lines, vec!["after rotation".to_string()]);
+    }
+
+    #[test]
+    fn source_keys_are_unique_per_path() {
+        let a = source_key("nginx", Path::new("/var/log/nginx/access.log"));
+        let b = source_key("nginx", Path::new("/var/log/nginx/error.log"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("nginx_"));
     }
 
     #[test]

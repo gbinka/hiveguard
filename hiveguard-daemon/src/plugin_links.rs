@@ -94,6 +94,8 @@ extern crate hiveguard_plugin_detector_timing as _;
 extern crate hiveguard_plugin_detector_port_scan as _;
 #[cfg(feature = "detector-distributed-slow")]
 extern crate hiveguard_plugin_detector_distributed_slow as _;
+#[cfg(feature = "detector-http-flood")]
+extern crate hiveguard_plugin_detector_http_flood as _;
 #[cfg(feature = "detector-sigma")]
 extern crate hiveguard_plugin_detector_sigma as _;
 

@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["fs", "rt", "sync"] }
 notify = "6"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+prometheus-client = "0.23"
 
 [dev-dependencies]
 tempfile = "3"

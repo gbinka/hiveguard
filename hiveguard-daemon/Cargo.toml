@@ -107,6 +107,7 @@ detectors-builtin = [
     "detector-timing",
     "detector-port-scan",
     "detector-distributed-slow",
+    "detector-http-flood",
 ]
 detector-ssh-bruteforce       = ["dep:hiveguard-plugin-detector-ssh-bruteforce"]
 detector-path-probe           = ["dep:hiveguard-plugin-detector-path-probe"]
@@ -119,6 +120,7 @@ detector-entropy              = ["dep:hiveguard-plugin-detector-entropy"]
 detector-timing               = ["dep:hiveguard-plugin-detector-timing"]
 detector-port-scan            = ["dep:hiveguard-plugin-detector-port-scan"]
 detector-distributed-slow     = ["dep:hiveguard-plugin-detector-distributed-slow"]
+detector-http-flood           = ["dep:hiveguard-plugin-detector-http-flood"]
 detector-sigma                = ["dep:hiveguard-plugin-detector-sigma"]
 
 # --- Scoring engine ------------------------------------------------------
@@ -195,6 +197,7 @@ hiveguard-plugin-detector-entropy               = { path = "../plugins/detector-
 hiveguard-plugin-detector-timing                = { path = "../plugins/detector-timing", optional = true }
 hiveguard-plugin-detector-port-scan             = { path = "../plugins/detector-port-scan", optional = true }
 hiveguard-plugin-detector-distributed-slow      = { path = "../plugins/detector-distributed-slow", optional = true }
+hiveguard-plugin-detector-http-flood            = { path = "../plugins/detector-http-flood", optional = true }
 hiveguard-plugin-detector-sigma                 = { path = "../plugins/detector-sigma", optional = true }
 
 hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default", optional = true }

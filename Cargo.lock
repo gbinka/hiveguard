@@ -2626,6 +2626,7 @@ dependencies = [
  "hiveguard-plugin-detector-entropy",
  "hiveguard-plugin-detector-honeypot",
  "hiveguard-plugin-detector-http-4xx-flood",
+ "hiveguard-plugin-detector-http-flood",
  "hiveguard-plugin-detector-http-login-bruteforce",
  "hiveguard-plugin-detector-path-probe",
  "hiveguard-plugin-detector-port-scan",
@@ -2881,6 +2882,18 @@ dependencies = [
 
 [[package]]
 name = "hiveguard-plugin-detector-http-4xx-flood"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hiveguard-core",
+ "hiveguard-plugin-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hiveguard-plugin-detector-http-flood"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -3241,6 +3254,7 @@ dependencies = [
  "hiveguard-core",
  "hiveguard-plugin-api",
  "notify",
+ "prometheus-client",
  "regex",
  "serde",
  "serde_json",

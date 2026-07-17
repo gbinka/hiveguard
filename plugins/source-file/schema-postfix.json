@@ -2,7 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["path"],
+  "required": [
+    "path"
+  ],
   "properties": {
     "path": {
       "type": "string",
@@ -11,6 +13,18 @@
     "seek_to_end": {
       "type": "boolean",
       "default": true
+    },
+    "max_chunk_bytes": {
+      "type": "integer",
+      "minimum": 65536,
+      "maximum": 1073741824,
+      "description": "Max bytes parsed per read batch (default 8 MiB)."
+    },
+    "max_lag_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1099511627776,
+      "description": "Skip ahead to the file tail when unread backlog exceeds this (default 128 MiB, 0 = never skip)."
     }
   }
 }
