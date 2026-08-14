@@ -14,7 +14,7 @@ pub use identity::NodeIdentity;
 pub use membership::{SwimAction, SwimConfig, SwimMembership};
 pub use messages::ClusterMessage;
 pub use peer::{PeerInfo, PeerManager, PeerState};
-pub use signed_record::SignedBanRecord;
+pub use signed_record::{SignedBanRecord, SigningCache};
 pub use sync::SyncCoordinator;
 pub use transport::QuicTransport;
 pub use transport::{read_bounded_message, send_message, decode_message, extract_peer_fingerprint, extract_peer_fingerprint_and_key, extract_fingerprint_from_cert_der};
