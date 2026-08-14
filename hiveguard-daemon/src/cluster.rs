@@ -58,7 +58,7 @@ use hiveguard_enforce::Enforcer;
 use hiveguard_net::{
     extract_peer_fingerprint_and_key, read_bounded_message, send_message, decode_message,
     ClusterMessage, GossipAction, GossipConfig, GossipEngine, NodeIdentity, PeerInfo, PeerState,
-    QuicTransport, SignedBanRecord, SwimAction, SwimConfig, SyncCoordinator,
+    QuicTransport, SignedBanRecord, SigningCache, SwimAction, SwimConfig, SyncCoordinator,
 };
 
 use crate::metrics::SharedMetrics;
@@ -302,6 +302,7 @@ pub async fn spawn_cluster(
         coordinator,
         trust,
         rate_limiter,
+        sign_cache: SigningCache::default(),
         ban_counts: HashMap::new(),
         connections: HashMap::new(),
         dialing: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -340,6 +341,9 @@ struct ClusterActor {
     coordinator: SyncCoordinator,
     trust: TrustManager,
     rate_limiter: RateLimiter,
+    /// Memoised PoW stamps — anti-entropy re-sends the same records every round
+    /// and mining each one costs ~65 k blake3 hashes.
+    sign_cache: SigningCache,
     /// node_id → number of ban records received (anti-poison quarantine input).
     ban_counts: HashMap<String, usize>,
     connections: HashMap<String, quinn::Connection>,
@@ -478,8 +482,16 @@ impl ClusterActor {
             ClusterMessage::DiffRequest { missing_keys } => {
                 let local_bans = self.snapshot_bans().await;
                 let missing = self.coordinator.handle_diff_request(&missing_keys, &local_bans);
+                let mined_before = self.sign_cache.stats().1;
                 let records: Vec<SignedBanRecord> =
                     missing.into_iter().filter_map(|r| self.sign(r)).collect();
+                debug!(
+                    peer = %from,
+                    records = records.len(),
+                    mined = self.sign_cache.stats().1 - mined_before,
+                    cached = self.sign_cache.len(),
+                    "cluster: answering diff request"
+                );
                 if !records.is_empty() {
                     self.send_to(&from, ClusterMessage::DiffResponse { records });
                 }
@@ -595,8 +607,11 @@ impl ClusterActor {
 
     /// Sign a ban record with the node's identity key. Returns `None` on the
     /// (practically impossible) signing/PoW failure.
-    fn sign(&self, record: BanRecord) -> Option<SignedBanRecord> {
-        match SignedBanRecord::sign(record, &self.node_id, &self.pkcs8, POW_DIFFICULTY) {
+    fn sign(&mut self, record: BanRecord) -> Option<SignedBanRecord> {
+        match self
+            .sign_cache
+            .sign(record, &self.node_id, &self.pkcs8, POW_DIFFICULTY)
+        {
             Ok(s) => Some(s),
             Err(e) => {
                 warn!(error = %e, "cluster: failed to sign ban record");
