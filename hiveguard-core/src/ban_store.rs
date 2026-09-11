@@ -59,6 +59,23 @@ impl InMemoryBanStore {
         }
     }
 
+    /// All bans whose network contains `subject` (the subject itself included),
+    /// expired ones too — the caller decides what "active" means.
+    ///
+    /// Unlike [`BanStore::is_banned`], which stops at the most specific match,
+    /// this returns every covering ban: a /24 may outlive a /32 inside it.
+    pub fn covering_bans(&self, subject: &IpNet) -> Vec<&BanRecord> {
+        let counts: &[u32] = match subject {
+            IpNet::V4(_) => &self.v4_prefix_counts,
+            IpNet::V6(_) => &self.v6_prefix_counts,
+        };
+        (0..=subject.prefix_len())
+            .filter(|&len| counts[len as usize] > 0)
+            .filter_map(|len| IpNet::new(subject.addr(), len).ok())
+            .filter_map(|net| self.bans.get(&net.trunc()))
+            .collect()
+    }
+
     fn rebuild_prefix_counts(&mut self) {
         self.v4_prefix_counts = [0; 33];
         self.v6_prefix_counts = [0; 129];

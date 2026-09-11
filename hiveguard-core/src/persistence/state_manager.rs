@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use tracing::{info, warn};
 
@@ -12,6 +13,22 @@ use crate::whitelist::WhitelistManager;
 
 use super::snapshot::{load_snapshot_v2, save_snapshot_with_revocations};
 use super::wal::{WalEntry, WalReader, WalSyncMode, WalWriter};
+
+/// A ban is only extended when the new expiry is at least this much later.
+const MIN_BAN_EXTENSION: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Result of [`StateManager::admit_ban`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanAdmission {
+    /// No active ban covered the subject; the ban was stored.
+    Added,
+    /// The subject already had an active ban that ran out sooner; its expiry
+    /// was pushed out. The firewall already holds the subject.
+    Extended { previous_expiry: Option<DateTime<Utc>> },
+    /// An active ban (the subject itself or a wider network) already lasts at
+    /// least as long; nothing was stored.
+    AlreadyCovered { by: IpNet, expires_at: Option<DateTime<Utc>> },
+}
 
 /// Coordinates persistence: in-memory state + WAL + snapshots.
 /// Includes both legacy BanRecord store and CRDT ban record store.
@@ -134,6 +151,56 @@ impl StateManager {
         self.wal_writer.append(&WalEntry::AddBan(record.clone()))?;
         self.ban_store.add_ban(record)?;
         Ok(())
+    }
+
+    /// Add a ban unless an active ban already covers it for at least as long.
+    ///
+    /// Check and insert happen in one call, so a caller holding the state
+    /// lock gets them atomically: a burst of signals for one subject (e.g. a
+    /// scanner's 25 requests read from the log in one chunk) yields one ban,
+    /// not one per request. A later, longer ban for the same subject extends
+    /// the existing one instead of being dropped, and a shorter one no longer
+    /// overwrites a longer ban (the plain `add_ban` overwrites unconditionally).
+    pub fn admit_ban(
+        &mut self,
+        mut record: BanRecord,
+        now: DateTime<Utc>,
+    ) -> Result<BanAdmission, HiveGuardError> {
+        let is_active = |b: &BanRecord| b.expires_at.map_or(true, |exp| exp > now);
+        // Records built milliseconds apart in one burst differ in expiry by
+        // those milliseconds; that must not count as an extension.
+        let outlasts = |existing: Option<DateTime<Utc>>, new: Option<DateTime<Utc>>| match (existing, new) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(e), Some(n)) => e + MIN_BAN_EXTENSION >= n,
+        };
+
+        let covering = self.ban_store.covering_bans(&record.subject);
+        if let Some(by) = covering
+            .iter()
+            .find(|b| is_active(b) && outlasts(b.expires_at, record.expires_at))
+        {
+            return Ok(BanAdmission::AlreadyCovered {
+                by: by.subject,
+                expires_at: by.expires_at,
+            });
+        }
+
+        let extended_from = covering
+            .iter()
+            .find(|b| b.subject == record.subject && is_active(b))
+            .map(|b| (b.created_at, b.expires_at));
+
+        let outcome = match extended_from {
+            Some((created_at, previous_expiry)) => {
+                // Keep the original start so "banned since" stays truthful.
+                record.created_at = created_at;
+                BanAdmission::Extended { previous_expiry }
+            }
+            None => BanAdmission::Added,
+        };
+        self.add_ban(record)?;
+        Ok(outcome)
     }
 
     /// Remove a ban: write to WAL first, then update in-memory store.
@@ -1145,5 +1212,181 @@ mod tests {
         let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
         assert_eq!(sm.ban_store().get_all_bans().len(), 1);
         assert!(sm.crdt_store().is_empty());
+    }
+
+    fn ban_for(cidr: &str, ttl: chrono::Duration) -> BanRecord {
+        BanRecord {
+            expires_at: Some(Utc::now() + ttl),
+            ..make_ban(cidr)
+        }
+    }
+
+    #[test]
+    fn admit_ban_burst_for_one_subject_yields_one_ban() {
+        // Journal 2026-09-10 16:10:30 on node-d: 23 "Ban issued" for
+        // 94.154.46.246/32 within 190 ms, one per probe request.
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let now = Utc::now();
+
+        let outcomes: Vec<BanAdmission> = (0..23)
+            .map(|_| sm.admit_ban(ban_for("94.154.46.246/32", chrono::Duration::days(3)), now).unwrap())
+            .collect();
+
+        assert_eq!(outcomes[0], BanAdmission::Added);
+        assert!(outcomes[1..]
+            .iter()
+            .all(|o| matches!(o, BanAdmission::AlreadyCovered { .. })));
+        assert_eq!(sm.ban_store().get_all_bans().len(), 1);
+    }
+
+    #[test]
+    fn admit_ban_shorter_ban_does_not_shorten_active_one() {
+        // Same burst: a 1-day honeypot ban used to overwrite the 3-day
+        // path_probe ban issued 8 ms earlier.
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let now = Utc::now();
+        let long = ban_for("94.154.46.246/32", chrono::Duration::days(3));
+        let long_expiry = long.expires_at;
+        assert_eq!(sm.admit_ban(long, now).unwrap(), BanAdmission::Added);
+
+        let outcome = sm
+            .admit_ban(ban_for("94.154.46.246/32", chrono::Duration::days(1)), now)
+            .unwrap();
+
+        assert!(matches!(outcome, BanAdmission::AlreadyCovered { .. }));
+        let ip: IpAddr = "94.154.46.246".parse().unwrap();
+        assert_eq!(sm.ban_store().is_banned(&ip).unwrap().expires_at, long_expiry);
+    }
+
+    #[test]
+    fn admit_ban_longer_ban_extends_and_keeps_start() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let now = Utc::now();
+        let short = ban_for("11.0.0.1/32", chrono::Duration::hours(1));
+        let (created, short_expiry) = (short.created_at, short.expires_at);
+        sm.admit_ban(short, now).unwrap();
+
+        let long = ban_for("11.0.0.1/32", chrono::Duration::days(3));
+        let long_expiry = long.expires_at;
+        let outcome = sm.admit_ban(long, now).unwrap();
+
+        assert_eq!(outcome, BanAdmission::Extended { previous_expiry: short_expiry });
+        let rec = sm.ban_store().is_banned(&"11.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(rec.expires_at, long_expiry);
+        assert_eq!(rec.created_at, created);
+        assert_eq!(sm.ban_store().get_all_bans().len(), 1);
+    }
+
+    #[test]
+    fn admit_ban_wider_active_ban_covers_host() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let now = Utc::now();
+        sm.admit_ban(ban_for("85.208.96.0/24", chrono::Duration::hours(12)), now).unwrap();
+
+        let covered = sm
+            .admit_ban(ban_for("85.208.96.7/32", chrono::Duration::hours(1)), now)
+            .unwrap();
+        assert_eq!(
+            covered,
+            BanAdmission::AlreadyCovered {
+                by: "85.208.96.0/24".parse().unwrap(),
+                expires_at: sm.ban_store().get_all_bans()[0].expires_at,
+            }
+        );
+
+        // A host ban that outlives the subnet ban is still worth storing.
+        let outliving = sm
+            .admit_ban(ban_for("85.208.96.7/32", chrono::Duration::days(3)), now)
+            .unwrap();
+        assert_eq!(outliving, BanAdmission::Added);
+        assert_eq!(sm.ban_store().get_all_bans().len(), 2);
+    }
+
+    #[test]
+    fn admit_ban_expired_ban_does_not_block_recidivism() {
+        // 85.208.96.0/24 is re-banned every ~12 h after the previous ban
+        // expires; the expiry task may not have swept the old record yet.
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let mut stale = make_ban("85.208.96.0/24");
+        stale.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        sm.add_ban(stale).unwrap();
+
+        let outcome = sm
+            .admit_ban(ban_for("85.208.96.0/24", chrono::Duration::hours(12)), Utc::now())
+            .unwrap();
+        assert_eq!(outcome, BanAdmission::Added);
+    }
+
+    #[test]
+    fn admit_ban_permanent_ban_covers_everything() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let now = Utc::now();
+        let mut permanent = make_ban("11.0.0.0/8");
+        permanent.expires_at = None;
+        sm.admit_ban(permanent, now).unwrap();
+
+        let mut other_permanent = make_ban("11.1.2.3/32");
+        other_permanent.expires_at = None;
+        assert!(matches!(
+            sm.admit_ban(other_permanent, now).unwrap(),
+            BanAdmission::AlreadyCovered { .. }
+        ));
+    }
+
+    #[test]
+    fn admit_ban_concurrent_callers_under_one_lock_add_once() {
+        // Every ban path (pipeline, socket, REST, cluster) shares one
+        // Mutex<StateManager>. With check-and-insert in a single call, racing
+        // callers cannot both see "no active ban" and both insert.
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let dir = TempDir::new().unwrap();
+        let sm = Arc::new(Mutex::new(
+            StateManager::new(dir.path(), WalSyncMode::None).unwrap(),
+        ));
+        let threads = 16;
+        let barrier = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let sm = Arc::clone(&sm);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let record = ban_for("35.205.92.82/32", chrono::Duration::days(3));
+                    barrier.wait();
+                    sm.lock().unwrap().admit_ban(record, Utc::now()).unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<BanAdmission> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let added = outcomes.iter().filter(|o| **o == BanAdmission::Added).count();
+        let covered = outcomes
+            .iter()
+            .filter(|o| matches!(o, BanAdmission::AlreadyCovered { .. }))
+            .count();
+        assert_eq!(added, 1, "exactly one caller may add the ban: {outcomes:?}");
+        assert_eq!(covered, threads - 1, "{outcomes:?}");
+        assert_eq!(sm.lock().unwrap().ban_store().get_all_bans().len(), 1);
+    }
+
+    #[test]
+    fn admit_ban_survives_restart_via_wal() {
+        let dir = TempDir::new().unwrap();
+        let now = Utc::now();
+        {
+            let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+            sm.admit_ban(ban_for("11.0.0.1/32", chrono::Duration::hours(1)), now).unwrap();
+            sm.admit_ban(ban_for("11.0.0.1/32", chrono::Duration::days(3)), now).unwrap();
+            sm.admit_ban(ban_for("11.0.0.1/32", chrono::Duration::hours(2)), now).unwrap();
+        }
+        let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let rec = sm.ban_store().is_banned(&"11.0.0.1".parse().unwrap()).unwrap();
+        assert!(rec.expires_at.unwrap() > now + chrono::Duration::days(2));
     }
 }

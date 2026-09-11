@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 use hiveguard_core::ban_store::BanStore;
 use hiveguard_core::bot_registry::{BotPolicy, BotRegistry};
 use hiveguard_core::detector::Detector;
-use hiveguard_core::models::{GeoIpInfo, NormalizedEvent};
-use hiveguard_core::persistence::StateManager;
+use hiveguard_core::models::{BanRecord, GeoIpInfo, NormalizedEvent};
+use hiveguard_core::persistence::{BanAdmission, StateManager};
 use hiveguard_enforce::Enforcer;
 use hiveguard_plugin_api::traits::Plugin;
 use hiveguard_plugin_api::{AlertEvent, ScoringEnginePlugin, SiemSinkPlugin};
@@ -150,6 +150,51 @@ impl Pipeline {
 
     pub fn close_input(&mut self) {
         self.receiver.close();
+    }
+
+    /// Persist a ban decision unless an active ban already covers it, then
+    /// replicate it. Returns `true` only for a brand-new ban — the caller then
+    /// logs it, counts it and pushes it to the enforcer. An extension updates
+    /// the store (and peers) but the firewall already holds the subject.
+    async fn admit(&self, ban_record: &BanRecord) -> bool {
+        let subject = ban_record.subject;
+        let admission = {
+            let mut st = self.state.lock().await;
+            st.admit_ban(ban_record.clone(), chrono::Utc::now())
+        };
+        let added = match admission {
+            Err(e) => {
+                error!(subject = %subject, "Failed to persist ban: {}", e);
+                return false;
+            }
+            Ok(BanAdmission::AlreadyCovered { by, expires_at }) => {
+                debug!(
+                    subject = %subject,
+                    covered_by = %by,
+                    expires_at = ?expires_at,
+                    "Ban skipped: subject already has an active ban"
+                );
+                return false;
+            }
+            Ok(BanAdmission::Extended { previous_expiry }) => {
+                info!(
+                    subject = %subject,
+                    previous_expiry = ?previous_expiry,
+                    expires_at = ?ban_record.expires_at,
+                    "Ban extended"
+                );
+                false
+            }
+            Ok(BanAdmission::Added) => true,
+        };
+        #[cfg(feature = "cluster")]
+        if let Some(ref c) = self.cluster {
+            c.announce_local_ban(ban_record);
+        }
+        if let Some(ref sniffer) = self.ui_sniffer {
+            sniffer.notify_bans_changed();
+        }
+        added
     }
 
     /// Run the event processing loop until the channel is closed.
@@ -335,9 +380,15 @@ impl Pipeline {
                         self.scoring.record(synthetic);
                         self.scoring.evaluate(signal_ip)
                     };
-                    if let Some(decision) = cti_decision {
-                        let mut ban_record = decision_to_record(decision);
-                        ban_record.geo_info = geo_info.clone();
+                    let cti_decision = match cti_decision {
+                        Some(decision) => {
+                            let mut ban_record = decision_to_record(decision);
+                            ban_record.geo_info = geo_info.clone();
+                            self.admit(&ban_record).await.then_some(ban_record)
+                        }
+                        None => None,
+                    };
+                    if let Some(ban_record) = cti_decision {
                         bans_issued += 1;
                         info!(
                             subject = %ban_record.subject,
@@ -349,18 +400,6 @@ impl Pipeline {
                         let ban_severity = ban_record.severity;
                         let ban_reason = ban_record.reason.clone();
                         let ban_geo = ban_record.geo_info.clone();
-                        let mut st = self.state.lock().await;
-                        if let Err(e) = st.add_ban(ban_record.clone()) {
-                            error!(subject = %subject, "Failed to persist CTI ban: {}", e);
-                            continue;
-                        }
-                        #[cfg(feature = "cluster")]
-                        if let Some(ref c) = self.cluster {
-                            c.announce_local_ban(&ban_record);
-                        }
-                        if let Some(ref sniffer) = self.ui_sniffer {
-                            sniffer.notify_bans_changed();
-                        }
                         {
                             let enforce_start = std::time::Instant::now();
                             let mut enf = self.enforcer.lock().await;
@@ -375,7 +414,6 @@ impl Pipeline {
                                     .observe(enforce_start.elapsed().as_secs_f64());
                             }
                         }
-                        drop(st);
                         if let Some(ref am) = self.alert_dispatcher {
                             am.send(AlertEvent::IpBanned {
                                 ip: subject,
@@ -493,6 +531,12 @@ impl Pipeline {
                         ban_record.geo_info = geo_info.clone();
                     }
 
+                    // Check-and-persist under one state lock: a subject that
+                    // already has an active ban must not get a second one.
+                    if !self.admit(&ban_record).await {
+                        continue;
+                    }
+
                     bans_issued += 1;
                     info!(
                         subject = %ban_record.subject,
@@ -527,19 +571,6 @@ impl Pipeline {
                         }
                     };
 
-                    let mut st = self.state.lock().await;
-                    if let Err(e) = st.add_ban(ban_record.clone()) {
-                        error!(subject = %subject, "Failed to persist ban: {}", e);
-                        continue;
-                    }
-                    #[cfg(feature = "cluster")]
-                    if let Some(ref c) = self.cluster {
-                        c.announce_local_ban(&ban_record);
-                    }
-                    if let Some(ref sniffer) = self.ui_sniffer {
-                        sniffer.notify_bans_changed();
-                    }
-
                     // Apply ban via enforcer (with timing)
                     {
                         let enforce_start = std::time::Instant::now();
@@ -553,8 +584,6 @@ impl Pipeline {
                                 .observe(enforce_start.elapsed().as_secs_f64());
                         }
                     }
-
-                    drop(st);
 
                     // Export to SIEM (Phase 3.1)
                     if let Some(ref mut siem) = self.siem_exporter {
@@ -1126,5 +1155,130 @@ mod tests {
 
         drop(tx);
         pipeline_handle.await.unwrap();
+    }
+
+    /// Counts `apply_ban` calls; one per subject is the invariant under test.
+    #[derive(Default)]
+    struct CountingEnforcer {
+        applied: Arc<std::sync::Mutex<Vec<ipnet::IpNet>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Enforcer for CountingEnforcer {
+        async fn apply_ban(&mut self, subject: &ipnet::IpNet) -> Result<(), hiveguard_core::errors::HiveGuardError> {
+            self.applied.lock().unwrap().push(*subject);
+            Ok(())
+        }
+        async fn remove_ban(&mut self, _: &ipnet::IpNet) -> Result<(), hiveguard_core::errors::HiveGuardError> {
+            Ok(())
+        }
+        async fn sync_full(&mut self, _: &[ipnet::IpNet]) -> Result<(), hiveguard_core::errors::HiveGuardError> {
+            Ok(())
+        }
+        async fn get_current_bans(&self) -> Result<Vec<ipnet::IpNet>, hiveguard_core::errors::HiveGuardError> {
+            Ok(self.applied.lock().unwrap().clone())
+        }
+    }
+
+    fn probe_event(ip: IpAddr, path: &str) -> NormalizedEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert("path".to_string(), path.to_string());
+        metadata.insert("method".to_string(), "GET".to_string());
+        metadata.insert("user_agent".to_string(), "scanner/1.0".to_string());
+        metadata.insert("status_code".to_string(), "404".to_string());
+        NormalizedEvent {
+            timestamp: Utc::now(),
+            source_ip: ip,
+            event_type: EventType::Http4xx,
+            source_name: "nginx".to_string(),
+            raw_line: format!("GET {path} HTTP/1.1"),
+            metadata,
+        }
+    }
+
+    /// Reproduces node-d 2026-09-10 16:10:30: a scanner's 23 probe
+    /// requests reached the pipeline in one log chunk. Each one alone crosses
+    /// the threshold (path_probe 200 > 100), so each produced a fresh
+    /// "Ban issued" and an nft `add element` — 23 bans for one address.
+    #[tokio::test]
+    async fn pipeline_burst_from_one_ip_issues_one_ban() {
+        use hiveguard_core::detectors::PathProbeDetector;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(
+            StateManager::new(dir.path(), WalSyncMode::None).unwrap(),
+        ));
+        let counting = CountingEnforcer::default();
+        let applied = Arc::clone(&counting.applied);
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(counting)));
+
+        let (tx, rx) = mpsc::channel(100);
+        let detectors: Vec<Box<dyn Detector>> = vec![Box::new(PathProbeDetector::new())];
+        let scoring = default_scoring().await;
+        let mut pipeline = Pipeline::new(rx, detectors, scoring, state.clone(), enforcer.clone());
+
+        let ip: IpAddr = "94.154.46.246".parse().unwrap();
+        for path in ["/.git/config", "/.env", "/wp-login.php", "/.env", "/phpmyadmin"]
+            .iter()
+            .cycle()
+            .take(23)
+        {
+            tx.send(probe_event(ip, path)).await.unwrap();
+        }
+        drop(tx);
+        pipeline.run().await;
+
+        let applied = applied.lock().unwrap().clone();
+        assert_eq!(
+            applied,
+            vec!["94.154.46.246/32".parse::<ipnet::IpNet>().unwrap()],
+            "one burst must yield exactly one enforcer ban"
+        );
+        let st = state.lock().await;
+        assert_eq!(st.ban_store().get_all_bans().len(), 1);
+    }
+
+    /// A ban issued through another path (socket `ban`, REST, cluster) while
+    /// signals keep arriving must not be duplicated by the pipeline either.
+    #[tokio::test]
+    async fn pipeline_skips_subject_banned_elsewhere() {
+        use hiveguard_core::detectors::PathProbeDetector;
+        use hiveguard_core::models::{BanRecord, BanSource};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(
+            StateManager::new(dir.path(), WalSyncMode::None).unwrap(),
+        ));
+        state
+            .lock()
+            .await
+            .add_ban(BanRecord {
+                subject: "35.205.92.0/24".parse().unwrap(),
+                created_at: Utc::now(),
+                expires_at: Some(Utc::now() + chrono::Duration::days(30)),
+                severity: 200,
+                reason: "manual".into(),
+                evidence_hash: [0u8; 32],
+                source: BanSource::ManualAdmin,
+                geo_info: None,
+            })
+            .unwrap();
+        let counting = CountingEnforcer::default();
+        let applied = Arc::clone(&counting.applied);
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(counting)));
+
+        let (tx, rx) = mpsc::channel(100);
+        let detectors: Vec<Box<dyn Detector>> = vec![Box::new(PathProbeDetector::new())];
+        let mut pipeline =
+            Pipeline::new(rx, detectors, default_scoring().await, state.clone(), enforcer.clone());
+
+        let ip: IpAddr = "35.205.92.82".parse().unwrap();
+        tx.send(probe_event(ip, "/.env")).await.unwrap();
+        tx.send(probe_event(ip, "/.git/config")).await.unwrap();
+        drop(tx);
+        pipeline.run().await;
+
+        assert!(applied.lock().unwrap().is_empty(), "covered by the /24 ban");
+        assert_eq!(state.lock().await.ban_store().get_all_bans().len(), 1);
     }
 }
