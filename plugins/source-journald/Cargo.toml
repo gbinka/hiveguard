@@ -5,6 +5,7 @@ edition = "2021"
 description = "systemd journal log source for HiveGuard (subprocess-backed journalctl follower)"
 
 [dependencies]
+hiveguard-plugin-utils = { path = "../../hiveguard-plugin-utils" }
 hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
 hiveguard-core = { path = "../../hiveguard-core" }
 serde = { version = "1", features = ["derive"] }

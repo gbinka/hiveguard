@@ -148,6 +148,10 @@ impl Pipeline {
         self
     }
 
+    pub fn close_input(&mut self) {
+        self.receiver.close();
+    }
+
     /// Run the event processing loop until the channel is closed.
     pub async fn run(&mut self) {
         info!("Pipeline started, waiting for events");
@@ -234,15 +238,14 @@ impl Pipeline {
                                 debug!(
                                     ip = %event.source_ip,
                                     ua = ua,
-                                    "Bot allowed — skipping detectors"
+                                    "Unverified bot User-Agent — running detectors"
                                 );
-                                continue; // skip all detectors for this event
                             }
                             BotPolicy::Block => {
                                 info!(
                                     ip = %event.source_ip,
                                     ua = ua,
-                                    "Bot blocked — generating ban signal"
+                                    "Bot marked block — running detectors"
                                 );
                                 // Block policy events still go through detectors
                                 // (they'll likely trigger scanner_fingerprint anyway)
@@ -313,9 +316,11 @@ impl Pipeline {
                     // Whitelist check moved to pipeline — plugin's ScoringEnginePlugin
                     // doesn't take a whitelist argument by design.
                     let signal_ip = synthetic.source_ip.addr();
+                    // Overlap, not containment: the subject may be a /24 while
+                    // the whitelist entry protecting it is a /32.
                     let whitelisted = {
                         let st = self.state.lock().await;
-                        st.whitelist().is_whitelisted(&signal_ip)
+                        st.whitelist().overlaps(&synthetic.source_ip)
                     };
                     let cti_decision = if whitelisted {
                         debug!(
@@ -344,16 +349,14 @@ impl Pipeline {
                         let ban_severity = ban_record.severity;
                         let ban_reason = ban_record.reason.clone();
                         let ban_geo = ban_record.geo_info.clone();
-                        // Replicate to cluster peers before `ban_record` is moved.
+                        let mut st = self.state.lock().await;
+                        if let Err(e) = st.add_ban(ban_record.clone()) {
+                            error!(subject = %subject, "Failed to persist CTI ban: {}", e);
+                            continue;
+                        }
                         #[cfg(feature = "cluster")]
                         if let Some(ref c) = self.cluster {
                             c.announce_local_ban(&ban_record);
-                        }
-                        {
-                            let mut st = self.state.lock().await;
-                            if let Err(e) = st.add_ban(ban_record) {
-                                error!(subject = %subject, "Failed to persist CTI ban: {}", e);
-                            }
                         }
                         if let Some(ref sniffer) = self.ui_sniffer {
                             sniffer.notify_bans_changed();
@@ -372,6 +375,7 @@ impl Pipeline {
                                     .observe(enforce_start.elapsed().as_secs_f64());
                             }
                         }
+                        drop(st);
                         if let Some(ref am) = self.alert_dispatcher {
                             am.send(AlertEvent::IpBanned {
                                 ip: subject,
@@ -461,7 +465,7 @@ impl Pipeline {
                 let signal_ip = signal.source_ip.addr();
                 let whitelisted = {
                     let st = self.state.lock().await;
-                    st.whitelist().is_whitelisted(&signal_ip)
+                    st.whitelist().overlaps(&signal.source_ip)
                 };
                 if whitelisted {
                     debug!(
@@ -516,18 +520,14 @@ impl Pipeline {
                         }
                     };
 
-                    // Replicate to cluster peers before `ban_record` is moved.
+                    let mut st = self.state.lock().await;
+                    if let Err(e) = st.add_ban(ban_record.clone()) {
+                        error!(subject = %subject, "Failed to persist ban: {}", e);
+                        continue;
+                    }
                     #[cfg(feature = "cluster")]
                     if let Some(ref c) = self.cluster {
                         c.announce_local_ban(&ban_record);
-                    }
-                    // Persist ban in StateManager
-                    {
-                        let mut st = self.state.lock().await;
-                        if let Err(e) = st.add_ban(ban_record) {
-                            error!(subject = %subject, "Failed to persist ban: {}", e);
-                            continue;
-                        }
                     }
                     if let Some(ref sniffer) = self.ui_sniffer {
                         sniffer.notify_bans_changed();
@@ -546,6 +546,8 @@ impl Pipeline {
                                 .observe(enforce_start.elapsed().as_secs_f64());
                         }
                     }
+
+                    drop(st);
 
                     // Export to SIEM (Phase 3.1)
                     if let Some(ref mut siem) = self.siem_exporter {
@@ -712,54 +714,37 @@ pub async fn ban_expiry_task(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Collect expired bans
-                let expired_subjects: Vec<ipnet::IpNet>;
-                {
-                    let st = state.lock().await;
-                    let now = chrono::Utc::now();
-                    expired_subjects = st
-                        .ban_store()
-                        .get_all_bans()
-                        .iter()
-                        .filter(|b| b.expires_at.map(|exp| exp <= now).unwrap_or(false))
-                        .map(|b| b.subject)
-                        .collect();
-                }
-
-                if expired_subjects.is_empty() {
-                    continue;
-                }
-
-                let expired_count = expired_subjects.len();
-                info!(count = expired_count, "Cleaning up expired bans");
-
-                // Remove from state
-                {
-                    let mut st = state.lock().await;
-                    st.ban_store_mut().cleanup_expired();
-                }
-
-                // Remove from enforcer
-                {
-                    let mut enf = enforcer.lock().await;
-                    for subject in &expired_subjects {
-                        let enforce_start = std::time::Instant::now();
-                        if let Err(e) = enf.remove_ban(subject).await {
-                            warn!(subject = %subject, "Failed to remove expired ban from enforcer: {}", e);
-                        }
-                        if let Some(ref m) = metrics {
-                            m.enforcement_duration_seconds
-                                .get_or_create(&OperationLabels { operation: "remove".to_string() })
-                                .observe(enforce_start.elapsed().as_secs_f64());
-                        }
+                // Serialize desired-state changes and enforcement. Holding state
+                // through sync prevents an older snapshot overwriting a new ban.
+                let mut st = state.lock().await;
+                let now = chrono::Utc::now();
+                let expired: Vec<_> = st.ban_store().get_all_bans().into_iter()
+                    .filter(|b| b.expires_at.is_some_and(|exp| exp <= now))
+                    .map(|b| b.subject).collect();
+                let mut removed = 0;
+                for subject in expired {
+                    match st.remove_ban(&subject) {
+                        Ok(true) => removed += 1,
+                        Ok(false) => {},
+                        Err(e) => error!(%subject, "Failed to persist ban expiry: {e}"),
                     }
                 }
-
-                // Update metrics
+                let desired: Vec<_> = st.ban_store().get_all_bans().into_iter()
+                    .filter(|b| !st.whitelist().overlaps(&b.subject))
+                    .filter(|b| b.expires_at.is_none_or(|exp| exp > now))
+                    .map(|b| b.subject).collect();
+                let enforce_start = std::time::Instant::now();
+                // Always sync, including no expiry and an empty desired set:
+                // this repairs failed apply/remove and external firewall drift.
+                if let Err(e) = enforcer.lock().await.sync_full(&desired).await {
+                    error!("Firewall reconciliation failed; retrying on next tick: {e}");
+                }
                 if let Some(ref m) = metrics {
-                    m.bans_expired_total.inc_by(expired_count as u64);
-                    let st = state.lock().await;
-                    m.active_bans.set(st.ban_store().get_all_bans().len() as i64);
+                    m.bans_expired_total.inc_by(removed);
+                    m.active_bans.set(desired.len() as i64);
+                    m.enforcement_duration_seconds
+                        .get_or_create(&OperationLabels { operation: "sync".to_string() })
+                        .observe(enforce_start.elapsed().as_secs_f64());
                 }
             }
             _ = shutdown.changed() => {
@@ -851,6 +836,32 @@ mod tests {
         )
         .await
         .expect("default scoring plugin must construct")
+    }
+
+    #[tokio::test]
+    async fn spoofed_allowed_bot_still_triggers_http_flood() {
+        use hiveguard_core::bot_registry::BotRule;
+        use hiveguard_core::detectors::HttpFloodDetector;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(StateManager::new(dir.path(), WalSyncMode::None).unwrap()));
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(ObserveOnlyEnforcer::new())));
+        let (tx, rx) = mpsc::channel(10);
+        let registry = BotRegistry::new(vec![BotRule {
+            name: "Googlebot".into(), ua_contains: "Googlebot".into(), org: "test".into(), policy: BotPolicy::Allow,
+        }]);
+        let detector = HttpFloodDetector::with_config(Duration::from_secs(60), 3, 0, Duration::from_secs(60), vec![]);
+        let mut pipeline = Pipeline::new(rx, vec![Box::new(detector)], default_scoring().await, state.clone(), enforcer)
+            .with_bot_registry(Arc::new(Mutex::new(registry)));
+        let ip = "11.22.33.44".parse().unwrap();
+        for _ in 0..3 {
+            tx.send(NormalizedEvent { timestamp: Utc::now(), source_ip: ip,
+                event_type: EventType::HttpRequest, source_name: "nginx".into(), raw_line: "GET /".into(),
+                metadata: HashMap::from([("user_agent".into(), "attacker Googlebot".into()), ("path".into(), "/".into())]),
+            }).await.unwrap();
+        }
+        drop(tx);
+        pipeline.run().await;
+        assert!(state.lock().await.ban_store().is_banned(&ip).is_some());
     }
 
     #[tokio::test]

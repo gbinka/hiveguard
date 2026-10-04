@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use hiveguard_core::anti_poison::{check_quarantine, median, RateLimiter};
 use hiveguard_core::trust::TrustManager;
@@ -37,25 +38,24 @@ pub enum GossipAction {
         records: Vec<SignedBanRecord>,
     },
     /// Send a digest exchange to a peer.
-    SendDigestExchange {
-        target_id: String,
-        digest: Vec<u8>,
-    },
+    SendDigestExchange { target_id: String, digest: Vec<u8> },
     /// Send a diff request to a peer.
     SendDiffRequest {
         target_id: String,
         missing_keys: Vec<String>,
     },
     /// Apply these received ban records locally (already verified).
-    ApplyBans {
-        records: Vec<BanRecord>,
-    },
+    ApplyBans { records: Vec<BanRecord> },
 }
 
 /// Gossip engine for propagating ban records across the cluster.
 pub struct GossipEngine {
     config: GossipConfig,
     local_node_id: String,
+    // Only authenticated, independently signed observations count as votes.
+    // Bounded process-local cache; peers retransmit after a restart.
+    reports: Mutex<HashMap<String, HashMap<String, BanRecord>>>,
+    accepted: Mutex<HashMap<[u8; 32], chrono::DateTime<chrono::Utc>>>,
 }
 
 impl GossipEngine {
@@ -64,17 +64,34 @@ impl GossipEngine {
         Self {
             config,
             local_node_id,
+            reports: Mutex::new(HashMap::new()),
+            accepted: Mutex::new(HashMap::new()),
         }
     }
 
     /// Compute a simple digest of the local ban store.
-    /// Returns a blake3 hash of all ban subjects sorted alphabetically.
+    /// Returns a blake3 hash of versioned records, independent of local provenance.
     pub fn compute_digest(bans: &[BanRecord]) -> Vec<u8> {
-        let mut keys: Vec<String> = bans.iter().map(|b| b.subject.to_string()).collect();
+        let mut keys: Vec<String> = bans.iter().map(Self::record_key).collect();
         keys.sort();
         let combined = keys.join(",");
         let hash = blake3::hash(combined.as_bytes());
         hash.as_bytes().to_vec()
+    }
+
+    /// Version key understood by new peers; old peers safely respond with their
+    /// full records when they do not recognize it. Local provenance is excluded.
+    pub fn record_key(record: &BanRecord) -> String {
+        let payload = bincode::serialize(&(
+            record.subject,
+            record.created_at,
+            record.expires_at,
+            record.severity,
+            &record.reason,
+            record.evidence_hash,
+        ))
+        .expect("ban version fields serialize");
+        format!("{}#{}", record.subject, blake3::hash(&payload).to_hex())
     }
 
     /// Determine which peers to gossip a new ban to.
@@ -135,8 +152,17 @@ impl GossipEngine {
 
         info!(peer = sender_id, "Digest mismatch — requesting diff");
 
-        // For simple implementation, request all keys (the peer will send what we're missing)
-        let local_keys: Vec<String> = local_bans.iter().map(|b| b.subject.to_string()).collect();
+        // Bound the inventory too: an omitted key only causes a safe redundant
+        // response. The daemon rotates bounded response batches over the tail.
+        let mut inventory_bytes = 0usize;
+        let local_keys: Vec<String> = local_bans
+            .iter()
+            .map(Self::record_key)
+            .take_while(|key| {
+                inventory_bytes += key.len() + 8;
+                inventory_bytes <= 2 * 1024 * 1024
+            })
+            .collect();
         Some(GossipAction::SendDiffRequest {
             target_id: sender_id.to_string(),
             missing_keys: local_keys,
@@ -154,7 +180,10 @@ impl GossipEngine {
 
         local_bans
             .iter()
-            .filter(|b| !peer_set.contains(b.subject.to_string().as_str()))
+            .filter(|b| {
+                !peer_set.contains(Self::record_key(b).as_str())
+                    && !peer_set.contains(b.subject.to_string().as_str())
+            })
             .cloned()
             .collect()
     }
@@ -179,9 +208,12 @@ impl GossipEngine {
     ///
     /// Each record is checked against:
     /// 1. Quarantine — reject all if sender's ban volume is anomalous
-    /// 2. Rate limiter — reject if sender exceeds max bans per minute
-    /// 3. Signature verification — reject if Ed25519 signature is invalid
-    /// 4. Trust scoring — reject if reporters' combined trust < threshold
+    /// 2. Replay/expiry and signature verification
+    /// 3. Independent signed observations accumulated across packets for quorum
+    /// 4. Decision rate limiter, charged only after authentication and quorum
+    ///
+    /// Callers must additionally bound raw verification work and prefilter local
+    /// whitelist, revocation and already-applied state before this method.
     ///
     /// `peer_public_keys`: map of node_id → raw Ed25519 public key bytes,
     /// populated from `PeerInfo::public_key_bytes` after TLS handshake.
@@ -195,6 +227,28 @@ impl GossipEngine {
         rate_limiter: &mut RateLimiter,
         ban_counts: &HashMap<String, usize>,
         peer_public_keys: &HashMap<String, Vec<u8>>,
+    ) -> Option<GossipAction> {
+        self.handle_ban_sync_filtered_with_policy(
+            records,
+            sender_id,
+            trust_manager,
+            rate_limiter,
+            ban_counts,
+            peer_public_keys,
+            |_| true,
+        )
+    }
+
+    /// Apply local eligibility to the final quorum decision before charging it.
+    pub fn handle_ban_sync_filtered_with_policy<F: Fn(&BanRecord) -> bool>(
+        &self,
+        records: Vec<SignedBanRecord>,
+        sender_id: &str,
+        trust_manager: &TrustManager,
+        rate_limiter: &mut RateLimiter,
+        ban_counts: &HashMap<String, usize>,
+        peer_public_keys: &HashMap<String, Vec<u8>>,
+        eligible: F,
     ) -> Option<GossipAction> {
         if records.is_empty() {
             return None;
@@ -221,14 +275,36 @@ impl GossipEngine {
 
         let mut accepted = Vec::new();
 
+        let now = chrono::Utc::now();
+        let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports.retain(|_, votes| {
+            votes.retain(|_, record| record.expires_at.is_none_or(|expiry| expiry > now));
+            !votes.is_empty()
+        });
+        let mut report_count: usize = reports.values().map(HashMap::len).sum();
+        let mut seen = self.accepted.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|_, expiry| *expiry > now);
+        let mut batch_seen = HashSet::new();
         for signed in records {
-            // 2. Rate limit check
-            if !rate_limiter.check_and_record(sender_id) {
-                warn!(
-                    sender = sender_id,
-                    subject = %signed.record.subject,
-                    "Rate limit exceeded — dropping ban record"
-                );
+            // Never promote a re-signed remote observation into an independent
+            // vote. Legacy daemons used to re-sign replicated records.
+            if matches!(
+                signed.record.source,
+                hiveguard_core::BanSource::ClusterPeer(_)
+            ) || signed.record.expires_at.is_some_and(|expiry| expiry <= now)
+            {
+                continue;
+            }
+            let Ok(encoded) = bincode::serialize(&signed) else {
+                continue;
+            };
+            // Bound retained metadata as well as record count (including votes
+            // from different reporters for the same subject).
+            if encoded.len() > 16 * 1024 {
+                continue;
+            }
+            let key = *blake3::hash(&encoded).as_bytes();
+            if seen.contains_key(&key) || !batch_seen.insert(key) {
                 continue;
             }
 
@@ -255,23 +331,63 @@ impl GossipEngine {
                 continue;
             }
 
-            // 4. Trust check: signer + relay endorsement
-            let mut reporters = vec![sender_id.to_string()];
-            if signed.signer_id != sender_id {
-                reporters.push(signed.signer_id.clone());
-            }
-
-            if !trust_manager.should_enforce(&reporters) {
-                debug!(
-                    sender = sender_id,
-                    signer = %signed.signer_id,
-                    subject = %signed.record.subject,
-                    "Insufficient trust — dropping ban record"
-                );
+            // A transport relay is not a second independent reporter. Keep
+            // verified votes across packets, deduplicated by signer + subject.
+            let subject = signed.record.subject.to_string();
+            if !reports.contains_key(&subject) && reports.len() >= 8192 {
                 continue;
             }
-
-            accepted.push(signed.record);
+            let votes = reports.entry(subject).or_default();
+            if !votes.contains_key(&signed.signer_id) {
+                if report_count >= 8192 || votes.len() >= 64 {
+                    continue;
+                }
+                report_count += 1;
+            }
+            if votes.get(&signed.signer_id).is_some_and(|old| {
+                (old.created_at, old.expires_at)
+                    > (signed.record.created_at, signed.record.expires_at)
+            }) {
+                continue;
+            }
+            votes.insert(signed.signer_id.clone(), signed.record.clone());
+            let reporters: Vec<String> = votes.keys().cloned().collect();
+            if !trust_manager.should_enforce(&reporters) {
+                continue;
+            }
+            let mut record = signed.record;
+            // Every counted reporter must support the resulting lifetime and
+            // severity, not merely an earlier short ban on the same subject.
+            record.created_at = votes
+                .values()
+                .map(|r| r.created_at)
+                .min()
+                .unwrap_or(record.created_at);
+            record.expires_at = votes.values().filter_map(|r| r.expires_at).min();
+            record.severity = votes
+                .values()
+                .map(|r| r.severity)
+                .min()
+                .unwrap_or(record.severity);
+            record.source = hiveguard_core::BanSource::ClusterPeer(signed.signer_id);
+            if !eligible(&record) {
+                continue;
+            }
+            // Charge only a new verified decision that reaches quorum.
+            if !rate_limiter.check_and_record(sender_id) {
+                continue;
+            }
+            if seen.len() >= 8192 {
+                if let Some(oldest) = seen
+                    .iter()
+                    .min_by_key(|(_, expiry)| **expiry)
+                    .map(|(key, _)| *key)
+                {
+                    seen.remove(&oldest);
+                }
+            }
+            seen.insert(key, now + chrono::Duration::seconds(5));
+            accepted.push(record);
         }
 
         if accepted.is_empty() {
@@ -359,7 +475,10 @@ mod tests {
 
     /// Build a peer_public_keys map from a list of (signer_id, pub_key).
     fn peer_keys(items: &[(&str, Vec<u8>)]) -> HashMap<String, Vec<u8>> {
-        items.iter().map(|(id, k)| (id.to_string(), k.clone())).collect()
+        items
+            .iter()
+            .map(|(id, k)| (id.to_string(), k.clone()))
+            .collect()
     }
 
     /// Simpler helper that creates a single signed ban and returns the signed record.
@@ -398,7 +517,10 @@ mod tests {
 
     #[test]
     fn compute_digest_same_bans_same_digest() {
-        let bans = vec![make_ban("10.0.0.1/32").record, make_ban("10.0.0.2/32").record];
+        let bans = vec![
+            make_ban("10.0.0.1/32").record,
+            make_ban("10.0.0.2/32").record,
+        ];
         let d1 = GossipEngine::compute_digest(&bans);
         let d2 = GossipEngine::compute_digest(&bans);
         assert_eq!(d1, d2);
@@ -415,8 +537,11 @@ mod tests {
 
     #[test]
     fn compute_digest_order_independent() {
-        let bans1 = vec![make_ban("10.0.0.1/32").record, make_ban("10.0.0.2/32").record];
-        let bans2 = vec![make_ban("10.0.0.2/32").record, make_ban("10.0.0.1/32").record];
+        let bans1 = vec![
+            make_ban("10.0.0.1/32").record,
+            make_ban("10.0.0.2/32").record,
+        ];
+        let bans2 = bans1.iter().rev().cloned().collect::<Vec<_>>();
         let d1 = GossipEngine::compute_digest(&bans1);
         let d2 = GossipEngine::compute_digest(&bans2);
         assert_eq!(d1, d2); // sorted internally
@@ -438,7 +563,13 @@ mod tests {
 
     #[test]
     fn select_gossip_targets_with_peers() {
-        let engine = GossipEngine::new("local".into(), GossipConfig { fanout: 2, ..Default::default() });
+        let engine = GossipEngine::new(
+            "local".into(),
+            GossipConfig {
+                fanout: 2,
+                ..Default::default()
+            },
+        );
         let mut pm = PeerManager::new();
         pm.add_peer(make_peer_info("n1"));
         pm.add_peer(make_peer_info("n2"));
@@ -450,7 +581,13 @@ mod tests {
 
     #[test]
     fn select_gossip_targets_fanout_exceeds_peers() {
-        let engine = GossipEngine::new("local".into(), GossipConfig { fanout: 10, ..Default::default() });
+        let engine = GossipEngine::new(
+            "local".into(),
+            GossipConfig {
+                fanout: 10,
+                ..Default::default()
+            },
+        );
         let mut pm = PeerManager::new();
         pm.add_peer(make_peer_info("n1"));
         pm.add_peer(make_peer_info("n2"));
@@ -478,7 +615,13 @@ mod tests {
 
     #[test]
     fn propagate_bans_with_peers_returns_action() {
-        let engine = GossipEngine::new("local".into(), GossipConfig { fanout: 2, ..Default::default() });
+        let engine = GossipEngine::new(
+            "local".into(),
+            GossipConfig {
+                fanout: 2,
+                ..Default::default()
+            },
+        );
         let mut pm = PeerManager::new();
         pm.add_peer(make_peer_info("n1"));
         pm.add_peer(make_peer_info("n2"));
@@ -487,7 +630,10 @@ mod tests {
         let result = engine.propagate_bans(bans, &pm);
         assert!(result.is_some());
         match result.unwrap() {
-            GossipAction::SendBanSync { target_ids, records } => {
+            GossipAction::SendBanSync {
+                target_ids,
+                records,
+            } => {
                 assert_eq!(target_ids.len(), 2);
                 assert_eq!(records.len(), 1);
             }
@@ -514,7 +660,10 @@ mod tests {
         let result = engine.handle_digest_exchange(&remote_digest, &local_bans, "peer1");
         assert!(result.is_some());
         match result.unwrap() {
-            GossipAction::SendDiffRequest { target_id, missing_keys } => {
+            GossipAction::SendDiffRequest {
+                target_id,
+                missing_keys,
+            } => {
                 assert_eq!(target_id, "peer1");
                 assert_eq!(missing_keys.len(), 1);
             }
@@ -589,7 +738,11 @@ mod tests {
         cell.get_or_init(|| gen_key())
     }
 
-    fn signed_ban(ip: &str, signer: &str, cell: &'static OnceLock<(Vec<u8>, Vec<u8>)>) -> SignedBanRecord {
+    fn signed_ban(
+        ip: &str,
+        signer: &str,
+        cell: &'static OnceLock<(Vec<u8>, Vec<u8>)>,
+    ) -> SignedBanRecord {
         let (priv_key, _) = kp(cell);
         let record = hiveguard_core::models::BanRecord {
             subject: ip.parse::<IpNet>().unwrap(),
@@ -604,7 +757,11 @@ mod tests {
         SignedBanRecord::sign(record, signer, priv_key, TEST_POW).unwrap()
     }
 
-    fn signed_ban_from_peer(ip: &str, signer: &str, cell: &'static OnceLock<(Vec<u8>, Vec<u8>)>) -> SignedBanRecord {
+    fn signed_ban_from_peer(
+        ip: &str,
+        signer: &str,
+        cell: &'static OnceLock<(Vec<u8>, Vec<u8>)>,
+    ) -> SignedBanRecord {
         let (priv_key, _) = kp(cell);
         let record = hiveguard_core::models::BanRecord {
             subject: ip.parse::<IpNet>().unwrap(),
@@ -620,13 +777,14 @@ mod tests {
     }
 
     fn pkeys(pairs: &[(&str, &'static OnceLock<(Vec<u8>, Vec<u8>)>)]) -> HashMap<String, Vec<u8>> {
-        pairs.iter()
+        pairs
+            .iter()
             .map(|(id, cell)| (id.to_string(), kp(cell).1.clone()))
             .collect()
     }
 
     #[test]
-    fn filtered_sync_two_reporters_accepted() {
+    fn filtered_sync_relay_is_not_an_independent_reporter() {
         let engine = GossipEngine::new("local".into(), GossipConfig::default());
         let tm = make_trusted_manager(&["sender-1", "origin-1"]);
         let mut rl = RateLimiter::new(100, chrono::Duration::minutes(1));
@@ -635,12 +793,9 @@ mod tests {
         let bans = vec![signed_ban_from_peer("1.2.3.0/32", "origin-1", &ORIGIN_1)];
         let pk = pkeys(&[("origin-1", &ORIGIN_1)]);
 
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
-        assert!(result.is_some());
-        match result.unwrap() {
-            GossipAction::ApplyBans { records } => assert_eq!(records.len(), 1),
-            _ => panic!("Expected ApplyBans"),
-        }
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -652,7 +807,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.3.1/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // Single reporter ~1.0 < threshold 2.0
     }
 
@@ -665,7 +821,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.3.2/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_some());
     }
 
@@ -679,7 +836,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.3.3/32", "sender-low", &SENDER_LOW)];
         let pk = pkeys(&[("sender-low", &SENDER_LOW)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-low", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-low", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // Trust too low
     }
 
@@ -696,7 +854,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.3.4/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // Rate limited
     }
 
@@ -716,7 +875,8 @@ mod tests {
             signed_ban("1.2.4.3/32", "sender-1", &SENDER_1),
         ];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_some());
         match result.unwrap() {
             GossipAction::ApplyBans { records } => assert_eq!(records.len(), 1),
@@ -737,7 +897,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.5.1/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // Quarantined
     }
 
@@ -749,7 +910,12 @@ mod tests {
         let ban_counts: HashMap<String, usize> = HashMap::new();
 
         let result = engine.handle_ban_sync_filtered(
-            vec![], "sender-1", &tm, &mut rl, &ban_counts, &HashMap::new(),
+            vec![],
+            "sender-1",
+            &tm,
+            &mut rl,
+            &ban_counts,
+            &HashMap::new(),
         );
         assert!(result.is_none());
     }
@@ -763,8 +929,9 @@ mod tests {
 
         let bans = vec![signed_ban_from_peer("1.2.6.1/32", "peer-x", &PEER_X)];
         let pk = pkeys(&[("peer-x", &PEER_X)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
-        assert!(result.is_some()); // Both reporters trusted → sum ≥ 2.0
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        assert!(result.is_none()); // Relay plus one signed observation is not quorum
     }
 
     #[test]
@@ -790,7 +957,11 @@ mod tests {
         };
         let signed = SignedBanRecord::sign(record, "peer-y", &priv_key, TEST_POW).unwrap();
         let result = engine.handle_ban_sync_filtered(
-            vec![signed], "sender-1", &tm, &mut rl, &ban_counts,
+            vec![signed],
+            "sender-1",
+            &tm,
+            &mut rl,
+            &ban_counts,
             &HashMap::new(), // peer-y not in peer_keys → unknown signer → dropped
         );
         assert!(result.is_none());
@@ -820,8 +991,10 @@ mod tests {
                 SignedBanRecord::sign(r, "sender-1", &priv_key, TEST_POW).unwrap()
             })
             .collect();
-        let pk: HashMap<String, Vec<u8>> = [("sender-1".to_string(), pub_key)].into_iter().collect();
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let pk: HashMap<String, Vec<u8>> =
+            [("sender-1".to_string(), pub_key)].into_iter().collect();
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_some());
         match result.unwrap() {
             GossipAction::ApplyBans { records } => assert_eq!(records.len(), 100),
@@ -853,8 +1026,10 @@ mod tests {
                 SignedBanRecord::sign(r, "sender-1", &priv_key, TEST_POW).unwrap()
             })
             .collect();
-        let pk: HashMap<String, Vec<u8>> = [("sender-1".to_string(), pub_key)].into_iter().collect();
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let pk: HashMap<String, Vec<u8>> =
+            [("sender-1".to_string(), pub_key)].into_iter().collect();
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_some());
         match result.unwrap() {
             GossipAction::ApplyBans { records } => assert_eq!(records.len(), 100),
@@ -874,7 +1049,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.8.1/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_some()); // 50 <= 50, not quarantined
     }
 
@@ -890,7 +1066,8 @@ mod tests {
 
         let bans = vec![signed_ban("1.2.9.1/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // 51 > 50, quarantined
     }
 
@@ -919,7 +1096,130 @@ mod tests {
         // ClusterPeer source with same ID as sender → only 1 reporter
         let bans = vec![signed_ban_from_peer("1.2.10.1/32", "sender-1", &SENDER_1)];
         let pk = pkeys(&[("sender-1", &SENDER_1)]);
-        let result = engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
+        let result =
+            engine.handle_ban_sync_filtered(bans, "sender-1", &tm, &mut rl, &ban_counts, &pk);
         assert!(result.is_none()); // Single reporter ~1.0 < 2.0
+    }
+    #[test]
+    fn independent_reports_accumulate_and_replay_cannot_spend_quota() {
+        let engine = GossipEngine::new("local".into(), GossipConfig::default());
+        let tm = make_trusted_manager(&["sender-1", "origin-1"]);
+        let mut rl = RateLimiter::new(1, chrono::Duration::minutes(1));
+        let pk = pkeys(&[("sender-1", &SENDER_1), ("origin-1", &ORIGIN_1)]);
+        let first = signed_ban("1.2.3.4/32", "sender-1", &SENDER_1);
+        let second = signed_ban("1.2.3.4/32", "origin-1", &ORIGIN_1);
+        let counts = HashMap::new();
+        assert!(engine
+            .handle_ban_sync_filtered(
+                vec![first.clone(), first],
+                "sender-1",
+                &tm,
+                &mut rl,
+                &counts,
+                &pk
+            )
+            .is_none());
+        let result = engine.handle_ban_sync_filtered(
+            vec![second.clone()],
+            "origin-1",
+            &tm,
+            &mut rl,
+            &counts,
+            &pk,
+        );
+        assert!(matches!(result, Some(GossipAction::ApplyBans { .. })));
+        assert!(engine
+            .handle_ban_sync_filtered(vec![second], "sender-1", &tm, &mut rl, &counts, &pk)
+            .is_none());
+        assert!(rl.check_and_record("sender-1"));
+    }
+
+    #[test]
+    fn forged_signature_does_not_consume_decision_quota() {
+        let engine = GossipEngine::new("local".into(), GossipConfig::default());
+        let tm = make_trusted_manager_with_threshold(&["sender-1"], 1.0);
+        let mut rl = RateLimiter::new(1, chrono::Duration::minutes(1));
+        let pk = pkeys(&[("sender-1", &SENDER_1)]);
+        let good = signed_ban("1.2.3.4/32", "sender-1", &SENDER_1);
+        let mut bad = good.clone();
+        bad.record.severity += 1;
+        assert!(engine
+            .handle_ban_sync_filtered(vec![bad], "sender-1", &tm, &mut rl, &HashMap::new(), &pk)
+            .is_none());
+        assert!(engine
+            .handle_ban_sync_filtered(vec![good], "sender-1", &tm, &mut rl, &HashMap::new(), &pk)
+            .is_some());
+    }
+
+    #[test]
+    fn expiry_change_changes_digest_and_is_requested() {
+        let engine = GossipEngine::new("local".into(), GossipConfig::default());
+        let old = make_ban("10.0.0.1/32").record;
+        let mut new = old.clone();
+        new.expires_at = old.expires_at.map(|t| t + chrono::Duration::hours(1));
+        assert_ne!(
+            GossipEngine::compute_digest(&[old.clone()]),
+            GossipEngine::compute_digest(&[new.clone()])
+        );
+        assert_eq!(
+            engine
+                .handle_diff_request(&[GossipEngine::record_key(&old)], &[new])
+                .len(),
+            1
+        );
+        let mut remote = old.clone();
+        remote.source = BanSource::ClusterPeer("origin".into());
+        assert_eq!(
+            GossipEngine::record_key(&old),
+            GossipEngine::record_key(&remote)
+        );
+    }
+    #[test]
+    fn transient_apply_failure_can_retry_after_short_dedup_window() {
+        let engine = GossipEngine::new("local".into(), GossipConfig::default());
+        let tm = make_trusted_manager_with_threshold(&["sender-1"], 1.0);
+        let mut rl = RateLimiter::new(2, chrono::Duration::minutes(1));
+        let pk = pkeys(&[("sender-1", &SENDER_1)]);
+        let signed = signed_ban("1.2.3.4/32", "sender-1", &SENDER_1);
+        assert!(engine
+            .handle_ban_sync_filtered(
+                vec![signed.clone()],
+                "sender-1",
+                &tm,
+                &mut rl,
+                &HashMap::new(),
+                &pk
+            )
+            .is_some());
+        // Simulate time passing after the caller failed to persist the result.
+        // A duplicate must be retryable without waiting for the ban's expiry.
+        for expiry in engine.accepted.lock().unwrap().values_mut() {
+            assert!(*expiry <= Utc::now() + chrono::Duration::seconds(5));
+            *expiry = Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert!(engine
+            .handle_ban_sync_filtered(vec![signed], "sender-1", &tm, &mut rl, &HashMap::new(), &pk)
+            .is_some());
+    }
+
+    #[test]
+    fn inapplicable_quorum_decision_does_not_consume_quota() {
+        let engine = GossipEngine::new("local".into(), GossipConfig::default());
+        let tm = make_trusted_manager_with_threshold(&["sender-1"], 1.0);
+        let mut rl = RateLimiter::new(1, chrono::Duration::minutes(1));
+        let pk = pkeys(&[("sender-1", &SENDER_1)]);
+        let signed = signed_ban("1.2.3.4/32", "sender-1", &SENDER_1);
+        assert!(engine
+            .handle_ban_sync_filtered_with_policy(
+                vec![signed],
+                "sender-1",
+                &tm,
+                &mut rl,
+                &HashMap::new(),
+                &pk,
+                |_| false
+            )
+            .is_none());
+        assert!(rl.check_and_record("sender-1"));
     }
 }

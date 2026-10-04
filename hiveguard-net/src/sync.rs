@@ -53,7 +53,9 @@ impl SyncCoordinator {
         let mut actions = Vec::new();
 
         // Select a target to probe
-        let probe_action = self.swim.select_probe_target(&self.peer_manager, local_digest);
+        let probe_action = self
+            .swim
+            .select_probe_target(&self.peer_manager, local_digest);
         if !matches!(probe_action, SwimAction::None) {
             actions.push(probe_action);
         }
@@ -71,13 +73,10 @@ impl SyncCoordinator {
     }
 
     /// Handle an incoming Ping message. Returns a Pong action.
-    pub fn handle_ping(
-        &mut self,
-        sender_id: &str,
-        _remote_digest: &[u8],
-    ) -> SwimAction {
+    pub fn handle_ping(&mut self, sender_id: &str, _remote_digest: &[u8]) -> SwimAction {
         // Update sender state to alive
-        self.peer_manager.update_peer_state(sender_id, crate::peer::PeerState::Alive);
+        self.peer_manager
+            .update_peer_state(sender_id, crate::peer::PeerState::Alive);
 
         // We don't produce a SwimAction::SendPong — the caller
         // should assemble a Pong ClusterMessage and send it directly.
@@ -85,10 +84,7 @@ impl SyncCoordinator {
     }
 
     /// Propagate signed bans via gossip.
-    pub fn propagate_bans(
-        &self,
-        records: Vec<SignedBanRecord>,
-    ) -> Option<GossipAction> {
+    pub fn propagate_bans(&self, records: Vec<SignedBanRecord>) -> Option<GossipAction> {
         self.gossip.propagate_bans(records, &self.peer_manager)
     }
 
@@ -96,10 +92,7 @@ impl SyncCoordinator {
     ///
     /// **WARNING:** Bypasses trust, rate limiting, quarantine, and signature checks.
     /// Must NOT be used for network-received data. Use `handle_ban_sync_filtered()` instead.
-    pub(crate) fn handle_ban_sync(
-        &self,
-        records: Vec<SignedBanRecord>,
-    ) -> Option<GossipAction> {
+    pub(crate) fn handle_ban_sync(&self, records: Vec<SignedBanRecord>) -> Option<GossipAction> {
         self.gossip.handle_ban_sync(records)
     }
 
@@ -120,6 +113,28 @@ impl SyncCoordinator {
             rate_limiter,
             ban_counts,
             peer_public_keys,
+        )
+    }
+
+    /// Filter the merged quorum decision against local policy before quota.
+    pub fn handle_ban_sync_filtered_with_policy<F: Fn(&hiveguard_core::BanRecord) -> bool>(
+        &self,
+        records: Vec<SignedBanRecord>,
+        sender_id: &str,
+        trust_manager: &hiveguard_core::trust::TrustManager,
+        rate_limiter: &mut hiveguard_core::anti_poison::RateLimiter,
+        ban_counts: &std::collections::HashMap<String, usize>,
+        peer_public_keys: &std::collections::HashMap<String, Vec<u8>>,
+        eligible: F,
+    ) -> Option<GossipAction> {
+        self.gossip.handle_ban_sync_filtered_with_policy(
+            records,
+            sender_id,
+            trust_manager,
+            rate_limiter,
+            ban_counts,
+            peer_public_keys,
+            eligible,
         )
     }
 
@@ -200,7 +215,10 @@ mod tests {
     }
 
     /// Returns (SignedBanRecord, HashMap<signer_id, pub_key>)
-    fn make_ban_with_keys(ip: &str, signer_id: &str) -> (SignedBanRecord, HashMap<String, Vec<u8>>) {
+    fn make_ban_with_keys(
+        ip: &str,
+        signer_id: &str,
+    ) -> (SignedBanRecord, HashMap<String, Vec<u8>>) {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -321,9 +339,8 @@ mod tests {
         for _ in 0..100 {
             tm.record_true_positive("sender-1");
         }
-        let mut rl = hiveguard_core::anti_poison::RateLimiter::new(
-            100, chrono::Duration::minutes(1),
-        );
+        let mut rl =
+            hiveguard_core::anti_poison::RateLimiter::new(100, chrono::Duration::minutes(1));
         let ban_counts = std::collections::HashMap::new();
         let (signed, peer_keys) = make_ban_with_keys("1.2.3.4/32", "sender-1");
 
@@ -351,9 +368,8 @@ mod tests {
         );
         let mut tm = hiveguard_core::trust::TrustManager::new(2.0);
         tm.register_node("sender-low".into()); // default 0.5 score < 2.0
-        let mut rl = hiveguard_core::anti_poison::RateLimiter::new(
-            100, chrono::Duration::minutes(1),
-        );
+        let mut rl =
+            hiveguard_core::anti_poison::RateLimiter::new(100, chrono::Duration::minutes(1));
         let ban_counts = std::collections::HashMap::new();
         let (signed, peer_keys) = make_ban_with_keys("1.2.3.5/32", "sender-low");
 

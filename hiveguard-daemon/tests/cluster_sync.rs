@@ -156,10 +156,12 @@ async fn preexisting_ban_reconciles_via_anti_entropy() {
     let port_b = free_udp_port();
 
     let cfg_a = make_config("node-a", dir_a.path(), port_a, port_b, &fp_b);
-    let cfg_b = make_config("node-b", dir_b.path(), port_b, port_a, &fp_a);
+    let mut cfg_b = make_config("node-b", dir_b.path(), port_b, port_a, &fp_a);
+    cfg_b.trust.max_bans_per_minute = 1;
 
     let state_a = make_state(dir_a.path());
     let state_b = make_state(dir_b.path());
+    state_b.lock().await.add_whitelist("123.0.0.0/24".parse().unwrap()).unwrap();
 
     // Seed a ban into node A's store *before* the cluster starts.
     let banned: IpNet = "185.243.218.99/32".parse().unwrap();
@@ -168,7 +170,7 @@ async fn preexisting_ban_reconciles_via_anti_entropy() {
         st.add_ban(BanRecord {
             subject: banned,
             created_at: Utc::now(),
-            expires_at: None,
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             severity: 180,
             reason: "pre-existing ban".into(),
             evidence_hash: [0u8; 32],
@@ -176,6 +178,22 @@ async fn preexisting_ban_reconciles_via_anti_entropy() {
             geo_info: None,
         })
         .unwrap();
+        // These sort before the useful record in the same anti-entropy batch.
+        // None may consume its sole decision slot.
+        let template = st.ban_store().is_banned(&banned.addr()).unwrap().clone();
+        for i in 1..=100 {
+            let mut ignored = template.clone();
+            ignored.subject = format!("123.0.0.{i}/32").parse().unwrap();
+            st.add_ban(ignored).unwrap();
+        }
+        let mut permanent = template.clone();
+        permanent.subject = "100.0.0.1/32".parse().unwrap();
+        permanent.expires_at = None;
+        st.add_ban(permanent).unwrap();
+        let mut broad = template;
+        broad.subject = "11.0.0.0/8".parse().unwrap();
+        st.add_ban(broad).unwrap();
+
     }
 
     let (_sd_tx_a, sd_rx_a) = watch::channel(false);
@@ -204,4 +222,8 @@ async fn preexisting_ban_reconciles_via_anti_entropy() {
         reconciled,
         "pre-existing ban on node A did not reconcile to node B via anti-entropy"
     );
+    let st = state_b.lock().await;
+    assert_eq!(st.ban_store().get_all_bans().len(), 1,
+        "whitelisted, permanent and broad bans must be rejected before quota");
+
 }

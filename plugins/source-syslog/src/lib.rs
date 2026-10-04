@@ -4,11 +4,14 @@ mod source;
 mod syslog_parser;
 mod syslog_router;
 
+use ipnet::IpNet;
 use std::sync::Arc;
 
 use serde::Deserialize;
 
-use hiveguard_core::config::{SyslogRouteConfig, SyslogTcpConfig, SyslogTlsConfig, SyslogUdpConfig};
+use hiveguard_core::config::{
+    SyslogRouteConfig, SyslogTcpConfig, SyslogTlsConfig, SyslogUdpConfig,
+};
 use hiveguard_plugin_api::prelude::*;
 
 use crate::source::{run_tcp, run_tls, run_udp};
@@ -24,6 +27,8 @@ struct UdpPluginConfig {
     #[serde(flatten)]
     transport: SyslogUdpConfig,
     #[serde(default)]
+    trusted_senders: Option<Vec<IpNet>>,
+    #[serde(default)]
     routes: Vec<SyslogRouteConfig>,
 }
 
@@ -32,6 +37,8 @@ struct TcpPluginConfig {
     #[serde(flatten)]
     transport: SyslogTcpConfig,
     #[serde(default)]
+    trusted_senders: Option<Vec<IpNet>>,
+    #[serde(default)]
     routes: Vec<SyslogRouteConfig>,
 }
 
@@ -39,6 +46,8 @@ struct TcpPluginConfig {
 struct TlsPluginConfig {
     #[serde(flatten)]
     transport: SyslogTlsConfig,
+    #[serde(default)]
+    trusted_senders: Option<Vec<IpNet>>,
     #[serde(default)]
     routes: Vec<SyslogRouteConfig>,
 }
@@ -49,8 +58,43 @@ enum Mode {
     Tls(SyslogTlsConfig),
 }
 
+/// Transport peer authorization, independent of attacker-controlled syslog
+/// hostname/app-name and the source IP contained in the log payload.
+pub(crate) struct SenderPolicy {
+    networks: Option<Vec<IpNet>>,
+}
+
+impl SenderPolicy {
+    fn new(networks: Option<Vec<IpNet>>, mutual_tls: bool) -> Self {
+        Self {
+            networks: networks.or_else(|| {
+                if mutual_tls {
+                    None
+                } else {
+                    Some(vec![
+                        "127.0.0.0/8".parse().unwrap(),
+                        "::1/128".parse().unwrap(),
+                    ])
+                }
+            }),
+        }
+    }
+
+    fn allows(&self, ip: std::net::IpAddr) -> bool {
+        // Canonicalize mapped IPv4 peers before applying IPv4 ACLs.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        };
+        self.networks
+            .as_ref()
+            .map_or(true, |nets| nets.iter().any(|net| net.contains(&ip)))
+    }
+}
+
 struct State {
     mode: Mode,
+    senders: Arc<SenderPolicy>,
     router: Arc<SyslogRouter>,
 }
 
@@ -67,45 +111,91 @@ impl SyslogSourcePlugin {
             description,
             kind: PluginKind::LogSource,
             author: "HiveGuard",
-            docs_url: Some("https://github.com/anthropics/hiveguard/blob/main/plugins/source-syslog/README.md"),
+            docs_url: Some(
+                "https://github.com/anthropics/hiveguard/blob/main/plugins/source-syslog/README.md",
+            ),
         }
     }
 
-    fn create_with_manifest(cfg: serde_json::Value, manifest: PluginManifest) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
+    fn create_with_manifest(
+        cfg: serde_json::Value,
+        manifest: PluginManifest,
+    ) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
         Box::pin(async move {
-            let mut plugin = SyslogSourcePlugin { manifest, state: None };
+            let mut plugin = SyslogSourcePlugin {
+                manifest,
+                state: None,
+            };
             <SyslogSourcePlugin as Plugin>::init(&mut plugin, cfg).await?;
             Ok(Box::new(plugin) as Box<dyn LogSourcePlugin>)
         })
     }
 
-    pub fn create_udp(_ctx: PluginContext, cfg: serde_json::Value) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
-        Self::create_with_manifest(cfg, Self::manifest_for(UDP_PLUGIN_ID, "Network syslog source over UDP (RFC 5426)."))
+    pub fn create_udp(
+        _ctx: PluginContext,
+        cfg: serde_json::Value,
+    ) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
+        Self::create_with_manifest(
+            cfg,
+            Self::manifest_for(UDP_PLUGIN_ID, "Network syslog source over UDP (RFC 5426)."),
+        )
     }
 
-    pub fn create_tcp(_ctx: PluginContext, cfg: serde_json::Value) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
-        Self::create_with_manifest(cfg, Self::manifest_for(TCP_PLUGIN_ID, "Network syslog source over TCP (RFC 6587)."))
+    pub fn create_tcp(
+        _ctx: PluginContext,
+        cfg: serde_json::Value,
+    ) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
+        Self::create_with_manifest(
+            cfg,
+            Self::manifest_for(TCP_PLUGIN_ID, "Network syslog source over TCP (RFC 6587)."),
+        )
     }
 
-    pub fn create_tls(_ctx: PluginContext, cfg: serde_json::Value) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
-        Self::create_with_manifest(cfg, Self::manifest_for(TLS_PLUGIN_ID, "Network syslog source over TLS (RFC 5425)."))
+    pub fn create_tls(
+        _ctx: PluginContext,
+        cfg: serde_json::Value,
+    ) -> BoxFuture<'static, PluginResult<Box<dyn LogSourcePlugin>>> {
+        Self::create_with_manifest(
+            cfg,
+            Self::manifest_for(TLS_PLUGIN_ID, "Network syslog source over TLS (RFC 5425)."),
+        )
     }
 
     fn build_state(plugin_id: &str, cfg: serde_json::Value) -> PluginResult<State> {
         match plugin_id {
             UDP_PLUGIN_ID => {
-                let cfg: UdpPluginConfig = serde_json::from_value(cfg).map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
-                Ok(State { mode: Mode::Udp(cfg.transport), router: Arc::new(SyslogRouter::from_config(&cfg.routes)?) })
+                let cfg: UdpPluginConfig = serde_json::from_value(cfg)
+                    .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+                Ok(State {
+                    senders: Arc::new(SenderPolicy::new(cfg.trusted_senders, false)),
+                    mode: Mode::Udp(cfg.transport),
+                    router: Arc::new(SyslogRouter::from_config(&cfg.routes)?),
+                })
             }
             TCP_PLUGIN_ID => {
-                let cfg: TcpPluginConfig = serde_json::from_value(cfg).map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
-                Ok(State { mode: Mode::Tcp(cfg.transport), router: Arc::new(SyslogRouter::from_config(&cfg.routes)?) })
+                let cfg: TcpPluginConfig = serde_json::from_value(cfg)
+                    .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+                Ok(State {
+                    senders: Arc::new(SenderPolicy::new(cfg.trusted_senders, false)),
+                    mode: Mode::Tcp(cfg.transport),
+                    router: Arc::new(SyslogRouter::from_config(&cfg.routes)?),
+                })
             }
             TLS_PLUGIN_ID => {
-                let cfg: TlsPluginConfig = serde_json::from_value(cfg).map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
-                Ok(State { mode: Mode::Tls(cfg.transport), router: Arc::new(SyslogRouter::from_config(&cfg.routes)?) })
+                let cfg: TlsPluginConfig = serde_json::from_value(cfg)
+                    .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+                Ok(State {
+                    senders: Arc::new(SenderPolicy::new(
+                        cfg.trusted_senders,
+                        cfg.transport.ca_cert.is_some(),
+                    )),
+                    mode: Mode::Tls(cfg.transport),
+                    router: Arc::new(SyslogRouter::from_config(&cfg.routes)?),
+                })
             }
-            other => Err(PluginError::Runtime(format!("unsupported plugin id: {other}"))),
+            other => Err(PluginError::Runtime(format!(
+                "unsupported plugin id: {other}"
+            ))),
         }
     }
 }
@@ -130,11 +220,44 @@ impl Plugin for SyslogSourcePlugin {
 #[async_trait]
 impl LogSourcePlugin for SyslogSourcePlugin {
     async fn run(&mut self, sink: EventSink, shutdown: CancellationToken) -> PluginResult<()> {
-        let state = self.state.as_ref().ok_or_else(|| PluginError::Runtime("log source used before init".into()))?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| PluginError::Runtime("log source used before init".into()))?;
         match &state.mode {
-            Mode::Udp(config) => run_udp(config.clone(), state.router.clone(), self.manifest.id.to_string(), sink, shutdown).await,
-            Mode::Tcp(config) => run_tcp(config.clone(), state.router.clone(), self.manifest.id.to_string(), sink, shutdown).await,
-            Mode::Tls(config) => run_tls(config.clone(), state.router.clone(), self.manifest.id.to_string(), sink, shutdown).await,
+            Mode::Udp(config) => {
+                run_udp(
+                    config.clone(),
+                    state.router.clone(),
+                    state.senders.clone(),
+                    self.manifest.id.to_string(),
+                    sink,
+                    shutdown,
+                )
+                .await
+            }
+            Mode::Tcp(config) => {
+                run_tcp(
+                    config.clone(),
+                    state.router.clone(),
+                    state.senders.clone(),
+                    self.manifest.id.to_string(),
+                    sink,
+                    shutdown,
+                )
+                .await
+            }
+            Mode::Tls(config) => {
+                run_tls(
+                    config.clone(),
+                    state.router.clone(),
+                    state.senders.clone(),
+                    self.manifest.id.to_string(),
+                    sink,
+                    shutdown,
+                )
+                .await
+            }
         }
     }
 }
@@ -214,6 +337,43 @@ mod tests {
     }
 
     #[test]
+    fn unauthenticated_syslog_requires_explicit_remote_sender_trust() {
+        for plugin_id in [UDP_PLUGIN_ID, TCP_PLUGIN_ID, TLS_PLUGIN_ID] {
+            let cfg =
+                serde_json::json!({"listen": "0.0.0.0:5514", "cert": "unused", "key": "unused"});
+            let state = SyslogSourcePlugin::build_state(plugin_id, cfg).unwrap();
+            assert!(state.senders.allows("127.0.0.1".parse().unwrap()));
+            assert!(state.senders.allows("::1".parse().unwrap()));
+            assert!(!state.senders.allows("11.22.33.44".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn explicit_sender_acl_is_applied_even_with_mutual_tls() {
+        let networks = vec!["11.22.33.0/24".parse().unwrap()];
+        for mutual_tls in [false, true] {
+            let policy = SenderPolicy::new(Some(networks.clone()), mutual_tls);
+            assert!(policy.allows("11.22.33.44".parse().unwrap()));
+            assert!(policy.allows("::ffff:11.22.33.44".parse().unwrap()));
+            assert!(!policy.allows("11.22.34.44".parse().unwrap()));
+            assert!(!policy.allows("127.0.0.1".parse().unwrap()));
+        }
+        assert!(SenderPolicy::new(None, true).allows("11.22.33.44".parse().unwrap()));
+        assert!(!SenderPolicy::new(Some(vec![]), true).allows("11.22.33.44".parse().unwrap()));
+    }
+
+    #[test]
+    fn malformed_sender_network_rejected_at_init() {
+        assert!(SyslogSourcePlugin::build_state(
+            TCP_PLUGIN_ID,
+            serde_json::json!({
+                "listen": "0.0.0.0:5514", "trusted_senders": ["not-a-network"]
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
     fn invalid_custom_route_rejected() {
         let result = SyslogSourcePlugin::build_state(
             UDP_PLUGIN_ID,
@@ -228,6 +388,9 @@ mod tests {
                 ]
             }),
         );
-        assert!(matches!(result, Err(PluginError::Other(_)) | Err(PluginError::ConfigValidation(_))));
+        assert!(matches!(
+            result,
+            Err(PluginError::Other(_)) | Err(PluginError::ConfigValidation(_))
+        ));
     }
 }

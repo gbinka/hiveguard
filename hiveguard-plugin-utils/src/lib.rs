@@ -21,3 +21,5 @@ pub mod http;
 pub mod ratelimit;
 pub mod retry;
 pub mod template;
+
+pub mod ssh;

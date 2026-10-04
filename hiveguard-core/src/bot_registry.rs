@@ -3,11 +3,15 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+const MAX_UNKNOWN_BOTS: usize = 1024;
+const MAX_TRACKED_UA_BYTES: usize = 1024;
+
 /// Policy for a known bot pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BotPolicy {
-    /// Allow — exempt from all detection, never ban.
+    /// Legacy request to allow a bot. UA alone cannot authenticate a source;
+    /// classification treats this as Monitor.
     Allow,
     /// Block — immediately reject (high severity signal).
     Block,
@@ -55,7 +59,10 @@ pub struct BotRegistry {
 }
 
 impl BotRegistry {
-    pub fn new(rules: Vec<BotRule>) -> Self {
+    pub fn new(mut rules: Vec<BotRule>) -> Self {
+        for rule in &mut rules {
+            rule.policy = effective_policy(rule.policy);
+        }
         let mut stats = HashMap::new();
         for rule in &rules {
             stats.insert(
@@ -82,20 +89,30 @@ impl BotRegistry {
     /// Match an event's User-Agent against known bot rules.
     /// Returns the matching rule's policy, or None if no rule matched.
     pub fn classify(&mut self, user_agent: &str, source_ip: &str) -> Option<BotPolicy> {
+        // These are untrusted diagnostics, not a reason to retain unlimited
+        // attacker-controlled strings or distinct identities in daemon memory.
+        let mut end = user_agent.len().min(MAX_TRACKED_UA_BYTES);
+        while !user_agent.is_char_boundary(end) { end -= 1; }
+        let user_agent = &user_agent[..end];
         let ua_lower = user_agent.to_lowercase();
 
         for rule in &self.rules {
-            if ua_lower.contains(&rule.ua_contains.to_lowercase()) {
-                let stat = self.stats.entry(rule.name.clone()).or_insert_with(|| BotStats {
-                    name: rule.name.clone(),
-                    org: rule.org.clone(),
-                    policy: rule.policy,
-                    request_count: 0,
-                    last_seen_ip: String::new(),
-                    last_seen_ua: String::new(),
-                    first_seen: None,
-                    last_seen: None,
-                });
+            if !rule.ua_contains.trim().is_empty()
+                && ua_lower.contains(&rule.ua_contains.to_lowercase())
+            {
+                let stat = self
+                    .stats
+                    .entry(rule.name.clone())
+                    .or_insert_with(|| BotStats {
+                        name: rule.name.clone(),
+                        org: rule.org.clone(),
+                        policy: rule.policy,
+                        request_count: 0,
+                        last_seen_ip: String::new(),
+                        last_seen_ua: String::new(),
+                        first_seen: None,
+                        last_seen: None,
+                    });
                 stat.request_count += 1;
                 stat.last_seen_ip = source_ip.to_string();
                 stat.last_seen_ua = user_agent.to_string();
@@ -111,16 +128,22 @@ impl BotRegistry {
         // Track unknown bot-like User-Agents (contain "bot", "crawler", "spider", etc.)
         if is_bot_like_ua(&ua_lower) {
             let key = extract_bot_key(&ua_lower);
-            let stat = self.unknown_bots.entry(key.clone()).or_insert_with(|| BotStats {
-                name: key,
-                org: "Unknown".to_string(),
-                policy: BotPolicy::Monitor,
-                request_count: 0,
-                last_seen_ip: String::new(),
-                last_seen_ua: String::new(),
-                first_seen: None,
-                last_seen: None,
-            });
+            if self.unknown_bots.len() >= MAX_UNKNOWN_BOTS && !self.unknown_bots.contains_key(&key) {
+                return None;
+            }
+            let stat = self
+                .unknown_bots
+                .entry(key.clone())
+                .or_insert_with(|| BotStats {
+                    name: key,
+                    org: "Unknown".to_string(),
+                    policy: BotPolicy::Monitor,
+                    request_count: 0,
+                    last_seen_ip: String::new(),
+                    last_seen_ua: String::new(),
+                    first_seen: None,
+                    last_seen: None,
+                });
             stat.request_count += 1;
             stat.last_seen_ip = source_ip.to_string();
             stat.last_seen_ua = user_agent.to_string();
@@ -178,6 +201,7 @@ impl BotRegistry {
 
     /// Update a bot rule's policy at runtime.
     pub fn set_policy(&mut self, name: &str, policy: BotPolicy) -> bool {
+        let policy = effective_policy(policy);
         for rule in &mut self.rules {
             if rule.name == name {
                 rule.policy = policy;
@@ -208,6 +232,15 @@ impl BotRegistry {
     }
 }
 
+// User-Agent is attacker-controlled. Keep legacy configs readable without
+// allowing a matching string to become an authentication/whitelist mechanism.
+fn effective_policy(policy: BotPolicy) -> BotPolicy {
+    match policy {
+        BotPolicy::Allow => BotPolicy::Monitor,
+        other => other,
+    }
+}
+
 /// API response for bot stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotStatsResponse {
@@ -223,9 +256,20 @@ pub struct BotStatsResponse {
 /// Check if a User-Agent string looks like a bot/crawler.
 fn is_bot_like_ua(ua_lower: &str) -> bool {
     const BOT_INDICATORS: &[&str] = &[
-        "bot", "crawler", "spider", "scraper", "fetcher",
-        "archiver", "monitor", "checker", "slurp", "scan",
-        "http://", "https://", "+http", "compatible;",
+        "bot",
+        "crawler",
+        "spider",
+        "scraper",
+        "fetcher",
+        "archiver",
+        "monitor",
+        "checker",
+        "slurp",
+        "scan",
+        "http://",
+        "https://",
+        "+http",
+        "compatible;",
     ];
     BOT_INDICATORS.iter().any(|ind| ua_lower.contains(ind))
 }
@@ -257,22 +301,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attacker_controlled_bot_statistics_are_bounded() {
+        let mut registry = BotRegistry::new(vec![]);
+        for i in 0..MAX_UNKNOWN_BOTS + 100 {
+            registry.classify(&format!("crawler-{i}/{}", "x".repeat(4096)), "11.22.33.44");
+        }
+        assert_eq!(registry.unknown_stats().len(), MAX_UNKNOWN_BOTS);
+        assert!(registry.unknown_stats().iter().all(|s| s.last_seen_ua.len() <= MAX_TRACKED_UA_BYTES));
+        // Cutting multibyte UTF-8 input must not panic.
+        registry.classify(&format!("bot{}", "🦀".repeat(1000)), "11.22.33.44");
+    }
+
+    #[test]
     fn test_classify_known_bot() {
-        let rules = vec![
-            BotRule {
-                name: "Googlebot".into(),
-                ua_contains: "googlebot".into(),
-                org: "Google LLC".into(),
-                policy: BotPolicy::Allow,
-            },
-        ];
+        let rules = vec![BotRule {
+            name: "Googlebot".into(),
+            ua_contains: "googlebot".into(),
+            org: "Google LLC".into(),
+            policy: BotPolicy::Allow,
+        }];
         let mut reg = BotRegistry::new(rules);
         let policy = reg.classify(
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
             "66.249.65.1",
         );
-        assert_eq!(policy, Some(BotPolicy::Allow));
+        assert_eq!(policy, Some(BotPolicy::Monitor));
         assert_eq!(reg.stats["Googlebot"].request_count, 1);
+    }
+
+    #[test]
+    fn spoofed_allow_and_empty_pattern_never_exempt_detection() {
+        let mut reg = BotRegistry::new(vec![BotRule {
+            name: "Googlebot".into(),
+            ua_contains: "Googlebot".into(),
+            org: String::new(),
+            policy: BotPolicy::Allow,
+        }]);
+        assert_eq!(
+            reg.classify("attacker Googlebot", "11.22.33.44"),
+            Some(BotPolicy::Monitor)
+        );
+        assert_eq!(reg.all_stats()[0].policy, BotPolicy::Monitor);
+        reg.rules[0].ua_contains.clear();
+        assert_eq!(reg.classify("ordinary browser", "11.22.33.44"), None);
     }
 
     #[test]
@@ -296,16 +367,14 @@ mod tests {
 
     #[test]
     fn test_set_policy() {
-        let rules = vec![
-            BotRule {
-                name: "Bingbot".into(),
-                ua_contains: "bingbot".into(),
-                org: "Microsoft".into(),
-                policy: BotPolicy::Monitor,
-            },
-        ];
+        let rules = vec![BotRule {
+            name: "Bingbot".into(),
+            ua_contains: "bingbot".into(),
+            org: "Microsoft".into(),
+            policy: BotPolicy::Monitor,
+        }];
         let mut reg = BotRegistry::new(rules);
         assert!(reg.set_policy("Bingbot", BotPolicy::Allow));
-        assert_eq!(reg.rules[0].policy, BotPolicy::Allow);
+        assert_eq!(reg.rules[0].policy, BotPolicy::Monitor);
     }
 }

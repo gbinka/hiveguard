@@ -75,9 +75,37 @@ impl WhitelistManager {
 
     /// Check if an IP is covered by any whitelisted network (CIDR containment).
     /// Returns true for both immutable and configured entries.
+    ///
+    /// Only valid for subjects that really are a single address. Ban subjects
+    /// are `IpNet` and may be *wider* than a whitelist entry (`ban_scope: /24`
+    /// against a `/32` admin entry) — reducing them with `.addr()` and calling
+    /// this silently misses the overlap. Use [`Self::overlaps`] for those.
     pub fn is_whitelisted(&self, ip: &IpAddr) -> bool {
         self.is_immutably_protected(ip)
             || self.entries.iter().any(|net| net.contains(ip))
+    }
+
+    /// True if `net` shares any address with a whitelisted (or immutable)
+    /// network — in either direction of containment.
+    ///
+    /// This is the predicate to use for ban subjects. Two CIDR blocks either
+    /// nest or are disjoint, so testing each network address against the other
+    /// block is exact, not an approximation.
+    pub fn overlaps(&self, net: &IpNet) -> bool {
+        self.immutable
+            .iter()
+            .chain(self.entries.iter())
+            .any(|w| nets_overlap(w, net))
+    }
+
+    /// True if the whitelist covers **all** of `net` (a single entry contains
+    /// it entirely). Used for de-duplicating config entries at startup, where
+    /// mere overlap must not suppress adding a wider entry.
+    pub fn covers(&self, net: &IpNet) -> bool {
+        self.immutable
+            .iter()
+            .chain(self.entries.iter())
+            .any(|w| w.contains(&net.addr()) && w.prefix_len() <= net.prefix_len())
     }
 
     pub fn entries(&self) -> &HashSet<IpNet> {
@@ -90,6 +118,12 @@ impl WhitelistManager {
     }
 }
 
+/// Do two CIDR blocks intersect? Blocks either nest or are disjoint, so it is
+/// enough to test each block's network address against the other.
+fn nets_overlap(a: &IpNet, b: &IpNet) -> bool {
+    a.contains(&b.addr()) || b.contains(&a.addr())
+}
+
 impl Default for WhitelistManager {
     fn default() -> Self {
         Self::new()
@@ -99,6 +133,71 @@ impl Default for WhitelistManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defect B: a whitelist entry narrower than the ban subject.
+    /// `is_whitelisted(ban.addr())` misses it — `overlaps` must not.
+    #[test]
+    fn whitelist_32_blocks_ban_on_containing_24() {
+        let mut wl = WhitelistManager::new();
+        wl.add("100.64.229.178/32".parse().unwrap());
+
+        let ban: IpNet = "100.64.229.0/24".parse().unwrap();
+
+        // The old address-based check is blind here — this is the bug.
+        assert!(!wl.is_whitelisted(&ban.addr()));
+        // The network-based check catches it.
+        assert!(wl.overlaps(&ban));
+
+        // A neighbouring /24 with no protected address stays bannable.
+        let other: IpNet = "77.252.230.0/24".parse().unwrap();
+        assert!(!wl.overlaps(&other));
+    }
+
+    #[test]
+    fn overlaps_matches_in_both_containment_directions() {
+        let mut wl = WhitelistManager::new();
+        wl.add("17.0.0.0/8".parse().unwrap());
+
+        // Whitelist wider than the subject.
+        assert!(wl.overlaps(&"17.166.20.0/24".parse().unwrap()));
+        // Whitelist narrower than the subject.
+        assert!(wl.overlaps(&"17.0.0.0/4".parse().unwrap()));
+        // Disjoint.
+        assert!(!wl.overlaps(&"18.0.0.0/8".parse().unwrap()));
+    }
+
+    #[test]
+    fn overlaps_protects_immutable_ranges_from_wider_subjects() {
+        let wl = WhitelistManager::new();
+        // 172.0.0.0/8 contains the RFC 1918 block 172.16.0.0/12 but its own
+        // network address is outside it — the address check let this through.
+        let subject: IpNet = "172.0.0.0/8".parse().unwrap();
+        assert!(!wl.is_whitelisted(&subject.addr()));
+        assert!(wl.overlaps(&subject));
+    }
+
+    #[test]
+    fn overlaps_does_not_cross_address_families() {
+        let mut wl = WhitelistManager::new();
+        wl.add("2001:db8::/32".parse().unwrap());
+        assert!(!wl.overlaps(&"100.64.229.0/24".parse().unwrap()));
+        assert!(wl.overlaps(&"2001:db8:1::/48".parse().unwrap()));
+    }
+
+    #[test]
+    fn covers_requires_full_containment() {
+        let mut wl = WhitelistManager::new();
+        wl.add("100.64.229.178/32".parse().unwrap());
+
+        let wide: IpNet = "100.64.229.0/24".parse().unwrap();
+        // Overlapping but not covered — a wider config entry must still be added.
+        assert!(wl.overlaps(&wide));
+        assert!(!wl.covers(&wide));
+
+        wl.add(wide);
+        assert!(wl.covers(&"100.64.229.178/32".parse().unwrap()));
+        assert!(wl.covers(&wide));
+    }
 
     #[test]
     fn test_whitelist_basic() {

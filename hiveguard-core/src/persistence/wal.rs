@@ -21,6 +21,8 @@ pub enum WalEntry {
     AddCrdtBan(CrdtBanRecord),
     /// Tombstone a CRDT ban record.
     TombstoneCrdtBan(IpNet),
+    /// Remove a ban and retain a cutoff against replay by cluster peers.
+    RevokeBan(IpNet, chrono::DateTime<chrono::Utc>),
 }
 
 /// Sync mode for WAL writes.
@@ -52,6 +54,7 @@ pub struct WalWriter {
     file: File,
     path: PathBuf,
     sync_mode: WalSyncMode,
+    write_failed: bool,
 }
 
 impl WalWriter {
@@ -64,36 +67,58 @@ impl WalWriter {
             .append(true)
             .open(&path)
             .map_err(HiveGuardError::Io)?;
+        // Replay stops at the first invalid record. New entries must replace
+        // that tail, otherwise successful future writes are forever invisible
+        // to recovery (including administrative revocations).
+        let (_, valid_end) = WalReader::replay_with_offset(&path)?;
+        if file.metadata()?.len() != valid_end {
+            warn!(
+                valid_end,
+                "Truncating corrupt or incomplete WAL tail before reopening writer"
+            );
+            file.set_len(valid_end)?;
+            file.sync_data()?;
+        }
         Ok(Self {
             file,
             path,
             sync_mode,
+            write_failed: false,
         })
     }
 
     /// Append a single WAL entry.
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), HiveGuardError> {
+        if self.write_failed {
+            return Err(HiveGuardError::Storage(
+                "WAL unavailable after a failed write; recovery is required".into(),
+            ));
+        }
         let payload = postcard::to_allocvec(entry)
             .map_err(|e| HiveGuardError::Storage(format!("WAL serialize error: {e}")))?;
+        if payload.len() > WAL_MAX_RECORD_SIZE {
+            return Err(HiveGuardError::Storage(
+                "WAL record exceeds maximum size".into(),
+            ));
+        }
         let length = payload.len() as u32;
         let crc = crc32fast::hash(&payload);
 
-        self.file
-            .write_all(&length.to_le_bytes())
-            .map_err(HiveGuardError::Io)?;
-        self.file.write_all(&payload).map_err(HiveGuardError::Io)?;
-        self.file
-            .write_all(&crc.to_le_bytes())
-            .map_err(HiveGuardError::Io)?;
-
-        match self.sync_mode {
-            WalSyncMode::Fdatasync | WalSyncMode::Sync => {
-                self.file.sync_data().map_err(HiveGuardError::Io)?;
+        let result = (|| -> io::Result<()> {
+            self.file.write_all(&length.to_le_bytes())?;
+            self.file.write_all(&payload)?;
+            self.file.write_all(&crc.to_le_bytes())?;
+            if self.sync_mode != WalSyncMode::None {
+                self.file.sync_data()?;
             }
-            WalSyncMode::None => {}
+            Ok(())
+        })();
+        if result.is_err() {
+            // Do not acknowledge later entries behind a potentially partial
+            // record. A successful snapshot/truncate or reopening repairs it.
+            self.write_failed = true;
         }
-
-        Ok(())
+        result.map_err(HiveGuardError::Io)
     }
 
     /// Truncate the WAL file (after snapshot).
@@ -104,6 +129,8 @@ impl WalWriter {
             .truncate(true)
             .open(&self.path)
             .map_err(HiveGuardError::Io)?;
+        self.file.sync_data()?;
+        self.write_failed = false;
         Ok(())
     }
 
@@ -132,13 +159,30 @@ impl WalReader {
     /// Read all valid entries from a WAL file.
     /// Stops on EOF or corrupt record (logs warning for corrupt).
     pub fn replay(path: &Path) -> Result<Vec<WalEntry>, HiveGuardError> {
+        Self::replay_with_offset(path).map(|(entries, _)| entries)
+    }
+
+    /// Read-only release preflight: reject any incomplete or corrupt tail.
+    pub fn replay_strict(path: &Path) -> Result<Vec<WalEntry>, HiveGuardError> {
+        let length = fs::metadata(path)?.len();
+        let (entries, valid_end) = Self::replay_with_offset(path)?;
+        if valid_end != length {
+            return Err(HiveGuardError::Storage(format!(
+                "WAL is not fully recoverable: {valid_end} valid bytes out of {length}"
+            )));
+        }
+        Ok(entries)
+    }
+
+    fn replay_with_offset(path: &Path) -> Result<(Vec<WalEntry>, u64), HiveGuardError> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let mut file = File::open(path).map_err(HiveGuardError::Io)?;
         let mut entries = Vec::new();
         let mut record_index = 0u64;
+        let mut valid_end = 0u64;
 
         loop {
             // Read 4-byte length
@@ -197,8 +241,12 @@ impl WalReader {
                 break;
             }
 
-            match postcard::from_bytes::<WalEntry>(&payload) {
-                Ok(entry) => entries.push(entry),
+            match postcard::take_from_bytes::<WalEntry>(&payload) {
+                Ok((entry, [])) => entries.push(entry),
+                Ok((_, _)) => {
+                    warn!("WAL record {} has trailing payload bytes, stopping replay", record_index);
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         "WAL record {} deserialization failed: {}, stopping replay",
@@ -209,9 +257,10 @@ impl WalReader {
             }
 
             record_index += 1;
+            valid_end += 4 + length as u64 + 4;
         }
 
-        Ok(entries)
+        Ok((entries, valid_end))
     }
 }
 
@@ -257,6 +306,60 @@ mod tests {
         for (a, b) in expected.iter().zip(replayed.iter()) {
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn reopened_writer_discards_partial_and_corrupt_tails_before_new_entries() {
+        let record = WalEntry::AddBan(make_ban("11.22.33.44/32"));
+        let payload = postcard::to_allocvec(&record).unwrap();
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        let mut corrupt = frame.clone();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        // Partial length, partial body, partial checksum, and a bad checksum.
+        for tail in [
+            &frame[..2],
+            &frame[..5],
+            &frame[..frame.len() - 1],
+            &corrupt[..],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut writer = WalWriter::open(dir.path(), WalSyncMode::Sync).unwrap();
+            writer.append(&record).unwrap();
+            let path = writer.path().to_path_buf();
+            let valid_len = fs::metadata(&path).unwrap().len();
+            drop(writer);
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+            let mut writer = WalWriter::open(dir.path(), WalSyncMode::Sync).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+            let revoke = WalEntry::RevokeBan("11.22.33.44/32".parse().unwrap(), Utc::now());
+            writer.append(&revoke).unwrap();
+            drop(writer);
+            assert_eq!(
+                WalReader::replay(&path).unwrap(),
+                vec![record.clone(), revoke]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_write_prevents_acknowledging_later_records() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open(dir.path(), WalSyncMode::None).unwrap();
+        // A read-only descriptor deterministically fails write without needing
+        // a full disk. The writer must remain unavailable after this failure.
+        writer.file = File::open(writer.path()).unwrap();
+        let entry = WalEntry::RemoveBan("11.22.33.44/32".parse().unwrap());
+        assert!(writer.append(&entry).is_err());
+        writer.file = OpenOptions::new().append(true).open(writer.path()).unwrap();
+        assert!(writer.append(&entry).is_err());
+        assert!(WalReader::replay(writer.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -377,10 +480,16 @@ mod tests {
 
     #[test]
     fn wal_sync_mode_from_str() {
-        assert_eq!("fdatasync".parse::<WalSyncMode>().unwrap(), WalSyncMode::Fdatasync);
+        assert_eq!(
+            "fdatasync".parse::<WalSyncMode>().unwrap(),
+            WalSyncMode::Fdatasync
+        );
         assert_eq!("sync".parse::<WalSyncMode>().unwrap(), WalSyncMode::Sync);
         assert_eq!("none".parse::<WalSyncMode>().unwrap(), WalSyncMode::None);
-        assert_eq!("anything_else".parse::<WalSyncMode>().unwrap(), WalSyncMode::Fdatasync);
+        assert_eq!(
+            "anything_else".parse::<WalSyncMode>().unwrap(),
+            WalSyncMode::Fdatasync
+        );
     }
 
     #[test]
@@ -388,7 +497,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path(), WalSyncMode::None).unwrap();
 
-        writer.append(&WalEntry::AddBan(make_ban("10.0.0.1/32"))).unwrap();
+        writer
+            .append(&WalEntry::AddBan(make_ban("10.0.0.1/32")))
+            .unwrap();
         writer.truncate().unwrap();
 
         // Append after truncate should work
@@ -420,7 +531,9 @@ mod tests {
         };
 
         writer.append(&WalEntry::AddBan(ban.clone())).unwrap();
-        writer.append(&WalEntry::AddWhitelist("::1/128".parse().unwrap())).unwrap();
+        writer
+            .append(&WalEntry::AddWhitelist("::1/128".parse().unwrap()))
+            .unwrap();
 
         let replayed = WalReader::replay(&dir.path().join("wal.bin")).unwrap();
         assert_eq!(replayed.len(), 2);

@@ -196,7 +196,7 @@ impl SocketServer {
                 reason,
             } => {
                 let net = match parse_target(&target) {
-                    Ok(n) => n,
+                    Ok(n) => n.trunc(),
                     Err(e) => {
                         return ApiResponse::Error { message: e };
                     }
@@ -233,9 +233,9 @@ impl SocketServer {
                     geo_info: None,
                 };
 
-                // 1) Persist to state.
+                // Keep state and firewall updates serialized with reconciliation.
+                let mut st = state.lock().await;
                 {
-                    let mut st = state.lock().await;
                     if let Err(e) = st.add_ban(record.clone()) {
                         return ApiResponse::Error {
                             message: format!("Failed to ban: {}", e),
@@ -252,6 +252,7 @@ impl SocketServer {
                 if let Some(enf) = enforcer {
                     if let Err(e) = enf.lock().await.apply_ban(&net).await {
                         warn!(subject = %net, "manual ban: enforcer apply failed: {}", e);
+                        return ApiResponse::Error { message: format!("Ban saved; firewall apply failed (pending retry): {e}") };
                     }
                 }
                 ApiResponse::Ok {
@@ -260,15 +261,15 @@ impl SocketServer {
             }
             ApiRequest::Unban { target } => {
                 let net = match parse_target(&target) {
-                    Ok(n) => n,
+                    Ok(n) => n.trunc(),
                     Err(e) => {
                         return ApiResponse::Error { message: e };
                     }
                 };
 
+                let mut st = state.lock().await;
                 let removed = {
-                    let mut st = state.lock().await;
-                    match st.remove_ban(&net) {
+                    match st.revoke_ban(&net) {
                         Ok(b) => b,
                         Err(e) => {
                             return ApiResponse::Error {
@@ -280,10 +281,11 @@ impl SocketServer {
                 // Remove from the enforcer too (manual unban previously left the
                 // nftables entry until next restart). Cluster peers are not
                 // notified of manual unbans — no tombstone-announce hook exists.
-                if removed {
+                {
                     if let Some(enf) = enforcer {
                         if let Err(e) = enf.lock().await.remove_ban(&net).await {
                             warn!(subject = %net, "manual unban: enforcer remove failed: {}", e);
+                            return ApiResponse::Error { message: format!("Unban saved; firewall removal failed (pending retry): {e}") };
                         }
                     }
                 }
@@ -299,25 +301,54 @@ impl SocketServer {
             }
             ApiRequest::WhitelistAdd { target } => {
                 let net = match parse_target(&target) {
-                    Ok(n) => n,
+                    Ok(n) => n.trunc(),
                     Err(e) => {
                         return ApiResponse::Error { message: e };
                     }
                 };
 
+                // Adding to the whitelist must also revoke the bans it now
+                // covers — both in the store and in the firewall — otherwise
+                // the entry has no effect until those bans expire.
                 let mut st = state.lock().await;
-                match st.add_whitelist(net) {
-                    Ok(()) => ApiResponse::Ok {
+                let revoked = {
+                    match st.add_whitelist(net) {
+                        Ok(revoked) => revoked,
+                        Err(e) => {
+                            return ApiResponse::Error {
+                                message: format!("Failed to add whitelist: {}", e),
+                            };
+                        }
+                    }
+                };
+                if let Some(enf) = enforcer {
+                    let now = chrono::Utc::now();
+                    let desired: Vec<_> = st.ban_store().get_all_bans().into_iter()
+                        .filter(|b| !st.whitelist().overlaps(&b.subject))
+                        .filter(|b| b.expires_at.is_none_or(|expiry| expiry > now))
+                        .map(|b| b.subject).collect();
+                    if let Err(e) = enf.lock().await.sync_full(&desired).await {
+                        return ApiResponse::Error { message: format!("Whitelist saved; firewall sync failed (pending retry): {e}") };
+                    }
+                }
+                if revoked.is_empty() {
+                    ApiResponse::Ok {
                         message: format!("Added {} to whitelist", net),
-                    },
-                    Err(e) => ApiResponse::Error {
-                        message: format!("Failed to add whitelist: {}", e),
-                    },
+                    }
+                } else {
+                    info!(count = revoked.len(), entry = %net, "whitelist add revoked covered bans");
+                    ApiResponse::Ok {
+                        message: format!(
+                            "Added {} to whitelist, revoked {} covered ban(s)",
+                            net,
+                            revoked.len()
+                        ),
+                    }
                 }
             }
             ApiRequest::WhitelistRemove { target } => {
                 let net = match parse_target(&target) {
-                    Ok(n) => n,
+                    Ok(n) => n.trunc(),
                     Err(e) => {
                         return ApiResponse::Error { message: e };
                     }

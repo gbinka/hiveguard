@@ -459,15 +459,13 @@ async fn post_ingest_logs(
 
     // Auth: dedicated ingest token (resolved to the main token at startup
     // when none was configured). Constant-time comparison.
-    if let Some(ref expected) = ingest.token {
-        let provided = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !ct_eq(provided.as_bytes(), expected.as_bytes()) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthorized" }))).into_response();
-        }
+    let expected = ingest.token.as_deref().filter(|token| !token.trim().is_empty());
+    let provided = headers.get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if !matches!((expected, provided), (Some(expected), Some(provided))
+        if ct_eq(provided.as_bytes(), expected.as_bytes())) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthorized" }))).into_response();
     }
 
     // Per-second rate limit.

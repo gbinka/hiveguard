@@ -29,7 +29,7 @@ impl DistributedSlowPlugin {
         PluginManifest {
             id: PLUGIN_ID,
             version: PLUGIN_VERSION,
-            description: "Distributed slow attack detector.",
+            description: "Disabled legacy subnet-count detector (insufficient evidence for subnet bans).",
             kind: PluginKind::Detector,
             author: "HiveGuard",
             docs_url: Some("https://github.com/anthropics/hiveguard/blob/main/plugins/detector-distributed-slow/README.md"),

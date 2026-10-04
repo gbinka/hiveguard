@@ -92,7 +92,7 @@ async fn ban_and_list_bans() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
             duration: Some("1h".to_string()),
             reason: Some("test ban".to_string()),
         },
@@ -108,7 +108,7 @@ async fn ban_and_list_bans() {
     match &resp {
         ApiResponse::BanList { bans } => {
             assert_eq!(bans.len(), 1);
-            assert_eq!(bans[0].subject, "10.0.0.1/32");
+            assert_eq!(bans[0].subject, "11.0.0.1/32");
             assert_eq!(bans[0].reason, "test ban");
             assert_eq!(bans[0].severity, 200);
         }
@@ -119,7 +119,7 @@ async fn ban_and_list_bans() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Unban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
         },
     )
     .await;
@@ -145,14 +145,14 @@ async fn ban_cidr_and_list() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "192.168.1.0/24".to_string(),
+            target: "193.168.1.0/24".to_string(),
             duration: None,
             reason: None,
         },
     )
     .await;
     match &resp {
-        ApiResponse::Ok { message } => assert!(message.contains("192.168.1.0/24")),
+        ApiResponse::Ok { message } => assert!(message.contains("193.168.1.0/24")),
         other => panic!("Expected Ok, got {:?}", other),
     }
 
@@ -160,7 +160,7 @@ async fn ban_cidr_and_list() {
     match &resp {
         ApiResponse::BanList { bans } => {
             assert_eq!(bans.len(), 1);
-            assert_eq!(bans[0].subject, "192.168.1.0/24");
+            assert_eq!(bans[0].subject, "193.168.1.0/24");
             assert_eq!(bans[0].reason, "manual admin ban");
         }
         other => panic!("Expected BanList, got {:?}", other),
@@ -177,7 +177,7 @@ async fn whitelist_add_list_remove() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::WhitelistAdd {
-            target: "10.0.0.0/8".to_string(),
+            target: "11.0.0.0/8".to_string(),
         },
     )
     .await;
@@ -191,7 +191,7 @@ async fn whitelist_add_list_remove() {
     match &resp {
         ApiResponse::WhitelistEntries { entries } => {
             assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0], "10.0.0.0/8");
+            assert_eq!(entries[0], "11.0.0.0/8");
         }
         other => panic!("Expected WhitelistEntries, got {:?}", other),
     }
@@ -200,7 +200,7 @@ async fn whitelist_add_list_remove() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::WhitelistRemove {
-            target: "10.0.0.0/8".to_string(),
+            target: "11.0.0.0/8".to_string(),
         },
     )
     .await;
@@ -247,7 +247,7 @@ async fn invalid_duration_returns_error() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
             duration: Some("xyz".to_string()),
             reason: None,
         },
@@ -269,7 +269,7 @@ async fn top_threats_sorted_by_severity() {
     raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
             duration: Some("1h".to_string()),
             reason: Some("low".to_string()),
         },
@@ -279,7 +279,7 @@ async fn top_threats_sorted_by_severity() {
     raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.2".to_string(),
+            target: "11.0.0.2".to_string(),
             duration: Some("1h".to_string()),
             reason: Some("high".to_string()),
         },
@@ -306,7 +306,7 @@ async fn list_bans_with_limit() {
         raw_request(
             &socket_path,
             &ApiRequest::Ban {
-                target: format!("10.0.0.{}", i),
+                target: format!("11.0.0.{}", i),
                 duration: Some("1h".to_string()),
                 reason: None,
             },
@@ -331,7 +331,7 @@ async fn unban_nonexistent_ip_returns_ok() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Unban {
-            target: "10.0.0.99".to_string(),
+            target: "11.0.0.99".to_string(),
         },
     )
     .await;
@@ -350,7 +350,7 @@ async fn ban_permanent_duration() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
             duration: Some("permanent".to_string()),
             reason: Some("permanent ban".to_string()),
         },
@@ -382,7 +382,7 @@ async fn export_json_returns_valid_json() {
     raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.1".to_string(),
+            target: "11.0.0.1".to_string(),
             duration: Some("1h".to_string()),
             reason: Some("test ban 1".to_string()),
         },
@@ -392,7 +392,7 @@ async fn export_json_returns_valid_json() {
     raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "10.0.0.2".to_string(),
+            target: "11.0.0.2".to_string(),
             duration: Some("2h".to_string()),
             reason: Some("test ban 2".to_string()),
         },
@@ -414,8 +414,8 @@ async fn export_json_returns_valid_json() {
                 serde_json::from_str(data).expect("should be valid JSON array of BanInfo");
             assert_eq!(parsed.len(), 2);
             let subjects: Vec<&str> = parsed.iter().map(|b| b.subject.as_str()).collect();
-            assert!(subjects.contains(&"10.0.0.1/32"));
-            assert!(subjects.contains(&"10.0.0.2/32"));
+            assert!(subjects.contains(&"11.0.0.1/32"));
+            assert!(subjects.contains(&"11.0.0.2/32"));
         }
         other => panic!("Expected ExportData, got {:?}", other),
     }
@@ -430,7 +430,7 @@ async fn export_csv_has_header_and_rows() {
     raw_request(
         &socket_path,
         &ApiRequest::Ban {
-            target: "192.168.1.1".to_string(),
+            target: "193.168.1.1".to_string(),
             duration: Some("24h".to_string()),
             reason: Some("csv test".to_string()),
         },
@@ -451,7 +451,7 @@ async fn export_csv_has_header_and_rows() {
             let lines: Vec<&str> = data.lines().collect();
             assert!(lines.len() >= 2, "should have header + at least 1 row");
             assert_eq!(lines[0], "subject,created_at,expires_at,severity,reason,source");
-            assert!(lines[1].starts_with("192.168.1.1/32,"));
+            assert!(lines[1].starts_with("193.168.1.1/32,"));
             assert!(lines[1].contains("csv test"));
         }
         other => panic!("Expected ExportData, got {:?}", other),

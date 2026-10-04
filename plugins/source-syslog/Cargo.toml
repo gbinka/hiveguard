@@ -5,10 +5,12 @@ edition = "2021"
 description = "Network syslog source plugins for HiveGuard (UDP/TCP/TLS)"
 
 [dependencies]
+hiveguard-plugin-utils = { path = "../../hiveguard-plugin-utils" }
 hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
 hiveguard-core = { path = "../../hiveguard-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ipnet = { version = "2", features = ["serde"] }
 async-trait = "0.1"
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }

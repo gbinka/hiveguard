@@ -10,7 +10,7 @@ use crate::errors::HiveGuardError;
 use crate::models::BanRecord;
 use crate::whitelist::WhitelistManager;
 
-use super::snapshot::{load_snapshot_v2, save_snapshot_v2};
+use super::snapshot::{load_snapshot_v2, save_snapshot_with_revocations};
 use super::wal::{WalEntry, WalReader, WalSyncMode, WalWriter};
 
 /// Coordinates persistence: in-memory state + WAL + snapshots.
@@ -19,6 +19,7 @@ pub struct StateManager {
     ban_store: InMemoryBanStore,
     whitelist: WhitelistManager,
     crdt_store: HashMap<IpNet, CrdtBanRecord>,
+    revocations: HashMap<IpNet, chrono::DateTime<chrono::Utc>>,
     wal_writer: WalWriter,
     snapshot_path: PathBuf,
     data_dir: PathBuf,
@@ -34,6 +35,8 @@ impl StateManager {
         let mut whitelist = WhitelistManager::new();
         let mut crdt_store: HashMap<IpNet, CrdtBanRecord> = HashMap::new();
 
+        let mut revocations = HashMap::new();
+
         // 1. Try loading snapshot (v2 with CRDT support)
         if snapshot_path.exists() {
             match load_snapshot_v2(&snapshot_path) {
@@ -44,6 +47,7 @@ impl StateManager {
                         crdt_bans = result.crdt_bans.len(),
                         "Loaded snapshot"
                     );
+                    revocations.extend(result.revocations);
                     for ban in result.bans {
                         ban_store.add_ban(ban)?;
                     }
@@ -55,7 +59,10 @@ impl StateManager {
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to load snapshot, starting fresh: {}", e);
+                    return Err(HiveGuardError::Storage(format!(
+                        "cannot recover snapshot {}; refusing to start with empty state: {e}",
+                        snapshot_path.display()
+                    )));
                 }
             }
         }
@@ -69,6 +76,10 @@ impl StateManager {
                     match entry {
                         WalEntry::AddBan(record) => {
                             ban_store.add_ban(record)?;
+                        }
+                        WalEntry::RevokeBan(subject, cutoff) => {
+                            revocations.insert(subject, cutoff);
+                            ban_store.remove_ban(&subject)?;
                         }
                         WalEntry::RemoveBan(subject) => {
                             ban_store.remove_ban(&subject)?;
@@ -105,6 +116,7 @@ impl StateManager {
             ban_store,
             whitelist,
             crdt_store,
+            revocations,
             wal_writer,
             snapshot_path,
             data_dir: data_dir.to_path_buf(),
@@ -112,7 +124,13 @@ impl StateManager {
     }
 
     /// Add a ban: write to WAL first, then update in-memory store.
-    pub fn add_ban(&mut self, record: BanRecord) -> Result<(), HiveGuardError> {
+    pub fn add_ban(&mut self, mut record: BanRecord) -> Result<(), HiveGuardError> {
+        record.subject = record.subject.trunc();
+        if self.whitelist.overlaps(&record.subject) {
+            return Err(HiveGuardError::Config(format!(
+                "ban {} overlaps a protected network", record.subject
+            )));
+        }
         self.wal_writer.append(&WalEntry::AddBan(record.clone()))?;
         self.ban_store.add_ban(record)?;
         Ok(())
@@ -124,11 +142,71 @@ impl StateManager {
         self.ban_store.remove_ban(subject)
     }
 
-    /// Add a whitelist entry: write to WAL, then update in-memory.
-    pub fn add_whitelist(&mut self, net: IpNet) -> Result<(), HiveGuardError> {
+    /// Administrative unban: one durable entry both removes the ban and prevents
+    /// peers from resurrecting an older decision, including after a restart.
+    /// This is local policy, not a cluster-wide signed revocation protocol.
+    pub fn revoke_ban(&mut self, subject: &IpNet) -> Result<bool, HiveGuardError> {
+        let subject = subject.trunc();
+        let mut cutoff = chrono::Utc::now();
+        if let Some(record) = self.ban_store.get_all_bans().into_iter().find(|b| b.subject == subject) {
+            cutoff = cutoff.max(record.created_at);
+        }
+        if let Some(previous) = self.revocations.get(&subject) {
+            cutoff = cutoff.max(*previous);
+        }
+        self.wal_writer.append(&WalEntry::RevokeBan(subject, cutoff))?;
+        self.revocations.insert(subject, cutoff);
+        self.ban_store.remove_ban(&subject)
+    }
+
+    pub fn accepts_remote_ban(&self, record: &BanRecord) -> bool {
+        !self.whitelist.overlaps(&record.subject)
+            && !self.revocations.iter().any(|(subject, cutoff)| {
+                (subject.contains(&record.subject.addr()) || record.subject.contains(&subject.addr()))
+                    && record.created_at <= *cutoff
+            })
+    }
+
+    /// Add a whitelist entry: write to WAL, update in-memory, then revoke any
+    /// ban the new entry now covers.
+    ///
+    /// Returns the ban subjects that were revoked so the caller can drop them
+    /// from the firewall too. A whitelist entry that leaves existing bans in
+    /// place is not protection — the ban outlives the entry and comes back on
+    /// every restart via the enforcer sync.
+    pub fn add_whitelist(&mut self, net: IpNet) -> Result<Vec<IpNet>, HiveGuardError> {
         self.wal_writer.append(&WalEntry::AddWhitelist(net))?;
         self.whitelist.add(net);
-        Ok(())
+        self.revoke_bans_covered_by_whitelist()
+    }
+
+    /// Remove every ban whose subject overlaps the whitelist (configured or
+    /// immutable), returning the revoked subjects.
+    ///
+    /// Overlap — not address containment — is the test: a `/24` ban subject
+    /// overlapping a `/32` whitelist entry must go, even though the ban's
+    /// network address is not itself whitelisted.
+    pub fn revoke_bans_covered_by_whitelist(&mut self) -> Result<Vec<IpNet>, HiveGuardError> {
+        let covered: Vec<IpNet> = self
+            .ban_store
+            .get_all_bans()
+            .iter()
+            .map(|b| b.subject)
+            .filter(|subject| self.whitelist.overlaps(subject))
+            .collect();
+
+        let mut revoked = Vec::with_capacity(covered.len());
+        for subject in covered {
+            if self.remove_ban(&subject)? {
+                revoked.push(subject);
+            }
+            // Tombstone the CRDT record too, otherwise cluster anti-entropy
+            // re-imports the ban we just revoked on the next gossip round.
+            if self.crdt_store.contains_key(&subject) {
+                self.tombstone_crdt_ban(subject)?;
+            }
+        }
+        Ok(revoked)
     }
 
     /// Remove a whitelist entry: write to WAL, then update in-memory.
@@ -189,7 +267,8 @@ impl StateManager {
         let whitelist: Vec<IpNet> = self.whitelist.entries().iter().cloned().collect();
         let crdt_bans: Vec<CrdtBanRecord> = self.crdt_store.values().cloned().collect();
 
-        save_snapshot_v2(&self.snapshot_path, &bans, &whitelist, &crdt_bans)?;
+        let revocations: Vec<_> = self.revocations.iter().map(|(s, t)| (*s, *t)).collect();
+        save_snapshot_with_revocations(&self.snapshot_path, &bans, &whitelist, &crdt_bans, &revocations)?;
         self.wal_writer.truncate()?;
 
         info!(
@@ -254,15 +333,63 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_snapshot_never_starts_with_empty_state_or_modifies_wal() {
+        let dir = TempDir::new().unwrap();
+        let bad = b"HVGD0004broken";
+        std::fs::write(dir.path().join("snapshot.bin"), bad).unwrap();
+        std::fs::write(dir.path().join("wal.bin"), b"partial tail").unwrap();
+        assert!(StateManager::new(dir.path(), WalSyncMode::Sync).is_err());
+        assert_eq!(std::fs::read(dir.path().join("snapshot.bin")).unwrap(), bad);
+        assert_eq!(std::fs::read(dir.path().join("wal.bin")).unwrap(), b"partial tail");
+    }
+
+    #[test]
+    fn protected_bans_are_rejected_before_wal_write() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        sm.add_whitelist("11.22.33.5/32".parse().unwrap()).unwrap();
+        sm.add_whitelist("2001:4860:1234::5/128".parse().unwrap()).unwrap();
+        for subject in ["127.0.0.1/32", "10.0.0.1/32", "11.22.33.0/24", "2001:4860:1234::/48"] {
+            assert!(sm.add_ban(make_ban(subject)).is_err(), "{subject}");
+        }
+        drop(sm);
+        let recovered = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        assert!(recovered.ban_store().get_all_bans().is_empty());
+    }
+
+    #[test]
+    fn administrative_revocation_survives_wal_and_snapshot_recovery() {
+        let dir = TempDir::new().unwrap();
+        let mut old = make_ban("11.22.33.5/32");
+        old.created_at = Utc::now() - chrono::Duration::hours(1);
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        sm.add_ban(old.clone()).unwrap();
+        assert!(sm.revoke_ban(&old.subject).unwrap());
+        for snapshot in [false, true] {
+            if snapshot { sm.take_snapshot().unwrap(); }
+            drop(sm);
+            sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+            assert!(sm.ban_store().get_all_bans().is_empty());
+            assert!(!sm.accepts_remote_ban(&old));
+            let mut wider = old.clone();
+            wider.subject = "11.22.33.0/24".parse().unwrap();
+            assert!(!sm.accepts_remote_ban(&wider));
+            let mut fresh = old.clone();
+            fresh.created_at = Utc::now() + chrono::Duration::seconds(1);
+            assert!(sm.accepts_remote_ban(&fresh));
+        }
+    }
+
+    #[test]
     fn add_bans_snapshot_restart_recovery() {
         let dir = TempDir::new().unwrap();
 
         // Phase 1: add bans + snapshot
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("192.168.1.0/24")).unwrap();
-            sm.add_ban(make_ban("172.16.0.0/12")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("193.168.1.0/24")).unwrap();
+            sm.add_ban(make_ban("173.16.0.0/12")).unwrap();
             sm.take_snapshot().unwrap();
         }
 
@@ -272,13 +399,13 @@ mod tests {
             let store = sm.ban_store();
             assert_eq!(store.get_all_bans().len(), 3);
 
-            let ip: IpAddr = "10.0.0.1".parse().unwrap();
+            let ip: IpAddr = "11.0.0.1".parse().unwrap();
             assert!(store.is_banned(&ip).is_some());
 
-            let ip2: IpAddr = "192.168.1.50".parse().unwrap();
+            let ip2: IpAddr = "193.168.1.50".parse().unwrap();
             assert!(store.is_banned(&ip2).is_some());
 
-            let ip3: IpAddr = "172.20.0.1".parse().unwrap();
+            let ip3: IpAddr = "173.20.0.1".parse().unwrap();
             assert!(store.is_banned(&ip3).is_some());
         }
     }
@@ -290,8 +417,8 @@ mod tests {
         // Phase 1: add bans WITHOUT snapshot
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
             // No snapshot — only WAL
         }
 
@@ -301,10 +428,10 @@ mod tests {
             let store = sm.ban_store();
             assert_eq!(store.get_all_bans().len(), 2);
 
-            let ip: IpAddr = "10.0.0.1".parse().unwrap();
+            let ip: IpAddr = "11.0.0.1".parse().unwrap();
             assert!(store.is_banned(&ip).is_some());
 
-            let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+            let ip2: IpAddr = "11.0.0.2".parse().unwrap();
             assert!(store.is_banned(&ip2).is_some());
         }
     }
@@ -316,11 +443,11 @@ mod tests {
         // Phase 1: add some bans, snapshot, then add more
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
             sm.take_snapshot().unwrap();
             // After snapshot, add more
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
             // These two are in WAL only (post-snapshot)
         }
 
@@ -337,9 +464,9 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
-            sm.remove_ban(&"10.0.0.1/32".parse().unwrap()).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
+            sm.remove_ban(&"11.0.0.1/32".parse().unwrap()).unwrap();
         }
 
         // Restart: WAL replay should show 1 ban (added 2, removed 1)
@@ -347,10 +474,10 @@ mod tests {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.ban_store().get_all_bans().len(), 1);
 
-            let ip: IpAddr = "10.0.0.2".parse().unwrap();
+            let ip: IpAddr = "11.0.0.2".parse().unwrap();
             assert!(sm.ban_store().is_banned(&ip).is_some());
 
-            let removed_ip: IpAddr = "10.0.0.1".parse().unwrap();
+            let removed_ip: IpAddr = "11.0.0.1".parse().unwrap();
             assert!(sm.ban_store().is_banned(&removed_ip).is_none());
         }
     }
@@ -362,7 +489,7 @@ mod tests {
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             sm.add_whitelist("127.0.0.0/8".parse().unwrap()).unwrap();
-            sm.add_whitelist("10.0.0.0/8".parse().unwrap()).unwrap();
+            sm.add_whitelist("11.0.0.0/8".parse().unwrap()).unwrap();
         }
 
         // Restart: whitelist recovered from WAL
@@ -371,9 +498,71 @@ mod tests {
             let ip: IpAddr = "127.0.0.1".parse().unwrap();
             assert!(sm.whitelist().is_whitelisted(&ip));
 
-            let ip2: IpAddr = "10.5.5.5".parse().unwrap();
+            let ip2: IpAddr = "11.5.5.5".parse().unwrap();
             assert!(sm.whitelist().is_whitelisted(&ip2));
         }
+    }
+
+    /// Defect A: a whitelist entry added after the fact must invalidate the
+    /// bans it covers, not wait for them to expire.
+    #[test]
+    fn whitelist_add_revokes_existing_overlapping_bans() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+
+        sm.add_ban(make_ban("17.166.20.0/24")).unwrap();
+        sm.add_ban(make_ban("17.166.237.0/24")).unwrap();
+        sm.add_ban(make_ban("45.33.0.9/32")).unwrap(); // untouched by the entry
+        assert_eq!(sm.ban_store().get_all_bans().len(), 3);
+
+        let revoked = sm.add_whitelist("17.0.0.0/8".parse().unwrap()).unwrap();
+
+        assert_eq!(revoked.len(), 2, "both Applebot subnets should be revoked");
+        let remaining = sm.ban_store().get_all_bans();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].subject.to_string(), "45.33.0.9/32");
+    }
+
+    /// Defect A + B together: the whitelist entry is *narrower* than the ban.
+    #[test]
+    fn whitelist_add_revokes_ban_wider_than_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+
+        // distributed_slow bans a /24 that happens to contain the admin's IP.
+        sm.add_ban(make_ban("100.64.229.0/24")).unwrap();
+
+        let revoked = sm
+            .add_whitelist("100.64.229.178/32".parse().unwrap())
+            .unwrap();
+
+        assert_eq!(revoked, vec!["100.64.229.0/24".parse::<IpNet>().unwrap()]);
+        assert!(sm.ban_store().get_all_bans().is_empty());
+    }
+
+    #[test]
+    fn revoked_bans_stay_revoked_after_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+            sm.add_ban(make_ban("17.166.20.0/24")).unwrap();
+            sm.add_whitelist("17.0.0.0/8".parse().unwrap()).unwrap();
+        }
+        // WAL replay must not resurrect the ban — the revoke was journalled.
+        let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        assert!(sm.ban_store().get_all_bans().is_empty());
+    }
+
+    #[test]
+    fn whitelist_add_leaves_unrelated_bans_alone() {
+        let dir = TempDir::new().unwrap();
+        let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+
+        sm.add_ban(make_ban("45.33.0.0/24")).unwrap();
+        let revoked = sm.add_whitelist("17.0.0.0/8".parse().unwrap()).unwrap();
+
+        assert!(revoked.is_empty());
+        assert_eq!(sm.ban_store().get_all_bans().len(), 1);
     }
 
     #[test]
@@ -408,8 +597,8 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
 
             // WAL should have entries
             assert!(wal_path.exists());
@@ -430,13 +619,13 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
             sm.take_snapshot().unwrap();
 
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
             sm.take_snapshot().unwrap();
 
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
             // Last ban only in WAL
         }
 
@@ -473,11 +662,13 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            // Public subjects on purpose: RFC 1918 addresses are immutably
+            // protected, and `add_whitelist` now revokes bans covering them.
+            sm.add_ban(make_ban("45.33.0.1/32")).unwrap();
+            sm.add_ban(make_ban("45.33.0.2/32")).unwrap();
             sm.add_whitelist("6.0.0.0/8".parse().unwrap()).unwrap();
-            sm.remove_ban(&"10.0.0.1/32".parse().unwrap()).unwrap();
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
+            sm.remove_ban(&"45.33.0.1/32".parse().unwrap()).unwrap();
+            sm.add_ban(make_ban("45.33.0.3/32")).unwrap();
             sm.add_whitelist("::1/128".parse().unwrap()).unwrap();
             sm.remove_whitelist(&"6.0.0.0/8".parse().unwrap()).unwrap();
         }
@@ -485,9 +676,9 @@ mod tests {
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.ban_store().get_all_bans().len(), 2); // .2 and .3
-            assert!(sm.ban_store().is_banned(&"10.0.0.2".parse().unwrap()).is_some());
-            assert!(sm.ban_store().is_banned(&"10.0.0.3".parse().unwrap()).is_some());
-            assert!(sm.ban_store().is_banned(&"10.0.0.1".parse().unwrap()).is_none());
+            assert!(sm.ban_store().is_banned(&"45.33.0.2".parse().unwrap()).is_some());
+            assert!(sm.ban_store().is_banned(&"45.33.0.3".parse().unwrap()).is_some());
+            assert!(sm.ban_store().is_banned(&"45.33.0.1".parse().unwrap()).is_none());
 
             assert!(sm.whitelist().is_whitelisted(&"::1".parse().unwrap()));
             assert!(!sm.whitelist().is_whitelisted(&"6.0.0.1".parse().unwrap()));
@@ -501,7 +692,7 @@ mod tests {
 
         let past = Utc::now() - chrono::Duration::hours(1);
         let expired_ban = BanRecord {
-            subject: "10.0.0.1/32".parse().unwrap(),
+            subject: "11.0.0.1/32".parse().unwrap(),
             created_at: past - chrono::Duration::hours(2),
             expires_at: Some(past),
             severity: 100,
@@ -511,7 +702,7 @@ mod tests {
             geo_info: None,
         };
         sm.add_ban(expired_ban).unwrap();
-        sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+        sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
 
         let removed = sm.ban_store_mut().cleanup_expired();
         assert_eq!(removed, 1);
@@ -531,9 +722,9 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
             sm.take_snapshot().unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
             sm.take_snapshot().unwrap();
         }
 
@@ -578,9 +769,9 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
             // Simulated crash: drop without snapshot
         }
 
@@ -598,14 +789,14 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
             sm.take_snapshot().unwrap();
 
             // Post-snapshot operations (only in WAL)
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.4/32")).unwrap();
-            sm.remove_ban(&"10.0.0.1/32".parse().unwrap()).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.4/32")).unwrap();
+            sm.remove_ban(&"11.0.0.1/32".parse().unwrap()).unwrap();
             // Crash: no final snapshot
         }
 
@@ -613,10 +804,10 @@ mod tests {
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.ban_store().get_all_bans().len(), 3);
-            assert!(sm.ban_store().is_banned(&"10.0.0.1".parse().unwrap()).is_none());
-            assert!(sm.ban_store().is_banned(&"10.0.0.2".parse().unwrap()).is_some());
-            assert!(sm.ban_store().is_banned(&"10.0.0.3".parse().unwrap()).is_some());
-            assert!(sm.ban_store().is_banned(&"10.0.0.4".parse().unwrap()).is_some());
+            assert!(sm.ban_store().is_banned(&"11.0.0.1".parse().unwrap()).is_none());
+            assert!(sm.ban_store().is_banned(&"11.0.0.2".parse().unwrap()).is_some());
+            assert!(sm.ban_store().is_banned(&"11.0.0.3".parse().unwrap()).is_some());
+            assert!(sm.ban_store().is_banned(&"11.0.0.4".parse().unwrap()).is_some());
         }
     }
 
@@ -628,9 +819,9 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.2/32")).unwrap();
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.2/32")).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
         }
 
         // Corrupt WAL: truncate last entry
@@ -681,11 +872,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
 
-        let ban = make_crdt_ban("10.0.0.1/32", "brute force");
+        let ban = make_crdt_ban("11.0.0.1/32", "brute force");
         sm.add_crdt_ban(ban.clone()).unwrap();
 
         assert_eq!(sm.crdt_store().len(), 1);
-        let stored = sm.crdt_store().get(&"10.0.0.1/32".parse::<IpNet>().unwrap());
+        let stored = sm.crdt_store().get(&"11.0.0.1/32".parse::<IpNet>().unwrap());
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().reason, "brute force");
     }
@@ -696,8 +887,8 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "ssh brute")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "path probe")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "ssh brute")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "path probe")).unwrap();
             sm.take_snapshot().unwrap();
         }
 
@@ -705,9 +896,9 @@ mod tests {
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.crdt_store().len(), 2);
-            let b1 = sm.crdt_store().get(&"10.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
+            let b1 = sm.crdt_store().get(&"11.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
             assert_eq!(b1.reason, "ssh brute");
-            let b2 = sm.crdt_store().get(&"10.0.0.2/32".parse::<IpNet>().unwrap()).unwrap();
+            let b2 = sm.crdt_store().get(&"11.0.0.2/32".parse::<IpNet>().unwrap()).unwrap();
             assert_eq!(b2.reason, "path probe");
         }
     }
@@ -718,8 +909,8 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "wal test")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "wal test 2")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "wal test")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "wal test 2")).unwrap();
             // No snapshot — crash simulation
         }
 
@@ -736,10 +927,10 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "before snapshot")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "before snapshot")).unwrap();
             sm.take_snapshot().unwrap();
 
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "after snapshot")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "after snapshot")).unwrap();
             // Crash: no final snapshot
         }
 
@@ -747,8 +938,8 @@ mod tests {
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.crdt_store().len(), 2);
-            assert!(sm.crdt_store().contains_key(&"10.0.0.1/32".parse::<IpNet>().unwrap()));
-            assert!(sm.crdt_store().contains_key(&"10.0.0.2/32".parse::<IpNet>().unwrap()));
+            assert!(sm.crdt_store().contains_key(&"11.0.0.1/32".parse::<IpNet>().unwrap()));
+            assert!(sm.crdt_store().contains_key(&"11.0.0.2/32".parse::<IpNet>().unwrap()));
         }
     }
 
@@ -763,7 +954,7 @@ mod tests {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
 
             // First version from node-a
-            let mut ban1 = make_crdt_ban("10.0.0.1/32", "first");
+            let mut ban1 = make_crdt_ban("11.0.0.1/32", "first");
             ban1.reporters = {
                 let mut s = HashSet::new();
                 s.insert("node-a".to_string());
@@ -773,7 +964,7 @@ mod tests {
             sm.add_crdt_ban(ban1).unwrap();
 
             // Second version from node-b with higher timestamp
-            let mut ban2 = make_crdt_ban("10.0.0.1/32", "second");
+            let mut ban2 = make_crdt_ban("11.0.0.1/32", "second");
             ban2.reporters = {
                 let mut s = HashSet::new();
                 s.insert("node-b".to_string());
@@ -794,7 +985,7 @@ mod tests {
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.crdt_store().len(), 1);
-            let ban = sm.crdt_store().get(&"10.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
+            let ban = sm.crdt_store().get(&"11.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
             // Merge takes max severity
             assert_eq!(ban.severity, 200);
             // Merge unions reporters
@@ -809,18 +1000,18 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "to be tombstoned")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "stays active")).unwrap();
-            sm.tombstone_crdt_ban("10.0.0.1/32".parse().unwrap()).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "to be tombstoned")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "stays active")).unwrap();
+            sm.tombstone_crdt_ban("11.0.0.1/32".parse().unwrap()).unwrap();
         }
 
         // Recovery: WAL replay should show tombstoned ban
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
             assert_eq!(sm.crdt_store().len(), 2);
-            let b1 = sm.crdt_store().get(&"10.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
+            let b1 = sm.crdt_store().get(&"11.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
             assert!(b1.tombstone, "Ban should be tombstoned");
-            let b2 = sm.crdt_store().get(&"10.0.0.2/32".parse::<IpNet>().unwrap()).unwrap();
+            let b2 = sm.crdt_store().get(&"11.0.0.2/32".parse::<IpNet>().unwrap()).unwrap();
             assert!(!b2.tombstone, "Ban should NOT be tombstoned");
         }
     }
@@ -831,14 +1022,14 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "tomb via snap")).unwrap();
-            sm.tombstone_crdt_ban("10.0.0.1/32".parse().unwrap()).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "tomb via snap")).unwrap();
+            sm.tombstone_crdt_ban("11.0.0.1/32".parse().unwrap()).unwrap();
             sm.take_snapshot().unwrap();
         }
 
         {
             let sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            let ban = sm.crdt_store().get(&"10.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
+            let ban = sm.crdt_store().get(&"11.0.0.1/32".parse::<IpNet>().unwrap()).unwrap();
             assert!(ban.tombstone);
         }
     }
@@ -848,9 +1039,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
 
-        sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "active")).unwrap();
-        sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "will tomb")).unwrap();
-        sm.tombstone_crdt_ban("10.0.0.2/32".parse().unwrap()).unwrap();
+        sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "active")).unwrap();
+        sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "will tomb")).unwrap();
+        sm.tombstone_crdt_ban("11.0.0.2/32".parse().unwrap()).unwrap();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -867,7 +1058,7 @@ mod tests {
         let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
 
         // Tombstoning a non-existent ban should succeed (no-op)
-        sm.tombstone_crdt_ban("10.0.0.1/32".parse().unwrap()).unwrap();
+        sm.tombstone_crdt_ban("11.0.0.1/32".parse().unwrap()).unwrap();
         assert!(sm.crdt_store().is_empty());
     }
 
@@ -876,7 +1067,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
 
-        sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "flush test")).unwrap();
+        sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "flush test")).unwrap();
         sm.flush_wal().unwrap();
 
         // Recovery should work
@@ -891,12 +1082,12 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_ban(make_ban("10.0.0.1/32")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "crdt ban")).unwrap();
+            sm.add_ban(make_ban("11.0.0.1/32")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "crdt ban")).unwrap();
             sm.take_snapshot().unwrap();
 
-            sm.add_ban(make_ban("10.0.0.3/32")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.4/32", "crdt ban 2")).unwrap();
+            sm.add_ban(make_ban("11.0.0.3/32")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.4/32", "crdt ban 2")).unwrap();
             // Crash
         }
 
@@ -915,9 +1106,9 @@ mod tests {
 
         {
             let mut sm = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.1/32", "first crdt")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.2/32", "second crdt")).unwrap();
-            sm.add_crdt_ban(make_crdt_ban("10.0.0.3/32", "third crdt")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.1/32", "first crdt")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.2/32", "second crdt")).unwrap();
+            sm.add_crdt_ban(make_crdt_ban("11.0.0.3/32", "third crdt")).unwrap();
         }
 
         // Corrupt WAL: truncate last entry
@@ -940,7 +1131,7 @@ mod tests {
         let snap_path = dir.path().join("snapshot.bin");
 
         // Create a v1 snapshot directly
-        let bans = vec![make_ban("10.0.0.1/32")];
+        let bans = vec![make_ban("11.0.0.1/32")];
         let wl: Vec<IpNet> = vec!["127.0.0.0/8".parse().unwrap()];
         save_snapshot(&snap_path, &bans, &wl).unwrap();
 

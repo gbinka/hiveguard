@@ -11,6 +11,7 @@ pub mod siem_buffer;
 pub mod siem_exporter;
 pub mod socket_server;
 pub mod ui_api;
+pub mod whitelist_sync;
 
 pub use metrics::{create_metrics, Metrics, SharedMetrics, SourceLabels, DetectorLabels, OperationLabels};
 pub use pipeline::Pipeline;

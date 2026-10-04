@@ -139,6 +139,12 @@ impl Plugin for RestPlugin {
             ));
         }
 
+        if let Some(ingest) = &parsed.ingest {
+            if ingest.enabled && ingest.token.as_deref().unwrap_or(&parsed.auth_token).trim().is_empty() {
+                return Err(PluginError::ConfigValidation("ingest token must not be empty".into()));
+            }
+        }
+
         parsed.bind_addr.parse::<SocketAddr>().map_err(|e| {
             PluginError::ConfigValidation(format!(
                 "bind_addr '{}' is not a valid socket address: {e}",
@@ -266,6 +272,15 @@ mod tests {
         assert_eq!(m.id, PLUGIN_ID);
         assert_eq!(m.kind, PluginKind::UiServer);
         assert_eq!(m.version, PLUGIN_VERSION);
+    }
+
+    #[tokio::test]
+    async fn enabled_ingest_rejects_empty_or_whitespace_token() {
+        for token in ["", " ", "\t\n"] {
+            let mut plugin = RestPlugin { manifest: RestPlugin::manifest_fn(), config: None };
+            let config = serde_json::json!({"auth_token": "valid", "ingest": {"enabled": true, "token": token}});
+            assert!(plugin.init(config).await.is_err());
+        }
     }
 
     #[tokio::test]

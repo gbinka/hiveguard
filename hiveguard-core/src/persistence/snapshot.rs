@@ -11,6 +11,7 @@ use crate::models::BanRecord;
 
 const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"HVGD0001";
 const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"HVGD0002";
+const SNAPSHOT_MAGIC_V4: &[u8; 8] = b"HVGD0004";
 const SNAPSHOT_MAGIC_V3: &[u8; 8] = b"HVGD0003";
 
 /// Maximum snapshot file size: 256 MiB.
@@ -30,28 +31,49 @@ struct SnapshotDataV2 {
     crdt_bans: Vec<CrdtBanRecord>,
 }
 
+/// V4 adds durable local administrative revocations. Older snapshots remain readable.
+#[derive(Serialize, Deserialize)]
+struct SnapshotDataV4 {
+    bans: Vec<BanRecord>,
+    whitelist: Vec<IpNet>,
+    crdt_bans: Vec<CrdtBanRecord>,
+    revocations: Vec<(IpNet, chrono::DateTime<chrono::Utc>)>,
+}
+
 /// Result of loading a snapshot, including optional CRDT state.
 pub struct SnapshotResult {
     pub bans: Vec<BanRecord>,
     pub whitelist: Vec<IpNet>,
     pub crdt_bans: Vec<CrdtBanRecord>,
+    pub revocations: Vec<(IpNet, chrono::DateTime<chrono::Utc>)>,
 }
 
-/// Save a v2 snapshot to disk atomically (write to temp file, then rename).
+/// Save current-format state without revocations (legacy API wrapper).
 pub fn save_snapshot_v2(
     path: &Path,
     bans: &[BanRecord],
     whitelist: &[IpNet],
     crdt_bans: &[CrdtBanRecord],
 ) -> Result<(), HiveGuardError> {
+    save_snapshot_with_revocations(path, bans, whitelist, crdt_bans, &[])
+}
+
+pub fn save_snapshot_with_revocations(
+    path: &Path,
+    bans: &[BanRecord],
+    whitelist: &[IpNet],
+    crdt_bans: &[CrdtBanRecord],
+    revocations: &[(IpNet, chrono::DateTime<chrono::Utc>)],
+) -> Result<(), HiveGuardError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(HiveGuardError::Io)?;
     }
 
-    let data = SnapshotDataV2 {
+    let data = SnapshotDataV4 {
         bans: bans.to_vec(),
         whitelist: whitelist.to_vec(),
         crdt_bans: crdt_bans.to_vec(),
+        revocations: revocations.to_vec(),
     };
 
     let encoded = postcard::to_allocvec(&data)
@@ -59,17 +81,20 @@ pub fn save_snapshot_v2(
 
     let tmp_path = path.with_extension("tmp");
     let mut file = File::create(&tmp_path).map_err(HiveGuardError::Io)?;
-    file.write_all(SNAPSHOT_MAGIC_V3).map_err(HiveGuardError::Io)?;
+    file.write_all(SNAPSHOT_MAGIC_V4).map_err(HiveGuardError::Io)?;
     file.write_all(&encoded).map_err(HiveGuardError::Io)?;
     file.sync_all().map_err(HiveGuardError::Io)?;
     drop(file);
 
     fs::rename(&tmp_path, path).map_err(HiveGuardError::Io)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
 
     Ok(())
 }
 
-/// Save a snapshot to disk atomically (v1 format, no CRDT state).
+/// Save current-format state without CRDT records or revocations.
 pub fn save_snapshot(
     path: &Path,
     bans: &[BanRecord],
@@ -78,13 +103,13 @@ pub fn save_snapshot(
     save_snapshot_v2(path, bans, whitelist, &[])
 }
 
-/// Load a snapshot from disk. Supports both v1 and v2 formats.
+/// Load a snapshot from disk, supporting formats V1–V4.
 pub fn load_snapshot(path: &Path) -> Result<(Vec<BanRecord>, Vec<IpNet>), HiveGuardError> {
     let result = load_snapshot_v2(path)?;
     Ok((result.bans, result.whitelist))
 }
 
-/// Load a v2 snapshot from disk. Supports both v1 and v2 magic headers.
+/// Load state including CRDT records and revocations, supporting V1–V4.
 pub fn load_snapshot_v2(path: &Path) -> Result<SnapshotResult, HiveGuardError> {
     let metadata = fs::metadata(path).map_err(HiveGuardError::Io)?;
     if metadata.len() > SNAPSHOT_MAX_SIZE {
@@ -103,13 +128,29 @@ pub fn load_snapshot_v2(path: &Path) -> Result<SnapshotResult, HiveGuardError> {
     let mut encoded = Vec::new();
     file.read_to_end(&mut encoded).map_err(HiveGuardError::Io)?;
 
-    if &magic == SNAPSHOT_MAGIC_V3 {
-        let data: SnapshotDataV2 = postcard::from_bytes(&encoded)
+    if &magic == SNAPSHOT_MAGIC_V4 {
+        let (data, tail): (SnapshotDataV4, _) = postcard::take_from_bytes(&encoded)
             .map_err(|e| HiveGuardError::Storage(format!("snapshot deserialize: {e}")))?;
+        if !tail.is_empty() {
+            return Err(HiveGuardError::Storage("unexpected trailing snapshot bytes".into()));
+        }
         Ok(SnapshotResult {
             bans: data.bans,
             whitelist: data.whitelist,
             crdt_bans: data.crdt_bans,
+            revocations: data.revocations,
+        })
+    } else if &magic == SNAPSHOT_MAGIC_V3 {
+        let (data, tail): (SnapshotDataV2, _) = postcard::take_from_bytes(&encoded)
+            .map_err(|e| HiveGuardError::Storage(format!("snapshot deserialize: {e}")))?;
+        if !tail.is_empty() {
+            return Err(HiveGuardError::Storage("unexpected trailing snapshot bytes".into()));
+        }
+        Ok(SnapshotResult {
+            bans: data.bans,
+            whitelist: data.whitelist,
+            crdt_bans: data.crdt_bans,
+            revocations: Vec::new(),
         })
     } else if &magic == SNAPSHOT_MAGIC_V2 {
         let data: SnapshotDataV2 = bincode::deserialize(&encoded)
@@ -118,6 +159,7 @@ pub fn load_snapshot_v2(path: &Path) -> Result<SnapshotResult, HiveGuardError> {
             bans: data.bans,
             whitelist: data.whitelist,
             crdt_bans: data.crdt_bans,
+            revocations: Vec::new(),
         })
     } else if &magic == SNAPSHOT_MAGIC_V1 {
         let data: SnapshotDataV1 = bincode::deserialize(&encoded)
@@ -126,10 +168,11 @@ pub fn load_snapshot_v2(path: &Path) -> Result<SnapshotResult, HiveGuardError> {
             bans: data.bans,
             whitelist: data.whitelist,
             crdt_bans: Vec::new(),
+            revocations: Vec::new(),
         })
     } else {
         Err(HiveGuardError::Storage(format!(
-            "invalid snapshot magic: expected HVGD0001, HVGD0002 or HVGD0003, got {:?}",
+            "invalid snapshot magic: expected HVGD0001, HVGD0002, HVGD0003 or HVGD0004, got {:?}",
             magic
         )))
     }

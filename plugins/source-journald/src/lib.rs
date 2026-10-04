@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use hiveguard_plugin_utils::ssh::SshPatterns;
 
 use chrono::Utc;
 use regex::Regex;
@@ -46,6 +48,7 @@ fn default_event_type() -> String { "ConnectionEvent".to_string() }
 pub struct JournaldPlugin {
     manifest: PluginManifest,
     config: Option<Config>,
+    cursor: Option<String>,
 }
 
 impl JournaldPlugin {
@@ -70,6 +73,7 @@ impl JournaldPlugin {
             let mut plugin = JournaldPlugin {
                 manifest: Self::manifest_fn(),
                 config: None,
+                cursor: None,
             };
             <JournaldPlugin as Plugin>::init(&mut plugin, cfg).await?;
             Ok(Box::new(plugin) as Box<dyn LogSourcePlugin>)
@@ -131,7 +135,14 @@ impl LogSourcePlugin for JournaldPlugin {
             command.arg(format!("--unit={unit}"));
         }
         command.arg(format!("--priority={}", cfg.priority));
-        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        if let Some(cursor) = &self.cursor {
+            command.arg(format!("--after-cursor={cursor}"));
+        } else if cfg.since_boot {
+            command.arg("--lines=all");
+        } else {
+            command.arg("--lines=0");
+        }
+        command.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::null());
 
         let mut child: Child = command
             .spawn()
@@ -155,25 +166,38 @@ impl LogSourcePlugin for JournaldPlugin {
                 line = reader.next_line() => {
                     match line {
                         Ok(Some(line)) => {
+                            let cursor = serde_json::from_str::<serde_json::Value>(&line).ok()
+                                .and_then(|entry| entry.get("__CURSOR").and_then(|v| v.as_str()).map(str::to_owned));
                             if let Some(event) = parse_journal_line(
                                 &line,
                                 &cfg.ip_field,
                                 ip_pattern.as_deref(),
                                 event_type.clone(),
                             ) {
-                                if sink.send(event).await.is_err() {
-                                    debug!(plugin = PLUGIN_ID, "event sink closed");
-                                    break;
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => {
+                                        let _ = child.kill().await;
+                                        return Ok(());
+                                    }
+                                    result = sink.send(event) => {
+                                        if result.is_err() {
+                                            debug!(plugin = PLUGIN_ID, "event sink closed");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                            if cursor.is_some() { self.cursor = cursor; }
                         }
                         Ok(None) => {
                             warn!(plugin = PLUGIN_ID, "journalctl stream ended");
+                            let _ = child.kill().await;
                             return Err(PluginError::Runtime(
                                 "journalctl exited unexpectedly".into(),
                             ));
                         }
                         Err(e) => {
+                            let _ = child.kill().await;
                             return Err(PluginError::Runtime(format!(
                                 "journalctl read error: {e}"
                             )));
@@ -216,15 +240,40 @@ fn parse_journal_line(
         return None;
     }
 
-    let source_ip = match ip_pattern {
-        Some(re) => re
-            .captures(field_value)
-            .and_then(|caps| caps.name("ip"))
-            .and_then(|m| m.as_str().parse::<IpAddr>().ok())?,
-        None => extract_first_ip(field_value)?,
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    let comm = obj.get("_COMM").and_then(|v| v.as_str()).unwrap_or("");
+    let identifier = obj.get("SYSLOG_IDENTIFIER").and_then(|v| v.as_str()).unwrap_or("");
+    let unit = obj.get("_SYSTEMD_UNIT").and_then(|v| v.as_str()).unwrap_or("");
+    let ssh_identity = |name: &str| matches!(name, "sshd" | "sshd-session" | "sshd-auth");
+    let ssh_unit = unit == "ssh.service" || unit == "sshd.service"
+        || unit.starts_with("ssh@") || unit.starts_with("sshd@");
+    let is_ssh = ssh_identity(comm) || ssh_identity(identifier) || ssh_unit;
+    let (source_ip, event_type) = if is_ssh {
+        // Underscore fields are supplied by journald, unlike the spoofable
+        // SYSLOG_IDENTIFIER. Authentication messages come from sshd's root
+        // monitor; an unprivileged process named sshd is not sufficient.
+        if !ssh_identity(comm) || obj.get("_UID").and_then(|v| v.as_str()) != Some("0") {
+            return None;
+        }
+        let message = obj.get("MESSAGE")?.as_str()?;
+        // Existing custom patterns remain an optional message filter, never
+        // an alternate source of client identity for SSH.
+        if ip_pattern.is_some_and(|re| !re.is_match(field_value)) { return None; }
+        static SSH: OnceLock<SshPatterns> = OnceLock::new();
+        let event = SSH.get_or_init(SshPatterns::new).parse_message(message)?;
+        metadata.insert("user".into(), event.user);
+        if event.invalid_user { metadata.insert("invalid_user".into(), "true".into()); }
+        (event.source_ip, event.event_type)
+    } else {
+        let source_ip = match ip_pattern {
+            Some(re) => re.captures(field_value)
+                .and_then(|caps| caps.name("ip"))
+                .and_then(|m| m.as_str().parse::<IpAddr>().ok())?,
+            None => extract_first_ip(field_value)?,
+        };
+        (source_ip, event_type)
     };
 
-    let mut metadata: HashMap<String, String> = HashMap::new();
     if let Some(unit) = obj.get("_SYSTEMD_UNIT").and_then(|v| v.as_str()) {
         metadata.insert("unit".into(), unit.to_string());
     }
@@ -318,9 +367,46 @@ mod tests {
         }
     }
 
+    fn ssh_entry(message: &str) -> serde_json::Value {
+        serde_json::json!({ "MESSAGE": message, "_COMM": "sshd", "_UID": "0", "_SYSTEMD_UNIT": "ssh.service" })
+    }
+
+    #[test]
+    fn ssh_success_overrides_configured_failure_type() {
+        let entry = ssh_entry("Accepted publickey for admin from 203.0.113.5 port 12345 ssh2: ED25519 SHA256:abc");
+        let event = parse_journal_line(&entry.to_string(), "MESSAGE", None, EventType::AuthFailure).unwrap();
+        assert_eq!(event.event_type, EventType::AuthSuccess);
+        assert_eq!(event.metadata.get("user").map(String::as_str), Some("admin"));
+    }
+
+    #[test]
+    fn ssh_username_cannot_poison_ip_even_with_custom_ip_pattern() {
+        let entry = ssh_entry("Invalid user 198.51.100.42 from 127.0.0.1 port 60540");
+        let pattern = Regex::new(r"(?P<ip>198\.51\.100\.42)").unwrap();
+        for re in [None, Some(&pattern)] {
+            let event = parse_journal_line(&entry.to_string(), "MESSAGE", re, EventType::AuthFailure).unwrap();
+            assert_eq!(event.source_ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert_eq!(event.metadata.get("invalid_user").map(String::as_str), Some("true"));
+        }
+    }
+
+    #[test]
+    fn rejects_spoofed_journal_identity_and_non_auth_messages() {
+        let message = "Failed password for root from 203.0.113.5 port 12345 ssh2";
+        let mut entry = ssh_entry(message);
+        entry["_UID"] = serde_json::json!("1000");
+        assert!(parse_journal_line(&entry.to_string(), "MESSAGE", None, EventType::AuthFailure).is_none());
+        entry = ssh_entry(message);
+        entry["SYSLOG_IDENTIFIER"] = serde_json::json!("sshd");
+        entry["_COMM"] = serde_json::json!("logger");
+        assert!(parse_journal_line(&entry.to_string(), "MESSAGE", None, EventType::AuthFailure).is_none());
+        entry = ssh_entry("Connection closed by invalid user 198.51.100.42 127.0.0.1 port 60540 [preauth]");
+        assert!(parse_journal_line(&entry.to_string(), "MESSAGE", None, EventType::AuthFailure).is_none());
+    }
+
     #[test]
     fn extracts_ipv4_from_message() {
-        let line = r#"{"MESSAGE": "Failed password from 203.0.113.5 port 12345", "_SYSTEMD_UNIT": "ssh.service"}"#;
+        let line = r#"{"MESSAGE": "Failed password for root from 203.0.113.5 port 12345 ssh2", "_SYSTEMD_UNIT": "ssh.service", "_COMM": "sshd", "_UID": "0"}"#;
         let event = parse_journal_line(line, "MESSAGE", None, EventType::AuthFailure).unwrap();
         assert_eq!(event.source_ip, "203.0.113.5".parse::<IpAddr>().unwrap());
         assert_eq!(event.event_type, EventType::AuthFailure);

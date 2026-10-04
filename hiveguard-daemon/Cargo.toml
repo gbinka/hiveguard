@@ -135,6 +135,8 @@ ui-web  = ["dep:hiveguard-ui-web"]
 # Dependencies
 # ---------------------------------------------------------------------------
 [dependencies]
+futures = "0.3"
+tempfile = "3"
 # Core (cluster feature gated)
 hiveguard-core   = { path = "../hiveguard-core", default-features = false }
 
@@ -216,6 +218,9 @@ tracing-subscriber = "0.3"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+bincode = "1"
+sha2 = "0.10"
 serde_yaml = "0.9"
 chrono = "0.4"
 ipnet = "2"
@@ -229,7 +234,6 @@ prometheus-client = "0.23"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
-tempfile = "3"
-futures = "0.3"
+tokio = { version = "1", features = ["test-util"] }
 ipnet = "2"
 hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default" }

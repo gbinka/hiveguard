@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use ipnet::IpNet;
 use tokio::process::Command;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::enforcer::Enforcer;
 use hiveguard_core::errors::HiveGuardError;
@@ -24,8 +26,12 @@ pub struct NftablesEnforcer {
     sync_next_set_name_v4: String,
     sync_next_set_name_v6: String,
     batch_interval: Duration,
-    pending_adds: Vec<IpNet>,
-    pending_removes: Vec<IpNet>,
+    // Preserve exact logical bans, including hosts hidden by broader intervals.
+    // Their lifetimes belong to the persistent daemon state; sync_full is the
+    // authoritative replacement used at startup and for periodic reconciliation.
+    desired_bans: BTreeSet<IpNet>,
+    nft_binary: PathBuf,
+    command_timeout: Duration,
     initialized: bool,
 }
 
@@ -45,8 +51,9 @@ impl NftablesEnforcer {
             sync_next_set_name_v4,
             sync_next_set_name_v6,
             batch_interval,
-            pending_adds: Vec::new(),
-            pending_removes: Vec::new(),
+            desired_bans: BTreeSet::new(),
+            nft_binary: PathBuf::from("nft"),
+            command_timeout: Duration::from_secs(10),
             initialized: false,
         }
     }
@@ -93,6 +100,7 @@ impl NftablesEnforcer {
     }
 
     /// Determine which set name to use based on the IP version.
+    #[cfg(test)]
     fn set_for(&self, net: &IpNet) -> &str {
         match net {
             IpNet::V4(_) => &self.set_name_v4,
@@ -101,6 +109,7 @@ impl NftablesEnforcer {
     }
 
     /// Determine which shadow set name to use based on the IP version.
+    #[cfg(test)]
     fn sync_set_for(&self, net: &IpNet) -> &str {
         match net {
             IpNet::V4(_) => &self.sync_set_name_v4,
@@ -109,6 +118,7 @@ impl NftablesEnforcer {
     }
 
     /// Determine which second shadow set name to use based on the IP version.
+    #[cfg(test)]
     fn sync_next_set_for(&self, net: &IpNet) -> &str {
         match net {
             IpNet::V4(_) => &self.sync_next_set_name_v4,
@@ -116,42 +126,72 @@ impl NftablesEnforcer {
         }
     }
 
-    /// Flush pending batch operations — execute queued adds/removes in a single nft batch.
+    /// Reapply the complete desired state in one transaction.
     pub async fn flush_batch(&mut self) -> Result<()> {
-        if self.pending_adds.is_empty() && self.pending_removes.is_empty() {
-            return Ok(());
-        }
+        let banned: Vec<_> = self.desired_bans.iter().copied().collect();
+        self.sync_full(&banned).await
+    }
 
-        let mut batch = String::new();
+    async fn execute(&self, args: &[&str], input: Option<&str>) -> Result<String> {
+        execute_nft(&self.nft_binary, args, input, self.command_timeout).await
+    }
+
+    fn build_setup_batch(&self) -> String {
         let table = &self.table_name;
-
-        let removes: Vec<IpNet> = self.pending_removes.drain(..).collect();
-        for net in &removes {
-            let set = self.set_for(net);
+        let mut batch = format!("add table inet {table}\n");
+        for set in [
+            &self.set_name_v4,
+            &self.sync_set_name_v4,
+            &self.sync_next_set_name_v4,
+        ] {
             batch.push_str(&format!(
-                "delete element inet {table} {set} {{ {} }}\n",
-                format_net(net)
+                "add set inet {table} {set} {{ type ipv4_addr; flags interval; }}\n"
             ));
         }
-
-        let adds: Vec<IpNet> = self.pending_adds.drain(..).collect();
-        for net in &adds {
-            let set = self.set_for(net);
+        for set in [
+            &self.set_name_v6,
+            &self.sync_set_name_v6,
+            &self.sync_next_set_name_v6,
+        ] {
             batch.push_str(&format!(
-                "add element inet {table} {set} {{ {} }}\n",
-                format_net(net)
+                "add set inet {table} {set} {{ type ipv6_addr; flags interval; }}\n"
             ));
         }
-
-        debug!("flushing nft batch:\n{}", batch);
-        run_nft_stdin(&batch).await
+        batch.push_str(&format!("add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}\n"));
+        // This chain is owned by HiveGuard. Replacing its rules in the same nft
+        // transaction removes duplicates without flushing bans or opening a gap.
+        batch.push_str(&format!("flush chain inet {table} input\n"));
+        for (family, sets) in [
+            (
+                "ip",
+                [
+                    &self.set_name_v4,
+                    &self.sync_set_name_v4,
+                    &self.sync_next_set_name_v4,
+                ],
+            ),
+            (
+                "ip6",
+                [
+                    &self.set_name_v6,
+                    &self.sync_set_name_v6,
+                    &self.sync_next_set_name_v6,
+                ],
+            ),
+        ] {
+            for set in sets {
+                batch.push_str(&format!(
+                    "add rule inet {table} input {family} saddr @{set} drop\n"
+                ));
+            }
+        }
+        batch
     }
 
     /// Build nft batch commands for a full sync.
     ///
-    /// Shadow sets are populated before active sets are flushed. If execution
-    /// fails after an active flush, the shadow drop rules still enforce the
-    /// desired ban list until the next successful sync.
+    /// nft applies the entire batch atomically. On any error the previously
+    /// applied sets remain in place; the caller must retain state for retry.
     pub fn build_sync_batch(&self, banned: &[IpNet]) -> String {
         let table = &self.table_name;
         let mut batch = String::new();
@@ -176,9 +216,7 @@ impl NftablesEnforcer {
         append_replace_set_batch(&mut batch, table, &self.set_name_v4, &v4);
         append_replace_set_batch(&mut batch, table, &self.set_name_v6, &v6);
 
-        // Cleanup is intentionally last: if active replacement fails after a
-        // flush, populated shadow sets are left in place as fail-closed
-        // protection rather than leaving the firewall open.
+        // Clear legacy shadow sets in the same atomic replacement transaction.
         batch.push_str(&format!(
             "flush set inet {table} {}\n",
             self.sync_set_name_v4
@@ -226,137 +264,48 @@ fn append_replace_set_batch(batch: &mut String, table: &str, set: &str, nets: &[
 #[async_trait]
 impl Enforcer for NftablesEnforcer {
     async fn setup(&mut self) -> Result<()> {
-        let table = &self.table_name;
-
-        // Create table (idempotent via `add`)
-        run_nft(&format!("add table inet {table}")).await?;
-
-        // Create active and shadow sets with interval flag for CIDR support.
-        for set in [
-            &self.set_name_v4,
-            &self.sync_set_name_v4,
-            &self.sync_next_set_name_v4,
-        ] {
-            run_nft(&format!(
-                "add set inet {table} {set} {{ type ipv4_addr; flags interval; }}"
-            ))
+        // Identifiers enter nft's language, not a shell: reject syntax injection.
+        for name in std::iter::once(self.table_name.as_str()).chain(self.all_set_names()) {
+            if name.is_empty()
+                || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                || name.as_bytes()[0].is_ascii_digit()
+            {
+                return Err(HiveGuardError::Enforcement(
+                    "invalid nft table/set identifier".into(),
+                ));
+            }
+        }
+        self.execute(&["-f", "-"], Some(&self.build_setup_batch()))
             .await?;
+        if !self.initialized {
+            // Preserve existing kernel bans until startup's authoritative sync.
+            self.desired_bans = self.get_current_bans().await?.into_iter().collect();
         }
-
-        for set in [
-            &self.set_name_v6,
-            &self.sync_set_name_v6,
-            &self.sync_next_set_name_v6,
-        ] {
-            run_nft(&format!(
-                "add set inet {table} {set} {{ type ipv6_addr; flags interval; }}"
-            ))
-            .await?;
-        }
-
-        // Create input chain with filter hook at priority -10
-        run_nft(&format!(
-            "add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}"
-        ))
-        .await?;
-
-        // Add drop rules referencing both active and shadow sets.
-        for set in [
-            &self.set_name_v4,
-            &self.sync_set_name_v4,
-            &self.sync_next_set_name_v4,
-        ] {
-            run_nft(&format!("add rule inet {table} input ip saddr @{set} drop")).await?;
-        }
-
-        for set in [
-            &self.set_name_v6,
-            &self.sync_set_name_v6,
-            &self.sync_next_set_name_v6,
-        ] {
-            run_nft(&format!(
-                "add rule inet {table} input ip6 saddr @{set} drop"
-            ))
-            .await?;
-        }
-
         self.initialized = true;
-        info!(
-            "nftables setup complete: table={}, sets={}/{}, shadow_sets={}/{}/{}/{}",
-            table,
-            self.set_name_v4,
-            self.set_name_v6,
-            self.sync_set_name_v4,
-            self.sync_set_name_v6,
-            self.sync_next_set_name_v4,
-            self.sync_next_set_name_v6
-        );
+        info!(table = %self.table_name, "nftables setup complete");
         Ok(())
     }
 
     async fn apply_ban(&mut self, subject: &IpNet) -> Result<()> {
-        let table = &self.table_name;
-        let set = self.set_for(subject).to_string();
-        let elem = format_net(subject);
-
-        info!("nftables: banning {} in set {}", subject, set);
-
-        let max_prefix = match subject {
-            IpNet::V4(_) => 32,
-            IpNet::V6(_) => 128,
-        };
-        // Banning a subnet (e.g. a /24 from the distributed-slow detector) into
-        // an interval set fails with "interval overlaps with an existing one"
-        // if a narrower entry it contains (e.g. an already-banned /32 host) is
-        // present. Purge those contained entries first, otherwise the broader
-        // ban is rejected and the rest of the subnet keeps leaking traffic.
-        if subject.prefix_len() < max_prefix {
-            let existing = self.get_current_bans().await.unwrap_or_default();
-            for net in existing
-                .into_iter()
-                .filter(|n| n != subject && subject.contains(n))
-            {
-                let contained = format_net(&net);
-                run_nft_idempotent_delete(&format!(
-                    "delete element inet {table} {set} {{ {contained} }}"
-                ))
-                .await?;
-            }
-        }
-
-        // Tolerate a residual overlap: if the target is still contained in a
-        // broader existing interval it is already blocked, so treat that as
-        // success rather than failing the ban.
-        run_nft_idempotent_add(&format!("add element inet {table} {set} {{ {elem} }}")).await
+        let mut next = self.desired_bans.clone();
+        next.insert(subject.trunc());
+        self.sync_full(&next.into_iter().collect::<Vec<_>>()).await
     }
 
     async fn remove_ban(&mut self, subject: &IpNet) -> Result<()> {
-        let table = &self.table_name;
-        let set = self.set_for(subject).to_string();
-        let sync_set = self.sync_set_for(subject).to_string();
-        let sync_next_set = self.sync_next_set_for(subject).to_string();
-        let elem = format_net(subject);
-
-        info!(
-            "nftables: unbanning {} from sets {}/{}/{}",
-            subject, set, sync_set, sync_next_set
-        );
-        run_nft_idempotent_delete(&format!("delete element inet {table} {set} {{ {elem} }}"))
-            .await?;
-        run_nft_idempotent_delete(&format!(
-            "delete element inet {table} {sync_set} {{ {elem} }}"
-        ))
-        .await?;
-        run_nft_idempotent_delete(&format!(
-            "delete element inet {table} {sync_next_set} {{ {elem} }}"
-        ))
-        .await
+        let mut next = self.desired_bans.clone();
+        next.remove(&subject.trunc());
+        // Restores any still-active narrower bans previously hidden by subject.
+        self.sync_full(&next.into_iter().collect::<Vec<_>>()).await
     }
 
     async fn sync_full(&mut self, banned: &[IpNet]) -> Result<()> {
-        info!("nftables: full sync with {} ban(s)", banned.len());
-        let batch = self.build_sync_batch(banned);
-        run_nft_stdin(&batch).await
+        let desired: BTreeSet<_> = banned.iter().map(IpNet::trunc).collect();
+        let batch = self.build_sync_batch(&desired.iter().copied().collect::<Vec<_>>());
+        self.execute(&["-f", "-"], Some(&batch)).await?;
+        // Only advance the applied cache after the atomic kernel update succeeds.
+        self.desired_bans = desired;
+        Ok(())
     }
 
     async fn get_current_bans(&self) -> Result<Vec<IpNet>> {
@@ -364,7 +313,9 @@ impl Enforcer for NftablesEnforcer {
         let mut result = Vec::new();
 
         for set in self.all_set_names() {
-            let output = run_nft_output(&format!("-j list set inet {table} {set}")).await?;
+            let output = self
+                .execute(&["-j", "list", "set", "inet", table, set], None)
+                .await?;
             parse_nft_set_elements(&output, &mut result);
         }
         result.sort();
@@ -384,7 +335,7 @@ fn dedup_overlapping(nets: &[IpNet]) -> Vec<IpNet> {
     if nets.is_empty() {
         return Vec::new();
     }
-    let mut sorted: Vec<IpNet> = nets.to_vec();
+    let mut sorted: Vec<IpNet> = nets.iter().map(IpNet::trunc).collect();
     sorted.sort();
     let mut result: Vec<IpNet> = vec![sorted[0]];
     for &net in &sorted[1..] {
@@ -426,140 +377,70 @@ fn format_net(net: &IpNet) -> String {
 // Helper: run nft commands
 // ---------------------------------------------------------------------------
 
+/// Bound both pipe writes and process completion. Dropping a timed-out child
+/// kills it, preventing a stuck nft process from holding the enforcer forever.
+async fn execute_nft(
+    binary: &std::path::Path,
+    args: &[&str],
+    input: Option<&str>,
+    deadline: Duration,
+) -> Result<String> {
+    let operation = async {
+        let mut child = Command::new(binary)
+            .args(args)
+            .kill_on_drop(true)
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| HiveGuardError::Enforcement(format!("failed to spawn nft: {e}")))?;
+        if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(input.as_bytes()).await.map_err(|e| {
+                HiveGuardError::Enforcement(format!("failed to write nft stdin: {e}"))
+            })?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| HiveGuardError::Enforcement(format!("failed to wait for nft: {e}")))?;
+        if !output.status.success() {
+            // No stderr substring may turn a failed transaction into success:
+            // nft rolls back every command, including supposedly idempotent ones.
+            return Err(HiveGuardError::Enforcement(format!(
+                "nft command failed (exit {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|e| HiveGuardError::Enforcement(format!("invalid UTF-8 from nft: {e}")))
+    };
+    debug!(?args, "running nft");
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| {
+            HiveGuardError::Enforcement(format!(
+                "nft command timed out after {}s",
+                deadline.as_secs()
+            ))
+        })?
+}
+
+#[cfg(test)]
 async fn run_nft(args: &str) -> Result<()> {
-    debug!("nft {}", args);
-    // Feed the command via stdin (`nft -f -`) rather than splitting it into argv.
-    // Whitespace-splitting breaks expressions such as `priority -10;`: the bare
-    // `-10;` token starts with `-`, so nft's option parser treats it as a CLI
-    // flag and aborts with "invalid option -- '1'" on older nft (e.g. 0.9.3 on
-    // Ubuntu 20.04). Reading from stdin sidesteps option parsing entirely.
-    let mut child = Command::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| HiveGuardError::Enforcement(format!("failed to run nft: {e}")))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(format!("{args}\n").as_bytes())
-            .await
-            .map_err(|e| HiveGuardError::Enforcement(format!("failed to write nft stdin: {e}")))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| HiveGuardError::Enforcement(format!("failed to run nft: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // "File exists" is okay for idempotent adds
-        if stderr.contains("File exists") {
-            warn!("nft: already exists (idempotent): {}", args);
-            return Ok(());
-        }
-        error!("nft command failed: {}", stderr);
-        return Err(HiveGuardError::Enforcement(format!(
-            "nft command failed (exit {}): {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
-}
-
-/// Run nft with batch input on stdin (`nft -f -`).
-async fn run_nft_stdin(batch: &str) -> Result<()> {
-    debug!("nft -f - (batch):\n{}", batch);
-    let mut child = Command::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| HiveGuardError::Enforcement(format!("failed to spawn nft: {e}")))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(batch.as_bytes())
-            .await
-            .map_err(|e| HiveGuardError::Enforcement(format!("failed to write nft stdin: {e}")))?;
-        // Drop to close stdin
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| HiveGuardError::Enforcement(format!("failed to wait for nft: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("nft batch failed: {}", stderr);
-        return Err(HiveGuardError::Enforcement(format!(
-            "nft batch failed (exit {}): {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
-}
-
-async fn run_nft_idempotent_delete(args: &str) -> Result<()> {
-    match run_nft(args).await {
-        Ok(()) => Ok(()),
-        Err(HiveGuardError::Enforcement(msg))
-            if msg.contains("No such file or directory") || msg.contains("does not exist") =>
-        {
-            warn!("nft: already absent (idempotent delete): {}", args);
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Run an `add element` that tolerates the target already being covered by an
-/// existing interval ("interval overlaps with an existing one"). That error
-/// means a broader ban already blocks the address, so the add is a no-op rather
-/// than a failure. Exact duplicates ("File exists") are handled inside `run_nft`.
-async fn run_nft_idempotent_add(args: &str) -> Result<()> {
-    match run_nft(args).await {
-        Ok(()) => Ok(()),
-        Err(HiveGuardError::Enforcement(msg)) if msg.contains("overlaps with an existing one") => {
-            warn!("nft: already covered by broader interval (idempotent add): {}", args);
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Run nft command and capture stdout.
-async fn run_nft_output(args: &str) -> Result<String> {
-    debug!("nft {}", args);
-    let output = Command::new("nft")
-        .args(args.split_whitespace())
-        .output()
-        .await
-        .map_err(|e| HiveGuardError::Enforcement(format!("failed to run nft: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(HiveGuardError::Enforcement(format!(
-            "nft command failed (exit {}): {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
-
-    String::from_utf8(output.stdout)
-        .map_err(|e| HiveGuardError::Enforcement(format!("invalid UTF-8 from nft: {e}")))
+    execute_nft(
+        std::path::Path::new("nft"),
+        &["-f", "-"],
+        Some(&format!("{args}\n")),
+        Duration::from_secs(10),
+    )
+    .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +733,124 @@ mod tests {
         );
         assert_eq!(e.batch_interval(), Duration::from_secs(1));
         assert!(!e.initialized);
+    }
+
+    #[tokio::test]
+    async fn command_deadline_covers_wait_and_pipe_write() {
+        // exec replaces the shell, so kill_on_drop kills the actual sleeper.
+        for input in [None, Some("x".repeat(1024 * 1024))] {
+            let start = std::time::Instant::now();
+            let result = execute_nft(
+                std::path::Path::new("/bin/sh"),
+                &["-c", "exec sleep 30"],
+                input.as_deref(),
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("timed out"));
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn error_text_never_turns_a_failed_transaction_into_success() {
+        for message in [
+            "File exists",
+            "interval overlaps with an existing one",
+            "does not exist",
+        ] {
+            let result = execute_nft(
+                std::path::Path::new("/bin/sh"),
+                &["-c", "printf '%s' \"$1\" >&2; exit 1", "sh", message],
+                None,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn normalization_handles_noncanonical_network_addresses() {
+        let nets = [
+            "11.22.33.9/24".parse().unwrap(),
+            "11.22.33.1/32".parse().unwrap(),
+        ];
+        assert_eq!(
+            dedup_overlapping(&nets),
+            vec!["11.22.33.0/24".parse::<IpNet>().unwrap()]
+        );
+    }
+
+    // Run ONLY inside an isolated network namespace (see plugin README).
+    #[tokio::test]
+    #[ignore]
+    async fn integration_overlap_expiry_atomic_rollback_and_restart() {
+        let mut enforcer = NftablesEnforcer::with_defaults();
+        enforcer.setup().await.unwrap();
+        enforcer.setup().await.unwrap();
+        let rules = enforcer
+            .execute(&["-j", "list", "chain", "inet", "hiveguard", "input"], None)
+            .await
+            .unwrap();
+        let rules: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        assert_eq!(
+            rules["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v.get("rule").is_some())
+                .count(),
+            6
+        );
+
+        for (host, subnet) in [
+            ("11.22.33.5/32", "11.22.33.0/24"),
+            ("2001:db8:1::5/128", "2001:db8:1::/48"),
+        ] {
+            let host: IpNet = host.parse().unwrap();
+            let subnet: IpNet = subnet.parse().unwrap();
+            for host_first in [true, false] {
+                enforcer.sync_full(&[]).await.unwrap();
+                for net in if host_first {
+                    [host, subnet]
+                } else {
+                    [subnet, host]
+                } {
+                    enforcer.apply_ban(&net).await.unwrap();
+                }
+                assert_eq!(enforcer.get_current_bans().await.unwrap(), vec![subnet]);
+                assert_eq!(enforcer.desired_bans.len(), 2);
+                // Setup again must preserve logical hosts hidden by intervals.
+                enforcer.setup().await.unwrap();
+                enforcer.remove_ban(&subnet).await.unwrap();
+                assert_eq!(enforcer.get_current_bans().await.unwrap(), vec![host]);
+                enforcer.remove_ban(&host).await.unwrap();
+                assert!(enforcer.get_current_bans().await.unwrap().is_empty());
+            }
+        }
+
+        let host: IpNet = "11.22.33.5/32".parse().unwrap();
+        enforcer.sync_full(&[host]).await.unwrap();
+        // A failing final command must roll back earlier shadow flush/adds too.
+        let original_set = enforcer.set_name_v6.clone();
+        enforcer.set_name_v6 = "missing_set".into();
+        assert!(enforcer.sync_full(&[]).await.is_err());
+        assert_eq!(enforcer.desired_bans, [host].into_iter().collect());
+        enforcer.set_name_v6 = original_set;
+        assert_eq!(enforcer.get_current_bans().await.unwrap(), vec![host]);
+
+        // A fresh process restores exact logical records from durable state.
+        let subnet: IpNet = "11.22.33.0/24".parse().unwrap();
+        enforcer.sync_full(&[host, subnet]).await.unwrap();
+        let mut restarted = NftablesEnforcer::with_defaults();
+        restarted.setup().await.unwrap();
+        restarted.sync_full(&[host, subnet]).await.unwrap();
+        restarted.remove_ban(&subnet).await.unwrap();
+        assert_eq!(restarted.get_current_bans().await.unwrap(), vec![host]);
+        restarted.sync_full(&[]).await.unwrap();
+        assert!(restarted.get_current_bans().await.unwrap().is_empty());
+        run_nft("delete table inet hiveguard").await.unwrap();
     }
 
     // Integration test requiring root/CAP_NET_ADMIN — run manually

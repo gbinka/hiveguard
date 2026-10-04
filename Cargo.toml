@@ -9,7 +9,7 @@ members = [
     # "hiveguard-tui" — legacy ratatui binary moved to obsolete/crates/.
     # Replaced by `plugins/ui-tui/` (in development by parallel agent).
     # "hiveguard-web" — legacy rust-embed SPA wrapper removed. The React panel
-    # now lives as a standalone project in ../hiveguard-web/ and talks to the
+    # now lives as a standalone npm project in web-panel/ and talks to the
     # ui.rest API over HTTP (CORS + Bearer). Serve its dist/ via ui.rest static_dir.
     "hiveguard-cti",
     "hiveguard-sigma",
@@ -81,10 +81,8 @@ exclude = ["fuzz"]
 license = "MIT OR Apache-2.0"
 
 [workspace.metadata]
-# AWS SDK 1.x requires Rust 1.88+ in newer versions.
-# The installed toolchain is 1.87.0. Use --ignore-rust-version when building.
-# Pinned AWS SDK versions in hiveguard-queue/Cargo.toml are compatible.
+# Build with the toolchain pinned in rust-toolchain.toml (Rust 1.91.1).
+# Do not bypass dependency MSRV checks with --ignore-rust-version.
 
-# Pin minimum versions for security fixes (F-6)
-[workspace.dependencies]
-time = ">=0.3.47"
+# Security updates to transitive dependencies are captured in Cargo.lock.
+# An unused workspace.dependencies entry does not constrain transitive versions.

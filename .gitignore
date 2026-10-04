@@ -13,7 +13,7 @@ fuzz/artifacts/
 fuzz/coverage/
 
 # === Frontend build artifacts (Trunk WASM in plugins/ui-*) ===
-# NOTE: The React panel is now a standalone project in ../hiveguard-web/.
+# The React panel is a standalone npm project in web-panel/.
 node_modules/
 **/node_modules/
 **/dist/
@@ -29,3 +29,7 @@ config.yaml
 # === Editor / OS ===
 .DS_Store
 *.swp
+
+# === Python deployment helper artifacts ===
+__pycache__/
+*.py[cod]

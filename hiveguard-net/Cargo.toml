@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 hiveguard-core = { path = "../hiveguard-core" }
 quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

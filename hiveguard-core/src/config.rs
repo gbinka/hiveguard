@@ -193,12 +193,12 @@ pub struct BotRuleConfig {
     pub ua_contains: String,
     #[serde(default)]
     pub org: String,
-    #[serde(default = "default_bot_policy_allow")]
+    #[serde(default = "default_bot_policy_monitor")]
     pub policy: String,
 }
 
-fn default_bot_policy_allow() -> String {
-    "allow".to_string()
+fn default_bot_policy_monitor() -> String {
+    "monitor".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,7 +1328,20 @@ pub struct TrustConfig {
     pub max_bans_per_minute: u32,
     #[serde(default = "default_auto_quarantine_multiplier")]
     pub auto_quarantine_multiplier: f64,
+    /// Smallest remotely accepted IPv4 prefix (default /24).
+    #[serde(default = "default_remote_min_prefix_v4")]
+    pub remote_min_prefix_v4: u8,
+    /// Smallest remotely accepted IPv6 prefix (default /48).
+    #[serde(default = "default_remote_min_prefix_v6")]
+    pub remote_min_prefix_v6: u8,
+    /// Maximum total lifetime of a remote ban; permanent bans are rejected.
+    #[serde(default = "default_remote_max_ttl_secs")]
+    pub remote_max_ttl_secs: u64,
 }
+
+fn default_remote_min_prefix_v4() -> u8 { 24 }
+fn default_remote_min_prefix_v6() -> u8 { 48 }
+fn default_remote_max_ttl_secs() -> u64 { 86400 }
 
 impl Default for TrustConfig {
     fn default() -> Self {
@@ -1338,6 +1351,9 @@ impl Default for TrustConfig {
             new_node_threshold_multiplier: 2.0,
             max_bans_per_minute: 100,
             auto_quarantine_multiplier: 10.0,
+            remote_min_prefix_v4: default_remote_min_prefix_v4(),
+            remote_min_prefix_v6: default_remote_min_prefix_v6(),
+            remote_max_ttl_secs: default_remote_max_ttl_secs(),
         }
     }
 }
@@ -2223,6 +2239,20 @@ impl HiveGuardConfig {
 
     /// Validate configuration values.
     pub fn validate(&self) -> Result<(), HiveGuardError> {
+        for bot in &self.bots {
+            if bot.ua_contains.trim().is_empty() {
+                return Err(HiveGuardError::Config("bot ua_contains must not be empty".into()));
+            }
+            if !matches!(bot.policy.to_lowercase().as_str(), "allow" | "monitor" | "block") {
+                return Err(HiveGuardError::Config(format!("unknown bot policy: {}", bot.policy)));
+            }
+        }
+        if self.trust.remote_min_prefix_v4 > 32 || self.trust.remote_min_prefix_v6 > 128 {
+            return Err(HiveGuardError::Config("remote minimum prefix exceeds address width".into()));
+        }
+        if self.trust.remote_max_ttl_secs == 0 || self.trust.remote_max_ttl_secs > i64::MAX as u64 {
+            return Err(HiveGuardError::Config("remote maximum TTL must be positive and representable".into()));
+        }
         // data_dir must be non-empty
         if self.node.data_dir.as_os_str().is_empty() {
             return Err(HiveGuardError::Config(

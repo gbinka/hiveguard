@@ -197,7 +197,7 @@ async fn manual_ban_via_ui_api_persists_and_emits_event() {
     let h = build_harness().await;
     let mut sub = h.ui_api.subscribe();
 
-    let subject: ipnet::IpNet = "198.51.100.5/32".parse().unwrap();
+    let subject: ipnet::IpNet = "11.22.33.5/32".parse().unwrap();
     h.ui_api
         .add_ban(BanRequest {
             subject,
@@ -209,7 +209,7 @@ async fn manual_ban_via_ui_api_persists_and_emits_event() {
 
     // Persistence check.
     let bans = h.ui_api.list_bans().await;
-    let found = bans.iter().find(|b| b.subject.contains("198.51.100.5"));
+    let found = bans.iter().find(|b| b.subject.contains("11.22.33.5"));
     assert!(found.is_some(), "manual ban must be persisted");
     assert_eq!(found.unwrap().source, "admin");
 
@@ -218,7 +218,7 @@ async fn manual_ban_via_ui_api_persists_and_emits_event() {
     for _ in 0..5 {
         match tokio::time::timeout(Duration::from_millis(200), sub.recv()).await {
             Ok(Ok(hiveguard_plugin_api::UiEvent::BansSnapshot(snap))) => {
-                if snap.iter().any(|b| b.subject.contains("198.51.100.5")) {
+                if snap.iter().any(|b| b.subject.contains("11.22.33.5")) {
                     got_snapshot = true;
                     break;
                 }
@@ -235,7 +235,7 @@ async fn manual_ban_via_ui_api_persists_and_emits_event() {
         .expect("remove_ban must succeed");
     let bans = h.ui_api.list_bans().await;
     assert!(
-        !bans.iter().any(|b| b.subject.contains("198.51.100.5")),
+        !bans.iter().any(|b| b.subject.contains("11.22.33.5")),
         "ban must be removed"
     );
 

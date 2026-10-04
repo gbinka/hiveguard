@@ -44,21 +44,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ipnet::IpNet;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
 use hiveguard_core::anti_poison::RateLimiter;
 use hiveguard_core::ban_store::BanStore;
-use hiveguard_core::config::{ClusterMode, HiveGuardConfig};
+use hiveguard_core::config::{ClusterMode, HiveGuardConfig, TrustConfig};
 use hiveguard_core::persistence::state_manager::StateManager;
 use hiveguard_core::trust::TrustManager;
 use hiveguard_core::{BanRecord, BanSource};
 use hiveguard_enforce::Enforcer;
 use hiveguard_net::{
-    extract_peer_fingerprint_and_key, read_bounded_message, send_message, decode_message,
-    ClusterMessage, GossipAction, GossipConfig, GossipEngine, NodeIdentity, PeerInfo, PeerState,
-    QuicTransport, SignedBanRecord, SigningCache, SwimAction, SwimConfig, SyncCoordinator,
+    decode_message, extract_peer_fingerprint_and_key, read_bounded_message, send_message,
+    signed_pages, ClusterMessage, GossipAction, GossipConfig, GossipEngine, NodeIdentity, PeerInfo,
+    PeerState, QuicTransport, SignedBanRecord, SigningCache, SwimAction, SwimConfig,
+    SyncCoordinator,
 };
 
 use crate::metrics::SharedMetrics;
@@ -205,7 +206,10 @@ pub async fn spawn_cluster(
     let coordinator = SyncCoordinator::new(
         node_id.clone(),
         SwimConfig::default(),
-        GossipConfig { fanout: 8, pow_difficulty: POW_DIFFICULTY },
+        GossipConfig {
+            fanout: 8,
+            pow_difficulty: POW_DIFFICULTY,
+        },
     );
 
     let (tx, rx) = mpsc::channel::<ActorEvent>(1024);
@@ -285,7 +289,9 @@ pub async fn spawn_cluster(
         let mut local_ban_rx = local_ban_rx;
         tokio::spawn(async move {
             while let Some(rec) = local_ban_rx.recv().await {
-                if tx.send(ActorEvent::LocalBan(rec)).await.is_err() { break; }
+                if tx.send(ActorEvent::LocalBan(rec)).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -302,7 +308,13 @@ pub async fn spawn_cluster(
         coordinator,
         trust,
         rate_limiter,
-        sign_cache: SigningCache::default(),
+        sign_cache: Arc::new(std::sync::Mutex::new(SigningCache::default())),
+        signing_slot: Arc::new(Semaphore::new(1)),
+        diff_offsets: HashMap::new(),
+        diff_requests: HashMap::new(),
+        raw_limiter: RateLimiter::new(10_000, chrono::Duration::minutes(1)),
+        remote_policy: config.trust.clone(),
+        count_window: std::time::Instant::now(),
         ban_counts: HashMap::new(),
         connections: HashMap::new(),
         dialing: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -323,7 +335,12 @@ async fn forward_connected(conn: quinn::Connection, tx: &mpsc::Sender<ActorEvent
         Some((fp, pubkey)) => {
             let addr = conn.remote_address();
             let _ = tx
-                .send(ActorEvent::PeerConnected { node_id: fp, public_key: pubkey, addr, conn })
+                .send(ActorEvent::PeerConnected {
+                    node_id: fp,
+                    public_key: pubkey,
+                    addr,
+                    conn,
+                })
                 .await;
         }
         None => debug!("cluster: peer presented no usable certificate — dropping connection"),
@@ -343,7 +360,13 @@ struct ClusterActor {
     rate_limiter: RateLimiter,
     /// Memoised PoW stamps — anti-entropy re-sends the same records every round
     /// and mining each one costs ~65 k blake3 hashes.
-    sign_cache: SigningCache,
+    sign_cache: Arc<std::sync::Mutex<SigningCache>>,
+    signing_slot: Arc<Semaphore>,
+    diff_offsets: HashMap<String, usize>,
+    diff_requests: HashMap<String, std::time::Instant>,
+    raw_limiter: RateLimiter,
+    remote_policy: TrustConfig,
+    count_window: std::time::Instant,
     /// node_id → number of ban records received (anti-poison quarantine input).
     ban_counts: HashMap<String, usize>,
     connections: HashMap<String, quinn::Connection>,
@@ -356,7 +379,11 @@ struct ClusterActor {
 }
 
 impl ClusterActor {
-    async fn run(mut self, mut rx: mpsc::Receiver<ActorEvent>, mut shutdown: watch::Receiver<bool>) {
+    async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<ActorEvent>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -456,14 +483,26 @@ impl ClusterActor {
         match msg {
             ClusterMessage::Ping { .. } => {
                 let digest = self.local_digest().await;
-                self.send_to(&from, ClusterMessage::Pong { sender_id: self.node_id.clone(), digest });
+                self.send_to(
+                    &from,
+                    ClusterMessage::Pong {
+                        sender_id: self.node_id.clone(),
+                        digest,
+                    },
+                );
             }
             ClusterMessage::Pong { .. } => {
                 self.coordinator.handle_pong(&from);
             }
             ClusterMessage::PingReq { target_id, .. } => {
                 let digest = self.local_digest().await;
-                self.send_to(&target_id, ClusterMessage::Ping { sender_id: self.node_id.clone(), digest });
+                self.send_to(
+                    &target_id,
+                    ClusterMessage::Ping {
+                        sender_id: self.node_id.clone(),
+                        digest,
+                    },
+                );
             }
             ClusterMessage::BanSync { records, .. } => {
                 self.ingest_remote_bans(&from, records).await;
@@ -473,27 +512,41 @@ impl ClusterActor {
             }
             ClusterMessage::DigestExchange { merkle_root } => {
                 let local_bans = self.snapshot_bans().await;
-                if let Some(GossipAction::SendDiffRequest { missing_keys, .. }) =
-                    self.coordinator.handle_digest_exchange(&merkle_root, &local_bans, &from)
+                if let Some(GossipAction::SendDiffRequest { missing_keys, .. }) = self
+                    .coordinator
+                    .handle_digest_exchange(&merkle_root, &local_bans, &from)
                 {
                     self.send_to(&from, ClusterMessage::DiffRequest { missing_keys });
                 }
             }
             ClusterMessage::DiffRequest { missing_keys } => {
+                let now = std::time::Instant::now();
+                if self
+                    .diff_requests
+                    .get(&from)
+                    .is_some_and(|last| now.duration_since(*last) < MAINTENANCE_INTERVAL)
+                {
+                    return;
+                }
+                self.diff_requests.insert(from.clone(), now);
                 let local_bans = self.snapshot_bans().await;
-                let missing = self.coordinator.handle_diff_request(&missing_keys, &local_bans);
-                let mined_before = self.sign_cache.stats().1;
-                let records: Vec<SignedBanRecord> =
-                    missing.into_iter().filter_map(|r| self.sign(r)).collect();
-                debug!(
-                    peer = %from,
-                    records = records.len(),
-                    mined = self.sign_cache.stats().1 - mined_before,
-                    cached = self.sign_cache.len(),
-                    "cluster: answering diff request"
-                );
-                if !records.is_empty() {
-                    self.send_to(&from, ClusterMessage::DiffResponse { records });
+                let missing = self
+                    .coordinator
+                    .handle_diff_request(&missing_keys, &local_bans);
+                // Bound each signing job and rotate over rejected/nonmatching
+                // subjects, so one unapplicable prefix cannot starve the tail.
+                let mut missing: Vec<_> = missing
+                    .into_iter()
+                    .filter(|r| !matches!(r.source, BanSource::ClusterPeer(_)))
+                    .collect();
+                missing.sort_by_key(|r| r.subject.to_string());
+                let offset = self.diff_offsets.entry(from.clone()).or_default();
+                if !missing.is_empty() {
+                    let len = missing.len();
+                    missing.rotate_left(*offset % len);
+                    missing.truncate(256);
+                    *offset = (*offset + missing.len()) % len;
+                    self.send_signed_bans(vec![from.clone()], missing);
                 }
             }
             ClusterMessage::MembershipUpdate { .. } => {
@@ -508,35 +561,57 @@ impl ClusterActor {
         if records.is_empty() {
             return;
         }
-        let n = records.len();
+        if self.count_window.elapsed() >= Duration::from_secs(60) {
+            self.ban_counts.clear();
+            self.count_window = std::time::Instant::now();
+        }
+        // Cheap applicability checks precede expensive crypto and the decision
+        // quota. A separate budget still bounds hostile raw verification work.
+        let mut batch = HashSet::new();
+        let records = {
+            let st = self.state.lock().await;
+            records
+                .into_iter()
+                .filter(|signed| {
+                    let rec = &signed.record;
+                    remote_policy_allows(&self.remote_policy, rec, chrono::Utc::now())
+                        && st.accepts_remote_ban(rec)
+                        && !st.whitelist().overlaps(&rec.subject)
+                        && remote_changes_state(&st, rec)
+                        && batch.insert((signed.signer_id.clone(), GossipEngine::record_key(rec)))
+                        && self.raw_limiter.check_and_record(from)
+                })
+                .collect()
+        };
         let peer_keys = self.peer_public_keys();
-        let action = self.coordinator.handle_ban_sync_filtered(
+        let st = self.state.lock().await;
+        let action = self.coordinator.handle_ban_sync_filtered_with_policy(
             records,
             from,
             &self.trust,
             &mut self.rate_limiter,
             &self.ban_counts,
             &peer_keys,
+            |rec| {
+                remote_policy_allows(&self.remote_policy, rec, chrono::Utc::now())
+                    && st.accepts_remote_ban(rec)
+                    && !st.whitelist().overlaps(&rec.subject)
+                    && remote_changes_state(&st, rec)
+            },
         );
-        *self.ban_counts.entry(from.to_string()).or_insert(0) += n;
-
+        drop(st);
         if let Some(GossipAction::ApplyBans { records }) = action {
+            *self.ban_counts.entry(from.to_string()).or_insert(0) += records.len();
             self.apply_bans(from, records).await;
         }
     }
 
     fn on_local_ban(&mut self, rec: BanRecord) {
-        let Some(signed) = self.sign(rec) else { return };
-        if let Some(GossipAction::SendBanSync { target_ids, records }) =
-            self.coordinator.propagate_bans(vec![signed])
-        {
-            for target in target_ids {
-                self.send_to(
-                    &target,
-                    ClusterMessage::BanSync { sender_id: self.node_id.clone(), records: records.clone() },
-                );
-            }
+        if matches!(rec.source, BanSource::ClusterPeer(_)) {
+            return;
         }
+        let targets = self.connections.keys().cloned().collect();
+        self.send_signed_bans(targets, vec![rec]);
     }
 
     fn on_probe(&mut self) {
@@ -545,14 +620,26 @@ impl ClusterActor {
         for action in actions {
             match action {
                 SwimAction::SendPing { target_id, digest } => {
-                    self.send_to(&target_id, ClusterMessage::Ping { sender_id: self.node_id.clone(), digest });
-                }
-                SwimAction::SendPingReq { target_id, via_peers } => {
-                    for via in via_peers {
-                        self.send_to(&via, ClusterMessage::PingReq {
+                    self.send_to(
+                        &target_id,
+                        ClusterMessage::Ping {
                             sender_id: self.node_id.clone(),
-                            target_id: target_id.clone(),
-                        });
+                            digest,
+                        },
+                    );
+                }
+                SwimAction::SendPingReq {
+                    target_id,
+                    via_peers,
+                } => {
+                    for via in via_peers {
+                        self.send_to(
+                            &via,
+                            ClusterMessage::PingReq {
+                                sender_id: self.node_id.clone(),
+                                target_id: target_id.clone(),
+                            },
+                        );
                     }
                 }
                 SwimAction::MarkDead { node_id } | SwimAction::RemovePeer { node_id } => {
@@ -598,26 +685,57 @@ impl ClusterActor {
             };
             let digest = GossipEngine::compute_digest(&bans);
             for conn in conns {
-                send_msg(conn, ClusterMessage::DigestExchange { merkle_root: digest.clone() }).await;
+                send_msg(
+                    conn,
+                    ClusterMessage::DigestExchange {
+                        merkle_root: digest.clone(),
+                    },
+                )
+                .await;
             }
         });
     }
 
     // --- helpers -----------------------------------------------------------
 
-    /// Sign a ban record with the node's identity key. Returns `None` on the
-    /// (practically impossible) signing/PoW failure.
-    fn sign(&mut self, record: BanRecord) -> Option<SignedBanRecord> {
-        match self
-            .sign_cache
-            .sign(record, &self.node_id, &self.pkcs8, POW_DIFFICULTY)
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!(error = %e, "cluster: failed to sign ban record");
-                None
+    /// Mining runs on the blocking pool with one bounded in-flight job.
+    /// Dropped jobs are retried by the next anti-entropy round.
+    fn send_signed_bans(&self, targets: Vec<String>, records: Vec<BanRecord>) {
+        let Ok(permit) = self.signing_slot.clone().try_acquire_owned() else {
+            return;
+        };
+        let cache = self.sign_cache.clone();
+        let key = self.pkcs8.clone();
+        let node = self.node_id.clone();
+        let conns: Vec<_> = targets
+            .iter()
+            .filter_map(|id| self.connections.get(id).cloned())
+            .collect();
+        tokio::spawn(async move {
+            let signed = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                records
+                    .into_iter()
+                    .filter_map(|record| cache.sign(record, &node, &key, POW_DIFFICULTY).ok())
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            let Ok(signed) = signed else {
+                return;
+            };
+            for page in signed_pages(signed) {
+                for conn in &conns {
+                    send_msg(
+                        conn.clone(),
+                        ClusterMessage::DiffResponse {
+                            records: page.clone(),
+                        },
+                    )
+                    .await;
+                }
             }
-        }
+        });
     }
 
     fn peer_public_keys(&self) -> HashMap<String, Vec<u8>> {
@@ -641,41 +759,48 @@ impl ClusterActor {
 
     /// Persist + enforce remotely-received bans (already past the security
     /// filter). Whitelisted targets and bans we already hold are skipped. The
-    /// record's `source` is re-tagged `ClusterPeer(from)` so logs/UI/SIEM show
-    /// the ban arrived via gossip rather than local detection. These are **not**
+    /// record's `source` identifies its authenticated signer so logs/UI/SIEM
+    /// preserve the origin rather than counting the relay as a detector. These are **not**
     /// re-announced (no echo).
     async fn apply_bans(&self, from: &str, records: Vec<BanRecord>) {
         let now = chrono::Utc::now();
         let mut to_enforce: Vec<IpNet> = Vec::new();
         {
             let mut st = self.state.lock().await;
+            let mut enf = self.enforcer.lock().await;
             for mut rec in records {
                 // Peers running older builds keep re-announcing bans that have
                 // already expired; persisting them just re-creates entries the
                 // expiry sweep removes again, looping forever.
-                if rec.expires_at.is_some_and(|exp| exp <= now) {
+                if !remote_policy_allows(&self.remote_policy, &rec, now) {
                     debug!(subject = %rec.subject, peer = %from, "cluster: remote ban already expired — skipping");
                     continue;
                 }
-                let addr = rec.subject.addr();
-                if st.whitelist().is_whitelisted(&addr) {
+                if st.whitelist().overlaps(&rec.subject) {
                     debug!(subject = %rec.subject, peer = %from, "cluster: remote ban hits whitelist — skipping");
                     continue;
                 }
-                if st.ban_store().is_banned(&addr).is_some() {
-                    continue; // already known
+                if !st.accepts_remote_ban(&rec) || !remote_changes_state(&st, &rec) {
+                    continue;
                 }
                 let subject = rec.subject;
                 let reason = rec.reason.clone();
                 // Provenance: this node did not detect the attacker itself — it
                 // was blocked pre-emptively because a peer reported it.
-                rec.source = BanSource::ClusterPeer(from.to_string());
+                // The security filter preserves the authenticated signer, which
+                // can differ from the transporting peer.
+                if !matches!(rec.source, BanSource::ClusterPeer(_)) {
+                    rec.source = BanSource::ClusterPeer(from.to_string());
+                }
                 match st.add_ban(rec) {
                     Ok(()) => {
                         info!(
                             %subject, peer = %from, reason = %reason,
                             "cluster: pre-emptively blocked IP reported by peer"
                         );
+                        if let Err(e) = enf.apply_ban(&subject).await {
+                            warn!(%subject, error = %e, "cluster: enforcer rejected remote ban");
+                        }
                         to_enforce.push(subject);
                     }
                     Err(e) => warn!(%subject, error = %e, "cluster: failed to persist remote ban"),
@@ -686,17 +811,10 @@ impl ClusterActor {
             return;
         }
         let count = to_enforce.len();
-        {
-            let mut enf = self.enforcer.lock().await;
-            for subject in &to_enforce {
-                if let Err(e) = enf.apply_ban(subject).await {
-                    warn!(%subject, error = %e, "cluster: enforcer rejected remote ban");
-                }
-            }
-        }
         if let Some(m) = &self.metrics {
             let st = self.state.lock().await;
-            m.active_bans.set(st.ban_store().get_all_bans().len() as i64);
+            m.active_bans
+                .set(st.ban_store().get_all_bans().len() as i64);
         }
         info!(count, peer = %from, "cluster: applied remote bans");
     }
@@ -708,7 +826,9 @@ impl ClusterActor {
             return;
         };
         let conn = conn.clone();
-        tokio::spawn(async move { send_msg(conn, msg).await; });
+        tokio::spawn(async move {
+            send_msg(conn, msg).await;
+        });
     }
 
     fn update_peer_metric(&self) {
@@ -744,39 +864,111 @@ impl ClusterActor {
     }
 }
 
+/// A finite, locally configured blast-radius limit, applied before quorum.
+fn remote_policy_allows(
+    policy: &TrustConfig,
+    record: &BanRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let min_prefix = match record.subject {
+        IpNet::V4(_) => policy.remote_min_prefix_v4,
+        IpNet::V6(_) => policy.remote_min_prefix_v6,
+    };
+    let Some(expiry) = record.expires_at else {
+        return false;
+    };
+    let Ok(max_secs) = i64::try_from(policy.remote_max_ttl_secs) else {
+        return false;
+    };
+    record.subject.prefix_len() >= min_prefix
+        && record.created_at <= now + chrono::Duration::minutes(5)
+        && expiry > now
+        && expiry > record.created_at
+        && expiry
+            .signed_duration_since(record.created_at)
+            .num_seconds()
+            <= max_secs
+        && expiry.signed_duration_since(now).num_seconds() <= max_secs
+}
+
+fn remote_changes_state(state: &StateManager, record: &BanRecord) -> bool {
+    let Some(existing) = state.ban_store().is_banned(&record.subject.addr()) else {
+        return true;
+    };
+    existing.subject == record.subject
+        && matches!(existing.source, BanSource::ClusterPeer(_))
+        && (record.created_at, record.expires_at) > (existing.created_at, existing.expires_at)
+}
+
 /// One message per uni-stream: `open_uni → length-prefixed bincode → finish`.
 async fn send_msg(conn: quinn::Connection, msg: ClusterMessage) {
-    match conn.open_uni().await {
-        Ok(mut stream) => {
-            if let Err(e) = send_message(&mut stream, &msg).await {
-                debug!(error = %e, "cluster: send_message failed");
-                return;
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        match conn.open_uni().await {
+            Ok(mut stream) => {
+                if let Err(e) = send_message(&mut stream, &msg).await {
+                    debug!(error = %e, "cluster: send_message failed");
+                    return;
+                }
+                let _ = stream.finish();
             }
-            let _ = stream.finish();
+            Err(e) => debug!(error = %e, "cluster: open_uni failed"),
         }
-        Err(e) => debug!(error = %e, "cluster: open_uni failed"),
-    }
+    })
+    .await;
 }
 
 /// Per-connection reader: each accepted uni-stream carries exactly one message.
 async fn reader_loop(node_id: String, conn: quinn::Connection, tx: mpsc::Sender<ActorEvent>) {
+    let mut window = std::time::Instant::now();
+    let mut bytes_received = 0usize;
+    let mut messages_received = 0usize;
     loop {
-        match conn.accept_uni().await {
-            Ok(mut recv) => match read_bounded_message(&mut recv).await {
-                Ok(bytes) => match decode_message::<ClusterMessage>(&bytes) {
-                    Ok(msg) => {
-                        if tx.send(ActorEvent::Inbound { from: node_id.clone(), msg }).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => debug!(%node_id, error = %e, "cluster: undecodable message"),
-                },
-                Err(e) => debug!(%node_id, error = %e, "cluster: stream read error"),
-            },
+        let mut recv = match conn.accept_uni().await {
+            Ok(recv) => recv,
             Err(e) => {
                 debug!(%node_id, error = %e, "cluster: connection closed");
                 break;
             }
+        };
+        let bytes =
+            match tokio::time::timeout(Duration::from_secs(10), read_bounded_message(&mut recv))
+                .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    debug!(%node_id, error = %e, "cluster: stream read error");
+                    continue;
+                }
+                Err(_) => {
+                    debug!(%node_id, "cluster: stream read deadline exceeded");
+                    continue;
+                }
+            };
+        if window.elapsed() >= Duration::from_secs(60) {
+            window = std::time::Instant::now();
+            bytes_received = 0;
+            messages_received = 0;
+        }
+        bytes_received += bytes.len();
+        messages_received += 1;
+        if bytes_received > 16 * 1024 * 1024 || messages_received > 1024 {
+            conn.close(0u32.into(), b"message budget exceeded");
+            break;
+        }
+        match decode_message::<ClusterMessage>(&bytes) {
+            Ok(msg) => {
+                if tx
+                    .send(ActorEvent::Inbound {
+                        from: node_id.clone(),
+                        msg,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(e) => debug!(%node_id, error = %e, "cluster: undecodable message"),
         }
     }
 }
@@ -789,5 +981,62 @@ async fn resolve(addr: &str) -> Option<SocketAddr> {
             debug!(addr, error = %e, "cluster: DNS resolution failed");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use hiveguard_core::persistence::wal::WalSyncMode;
+
+    fn record(subject: &str) -> BanRecord {
+        let now = chrono::Utc::now();
+        BanRecord {
+            subject: subject.parse().unwrap(),
+            created_at: now,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            severity: 100,
+            reason: "test".into(),
+            evidence_hash: [0; 32],
+            source: BanSource::ClusterPeer("peer".into()),
+            geo_info: None,
+        }
+    }
+
+    #[test]
+    fn remote_policy_bounds_prefix_lifetime_and_future_dates() {
+        let policy = TrustConfig::default();
+        let now = chrono::Utc::now();
+        for subject in ["8.0.0.0/8", "2000::/3"] {
+            assert!(!remote_policy_allows(&policy, &record(subject), now));
+        }
+        for subject in ["8.8.8.0/24", "2001:4860::/48"] {
+            assert!(remote_policy_allows(&policy, &record(subject), now));
+        }
+        let mut ban = record("8.8.8.8/32");
+        ban.expires_at = None;
+        assert!(!remote_policy_allows(&policy, &ban, now));
+        ban.expires_at = Some(now + chrono::Duration::days(2));
+        assert!(!remote_policy_allows(&policy, &ban, now));
+        ban.created_at = now + chrono::Duration::days(2);
+        ban.expires_at = Some(ban.created_at + chrono::Duration::hours(1));
+        assert!(!remote_policy_allows(&policy, &ban, now));
+    }
+
+    #[test]
+    fn identical_covered_and_local_bans_are_not_new_remote_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::new(dir.path(), WalSyncMode::None).unwrap();
+        let ban = record("8.8.8.0/24");
+        state.add_ban(ban.clone()).unwrap();
+        assert!(!remote_changes_state(&state, &ban));
+        assert!(!remote_changes_state(&state, &record("8.8.8.8/32")));
+        let mut newer = ban.clone();
+        newer.expires_at = ban.expires_at.map(|e| e + chrono::Duration::minutes(1));
+        assert!(remote_changes_state(&state, &newer));
+        let mut local = ban;
+        local.source = BanSource::LocalDetector("ssh".into());
+        state.add_ban(local).unwrap();
+        assert!(!remote_changes_state(&state, &newer));
     }
 }

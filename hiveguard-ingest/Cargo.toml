@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+hiveguard-plugin-utils = { path = "../hiveguard-plugin-utils" }
 hiveguard-core = { path = "../hiveguard-core" }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

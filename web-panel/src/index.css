@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-gray-900 text-gray-100 font-sans antialiased;
+    background-color: #181b24;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #181b24;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #374151;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #4b5563;
+  }
+
+  /* Focus ring */
+  *:focus-visible {
+    @apply outline-none ring-2 ring-blue-500 ring-offset-1 ring-offset-gray-900;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-lg border border-gray-700/50 bg-gray-800/60 backdrop-blur-sm;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-md bg-blue-600 px-3 py-1.5
+           text-sm font-medium text-white shadow-sm
+           hover:bg-blue-500 active:bg-blue-700
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center gap-2 rounded-md bg-red-700/80 px-3 py-1.5
+           text-sm font-medium text-red-100 shadow-sm
+           hover:bg-red-600 active:bg-red-800
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-md px-3 py-1.5
+           text-sm font-medium text-gray-300
+           hover:bg-gray-700 active:bg-gray-600
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 rounded-md border border-gray-600 px-3 py-1.5
+           text-sm font-medium text-gray-300 bg-gray-700/40
+           hover:bg-gray-700 hover:border-gray-500 active:bg-gray-600
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors;
+  }
+
+  .input {
+    @apply w-full rounded-md border border-gray-600 bg-gray-700/50 px-3 py-2
+           text-sm text-gray-100 placeholder-gray-500
+           focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500
+           transition-colors;
+  }
+
+  .select {
+    @apply rounded-md border border-gray-600 bg-gray-700/50 px-2 py-1
+           text-sm text-gray-100
+           focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500
+           cursor-pointer transition-colors;
+  }
+
+  .table-row-hover {
+    @apply hover:bg-gray-700/30 transition-colors;
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold;
+  }
+}

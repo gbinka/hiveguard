@@ -1,7 +1,7 @@
 use hiveguard_core::{BanRecord, HiveGuardError, PowStamp};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// A `BanRecord` with an Ed25519 signature and a Proof-of-Work stamp.
 ///
@@ -35,7 +35,13 @@ impl SignedBanRecord {
         let canonical = bincode::serialize(&record)
             .map_err(|e| HiveGuardError::Protocol(format!("sign: serialize error: {e}")))?;
 
-        Self::sign_canonical(record, &canonical, local_node_id, pkcs8_key_bytes, difficulty)
+        Self::sign_canonical(
+            record,
+            &canonical,
+            local_node_id,
+            pkcs8_key_bytes,
+            difficulty,
+        )
     }
 
     /// Sign a record whose canonical (bincode) encoding has already been computed.
@@ -106,12 +112,12 @@ impl SignedBanRecord {
 /// record (a re-ban extending `expires_at`, a different severity) or to the
 /// signing identity produces a fresh entry rather than a stale stamp.
 ///
-/// Capacity is a hard ceiling: once reached the whole map is dropped, costing at
-/// most one re-mine per record. Entries are ~300 B, so the default 8192 caps the
-/// cache at roughly 2.5 MB.
+/// Capacity is a hard ceiling with incremental FIFO eviction, so a single new
+/// record never discards the entire cache. Entries are typically ~300 B.
 pub struct SigningCache {
     entries: HashMap<[u8; 32], SignedBanRecord>,
     capacity: usize,
+    insertion_order: VecDeque<[u8; 32]>,
     hits: u64,
     misses: u64,
 }
@@ -123,6 +129,7 @@ impl SigningCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
             capacity: capacity.max(1),
             hits: 0,
             misses: 0,
@@ -162,8 +169,11 @@ impl SigningCache {
         self.misses += 1;
 
         if self.entries.len() >= self.capacity {
-            self.entries.clear();
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
         }
+        self.insertion_order.push_back(key);
         self.entries.insert(key, signed.clone());
 
         Ok(signed)
@@ -194,10 +204,10 @@ impl Default for SigningCache {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use hiveguard_core::{BanSource, models::BanRecord};
+    use hiveguard_core::{models::BanRecord, BanSource};
     use ipnet::IpNet;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
     use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     fn make_record() -> BanRecord {
         BanRecord {
@@ -276,8 +286,12 @@ mod tests {
         let mut cache = SigningCache::default();
         let record = make_record();
 
-        let first = cache.sign(record.clone(), "node-abc", &priv_key, 16).unwrap();
-        let second = cache.sign(record.clone(), "node-abc", &priv_key, 16).unwrap();
+        let first = cache
+            .sign(record.clone(), "node-abc", &priv_key, 16)
+            .unwrap();
+        let second = cache
+            .sign(record.clone(), "node-abc", &priv_key, 16)
+            .unwrap();
 
         assert_eq!(first, second, "same record must yield the same stamp");
         assert_eq!(cache.stats(), (1, 1), "second call must be a cache hit");
@@ -292,7 +306,9 @@ mod tests {
         let mut cache = SigningCache::default();
 
         let record = make_record();
-        cache.sign(record.clone(), "node-abc", &priv_key, 16).unwrap();
+        cache
+            .sign(record.clone(), "node-abc", &priv_key, 16)
+            .unwrap();
 
         // A re-ban that extends the expiry is a different record.
         let mut extended = record.clone();
@@ -320,6 +336,36 @@ mod tests {
         assert!(cache.len() <= 2, "cache must not grow past its capacity");
     }
 
+    #[test]
+    fn paging_respects_wire_limit_and_cache_evicts_one_entry() {
+        let (key, _) = gen_key();
+        let mut cache = SigningCache::new(2);
+        let a = make_record();
+        let mut b = a.clone();
+        b.severity += 1;
+        let mut c = a.clone();
+        c.severity += 2;
+        cache.sign(a, "node", &key, 16).unwrap();
+        let signed = cache.sign(b.clone(), "node", &key, 16).unwrap();
+        cache.sign(c, "node", &key, 16).unwrap();
+        cache.sign(b, "node", &key, 16).unwrap();
+        assert_eq!(cache.stats(), (1, 3));
+        let mut large = signed;
+        large.record.reason = "x".repeat(100_000);
+        let pages = signed_pages(vec![large; 130]);
+        assert!(pages.len() > 1);
+        assert_eq!(pages.iter().map(Vec::len).sum::<usize>(), 130);
+        for records in pages {
+            assert!(
+                bincode::serialized_size(&crate::messages::ClusterMessage::DiffResponse {
+                    records
+                })
+                .unwrap()
+                    <= 4 * 1024 * 1024
+            );
+        }
+    }
+
     /// CRITICAL compatibility check: the rcgen-generated NodeIdentity key must be
     /// usable by ring's `Ed25519KeyPair::from_pkcs8` (used inside `sign`), and the
     /// resulting signature must verify against the identity's raw public key (the
@@ -341,4 +387,29 @@ mod tests {
             .verify(raw_pub)
             .expect("signature from identity key must verify against its raw pubkey");
     }
+}
+
+/// Keep wire frames below 4 MiB, including enum/vector framing overhead.
+pub fn signed_pages(records: Vec<SignedBanRecord>) -> Vec<Vec<SignedBanRecord>> {
+    let mut pages = Vec::new();
+    let mut page = Vec::new();
+    let mut bytes = 12u64;
+    for record in records {
+        let Ok(size) = bincode::serialized_size(&record) else {
+            continue;
+        };
+        if size + 12 > 4 * 1024 * 1024 {
+            continue;
+        }
+        if !page.is_empty() && (bytes + size > 4 * 1024 * 1024 || page.len() >= 128) {
+            pages.push(std::mem::take(&mut page));
+            bytes = 12;
+        }
+        bytes += size;
+        page.push(record);
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    pages
 }

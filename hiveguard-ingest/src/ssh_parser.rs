@@ -1,201 +1,30 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use notify::{EventKind, RecursiveMode, Watcher};
-use regex::Regex;
 use tokio::sync::mpsc;
-use tracing::{info, trace, warn};
+use tracing::{info, warn};
 
 use hiveguard_core::errors::HiveGuardError;
-use hiveguard_core::models::{EventType, NormalizedEvent};
+use hiveguard_core::models::NormalizedEvent;
+#[cfg(test)]
+use hiveguard_core::models::EventType;
 
 use crate::file_watcher::{self, FileWatcher};
 use crate::source::LogSource;
 
 /// Parsed SSH log event before normalization.
-#[derive(Debug, Clone)]
-pub struct SshEvent {
-    pub timestamp_str: String,
-    pub event_type: EventType,
-    pub source_ip: IpAddr,
-    pub user: String,
-    pub invalid_user: bool,
-    pub raw_line: String,
-}
+pub use hiveguard_plugin_utils::ssh::{parse_ssh_line, SshEvent, SshPatterns};
 
-/// Compiled regex patterns for SSH auth log parsing.
-pub struct SshPatterns {
-    /// `Failed password for <user> from <ip> port <port>`
-    failed_password: Regex,
-    /// `Failed password for invalid user <user> from <ip>`
-    failed_password_invalid: Regex,
-    /// `Invalid user <user> from <ip>`
-    invalid_user: Regex,
-    /// `Accepted password for <user> from <ip>`
-    accepted_password: Regex,
-    /// `Accepted publickey for <user> from <ip>`
-    accepted_publickey: Regex,
-    /// Syslog timestamp prefix
-    syslog_timestamp: Regex,
-}
-
-impl Default for SshPatterns {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SshPatterns {
-    pub fn new() -> Self {
-        Self {
-            failed_password: Regex::new(
-                r"Failed password for ([^\s]+) from ([0-9a-fA-F.:]+) port \d+"
-            ).unwrap(),
-            failed_password_invalid: Regex::new(
-                r"Failed password for invalid user ([^\s]+) from ([0-9a-fA-F.:]+)"
-            ).unwrap(),
-            invalid_user: Regex::new(
-                r"Invalid user ([^\s]+) from ([0-9a-fA-F.:]+)"
-            ).unwrap(),
-            accepted_password: Regex::new(
-                r"Accepted password for ([^\s]+) from ([0-9a-fA-F.:]+)"
-            ).unwrap(),
-            accepted_publickey: Regex::new(
-                r"Accepted publickey for ([^\s]+) from ([0-9a-fA-F.:]+)"
-            ).unwrap(),
-            syslog_timestamp: Regex::new(
-                r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
-            ).unwrap(),
-        }
-    }
-}
-
-/// Parse a syslog-format timestamp string (e.g., "Apr  8 14:30:22") into a `DateTime<Utc>`.
-/// Uses the current year since syslog timestamps don't include it.
 pub fn parse_syslog_timestamp(ts: &str) -> Option<DateTime<Utc>> {
     let current_year = Utc::now().format("%Y").to_string();
     let with_year = format!("{} {}", current_year, ts);
     NaiveDateTime::parse_from_str(&with_year, "%Y %b %e %H:%M:%S")
         .ok()
         .map(|naive| naive.and_utc())
-}
-
-/// Try to parse a single auth.log line into an SshEvent.
-/// Returns None if the line doesn't match any known SSH pattern.
-pub fn parse_ssh_line(line: &str, patterns: &SshPatterns) -> Option<SshEvent> {
-    // Extract syslog timestamp
-    let timestamp_str = patterns
-        .syslog_timestamp
-        .captures(line)
-        .map(|c| c[1].to_string())
-        .unwrap_or_default();
-
-    // Try patterns in order of specificity
-    // 1. Failed password for invalid user
-    if let Some(caps) = patterns.failed_password_invalid.captures(line) {
-        let user = caps[1].to_string();
-        let ip: IpAddr = match caps[2].parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(line = line, "Failed to parse IP from auth.log line");
-                return None;
-            }
-        };
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip: ip,
-            user,
-            invalid_user: true,
-            raw_line: line.to_string(),
-        });
-    }
-
-    // 2. Failed password for valid user
-    if let Some(caps) = patterns.failed_password.captures(line) {
-        let user = caps[1].to_string();
-        let ip: IpAddr = match caps[2].parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(line = line, "Failed to parse IP from auth.log line");
-                return None;
-            }
-        };
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip: ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-
-    // 3. Invalid user (without "Failed password" prefix)
-    if let Some(caps) = patterns.invalid_user.captures(line) {
-        let user = caps[1].to_string();
-        let ip: IpAddr = match caps[2].parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(line = line, "Failed to parse IP from auth.log line");
-                return None;
-            }
-        };
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip: ip,
-            user,
-            invalid_user: true,
-            raw_line: line.to_string(),
-        });
-    }
-
-    // 4. Accepted password
-    if let Some(caps) = patterns.accepted_password.captures(line) {
-        let user = caps[1].to_string();
-        let ip: IpAddr = match caps[2].parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(line = line, "Failed to parse IP from auth.log line");
-                return None;
-            }
-        };
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthSuccess,
-            source_ip: ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-
-    // 5. Accepted publickey
-    if let Some(caps) = patterns.accepted_publickey.captures(line) {
-        let user = caps[1].to_string();
-        let ip: IpAddr = match caps[2].parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(line = line, "Failed to parse IP from auth.log line");
-                return None;
-            }
-        };
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthSuccess,
-            source_ip: ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-
-    // No match — not an SSH auth event we care about
-    trace!(line = line, "Line did not match any SSH pattern, skipping");
-    None
 }
 
 /// Convert an SshEvent into a NormalizedEvent.

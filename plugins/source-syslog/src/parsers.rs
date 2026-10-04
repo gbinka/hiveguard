@@ -7,63 +7,12 @@ use tracing::trace;
 
 use hiveguard_core::models::{EventType, NormalizedEvent};
 
-#[derive(Debug, Clone)]
-pub struct SshEvent {
-    pub timestamp_str: String,
-    pub event_type: EventType,
-    pub source_ip: IpAddr,
-    pub user: String,
-    pub invalid_user: bool,
-    pub raw_line: String,
-}
-
-pub struct SshPatterns {
-    failed_password: Regex,
-    failed_password_invalid: Regex,
-    invalid_user: Regex,
-    accepted_password: Regex,
-    accepted_publickey: Regex,
-    syslog_timestamp: Regex,
-}
-
-impl SshPatterns {
-    pub fn new() -> Self {
-        Self {
-            failed_password: Regex::new(r"Failed password for ([^\s]+) from ([0-9a-fA-F.:]+) port \d+").unwrap(),
-            failed_password_invalid: Regex::new(r"Failed password for invalid user ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            invalid_user: Regex::new(r"Invalid user ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            accepted_password: Regex::new(r"Accepted password for ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            accepted_publickey: Regex::new(r"Accepted publickey for ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            syslog_timestamp: Regex::new(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+").unwrap(),
-        }
-    }
-}
+pub use hiveguard_plugin_utils::ssh::{parse_ssh_line, SshEvent, SshPatterns};
 
 pub fn parse_syslog_timestamp(ts: &str) -> Option<DateTime<Utc>> {
     let current_year = Utc::now().format("%Y").to_string();
     let with_year = format!("{} {}", current_year, ts);
     NaiveDateTime::parse_from_str(&with_year, "%Y %b %e %H:%M:%S").ok().map(|naive| naive.and_utc())
-}
-
-pub fn parse_ssh_line(line: &str, patterns: &SshPatterns) -> Option<SshEvent> {
-    let timestamp_str = patterns.syslog_timestamp.captures(line).map(|caps| caps[1].to_string()).unwrap_or_default();
-    if let Some(caps) = patterns.failed_password_invalid.captures(line) {
-        return Some(SshEvent { timestamp_str, event_type: EventType::AuthFailure, source_ip: caps[2].parse().ok()?, user: caps[1].to_string(), invalid_user: true, raw_line: line.to_string() });
-    }
-    if let Some(caps) = patterns.failed_password.captures(line) {
-        return Some(SshEvent { timestamp_str, event_type: EventType::AuthFailure, source_ip: caps[2].parse().ok()?, user: caps[1].to_string(), invalid_user: false, raw_line: line.to_string() });
-    }
-    if let Some(caps) = patterns.invalid_user.captures(line) {
-        return Some(SshEvent { timestamp_str, event_type: EventType::AuthFailure, source_ip: caps[2].parse().ok()?, user: caps[1].to_string(), invalid_user: true, raw_line: line.to_string() });
-    }
-    if let Some(caps) = patterns.accepted_password.captures(line) {
-        return Some(SshEvent { timestamp_str, event_type: EventType::AuthSuccess, source_ip: caps[2].parse().ok()?, user: caps[1].to_string(), invalid_user: false, raw_line: line.to_string() });
-    }
-    if let Some(caps) = patterns.accepted_publickey.captures(line) {
-        return Some(SshEvent { timestamp_str, event_type: EventType::AuthSuccess, source_ip: caps[2].parse().ok()?, user: caps[1].to_string(), invalid_user: false, raw_line: line.to_string() });
-    }
-    trace!(line = line, "ssh line did not match any known pattern");
-    None
 }
 
 pub fn ssh_event_to_normalized(event: SshEvent) -> NormalizedEvent {

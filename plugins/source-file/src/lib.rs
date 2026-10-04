@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use tokio::time::Instant;
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -345,26 +345,36 @@ where
         .map_err(|e| PluginError::Runtime(format!("failed to watch {}: {e}", watch_path.display())))?;
 
     let mut last_save = Instant::now();
-
-    // Drain once on startup so `seek_to_end: false` really replays existing content
-    // and saved offsets pick up unread lines after restart.
-    drain_to_eof(&mut watcher, limits, &sink, &shutdown, &parser, &lag_gauge).await?;
-
+    // Poll as well as watching: notification loss and temporary read errors
+    // must recover even when no further filesystem notification arrives.
+    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                save_offset(&data_dir, offset_key, watcher.offset()).await.map_err(PluginError::from)?;
+                checkpoint_offset(&data_dir, offset_key, watcher.offset()).await;
                 info!(source = offset_key, path = %path.display(), "file source stopping");
                 return Ok(());
             }
+            _ = sink.closed() => {
+                checkpoint_offset(&data_dir, offset_key, watcher.offset()).await;
+                return Ok(());
+            },
+            _ = poll.tick() => {}
             Some(()) = notify_rx.recv() => {
                 while notify_rx.try_recv().is_ok() {}
-                drain_to_eof(&mut watcher, limits, &sink, &shutdown, &parser, &lag_gauge).await?;
-                if last_save.elapsed() >= OFFSET_SAVE_INTERVAL {
-                    save_offset(&data_dir, offset_key, watcher.offset()).await.map_err(PluginError::from)?;
-                    last_save = Instant::now();
-                }
             }
+        }
+        if let Err(error) = drain_to_eof(&mut watcher, limits, &sink, &shutdown, &parser, &lag_gauge).await {
+            if sink.is_closed() {
+                checkpoint_offset(&data_dir, offset_key, watcher.offset()).await;
+                return Ok(());
+            }
+            warn!(source = offset_key, %error, "file source read failed; retrying on next poll");
+        }
+        if last_save.elapsed() >= OFFSET_SAVE_INTERVAL {
+            checkpoint_offset(&data_dir, offset_key, watcher.offset()).await;
+            last_save = Instant::now();
         }
     }
 }
@@ -384,14 +394,26 @@ where
     F: Fn(&str) -> Option<NormalizedEvent> + Send + Sync + 'static,
 {
     loop {
+        let batch_start = watcher.offset();
         let outcome = watcher.read_new_lines(limits).await.map_err(PluginError::from)?;
         lag_gauge.set(outcome.file_len.saturating_sub(outcome.offset) as i64);
 
         for line in &outcome.lines {
             if let Some(event) = parser(line) {
-                sink.send(event)
-                    .await
-                    .map_err(|_| PluginError::Runtime("event sink closed".into()))?;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        // Never checkpoint undelivered lines from this batch.
+                        // A small replay is safer than losing authentication events.
+                        watcher.offset = batch_start;
+                        return Ok(());
+                    }
+                    result = sink.send(event) => {
+                        if result.is_err() {
+                            watcher.offset = batch_start;
+                            return Err(PluginError::Runtime("event sink closed".into()));
+                        }
+                    }
+                }
             }
         }
 
@@ -581,6 +603,14 @@ fn read_new_lines_blocking(path: PathBuf, offset: u64, limits: ReadLimits) -> st
     })
 }
 
+/// A lost checkpoint can replay events after a crash; it must not disable
+/// protection for all new traffic while the daemon is still running.
+async fn checkpoint_offset(data_dir: &Path, source_name: &str, offset: u64) {
+    if let Err(error) = save_offset(data_dir, source_name, offset).await {
+        warn!(source = source_name, %error, "could not save log offset; source remains active");
+    }
+}
+
 async fn save_offset(data_dir: &Path, source_name: &str, offset: u64) -> std::io::Result<()> {
     let data_dir = data_dir.to_path_buf();
     let source_name = source_name.to_string();
@@ -609,37 +639,7 @@ async fn load_offset(data_dir: &Path, source_name: &str) -> PluginResult<u64> {
     .map_err(PluginError::from)
 }
 
-#[derive(Debug, Clone)]
-struct SshEvent {
-    timestamp_str: String,
-    event_type: EventType,
-    source_ip: IpAddr,
-    user: String,
-    invalid_user: bool,
-    raw_line: String,
-}
-
-struct SshPatterns {
-    failed_password: Regex,
-    failed_password_invalid: Regex,
-    invalid_user: Regex,
-    accepted_password: Regex,
-    accepted_publickey: Regex,
-    syslog_timestamp: Regex,
-}
-
-impl SshPatterns {
-    fn new() -> Self {
-        Self {
-            failed_password: Regex::new(r"Failed password for ([^\s]+) from ([0-9a-fA-F.:]+) port \d+").unwrap(),
-            failed_password_invalid: Regex::new(r"Failed password for invalid user ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            invalid_user: Regex::new(r"Invalid user ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            accepted_password: Regex::new(r"Accepted password for ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            accepted_publickey: Regex::new(r"Accepted publickey for ([^\s]+) from ([0-9a-fA-F.:]+)").unwrap(),
-            syslog_timestamp: Regex::new(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+").unwrap(),
-        }
-    }
-}
+use hiveguard_plugin_utils::ssh::{parse_ssh_line, SshPatterns};
 
 fn parse_syslog_timestamp(ts: &str) -> Option<DateTime<Utc>> {
     let current_year = Utc::now().format("%Y").to_string();
@@ -647,78 +647,6 @@ fn parse_syslog_timestamp(ts: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(&with_year, "%Y %b %e %H:%M:%S")
         .ok()
         .map(|naive| naive.and_utc())
-}
-
-fn parse_ssh_line(line: &str, patterns: &SshPatterns) -> Option<SshEvent> {
-    let timestamp_str = patterns
-        .syslog_timestamp
-        .captures(line)
-        .map(|captures| captures[1].to_string())
-        .unwrap_or_default();
-
-    if let Some(captures) = patterns.failed_password_invalid.captures(line) {
-        let user = captures[1].to_string();
-        let source_ip = captures[2].parse().ok()?;
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip,
-            user,
-            invalid_user: true,
-            raw_line: line.to_string(),
-        });
-    }
-    if let Some(captures) = patterns.failed_password.captures(line) {
-        let user = captures[1].to_string();
-        let source_ip = captures[2].parse().ok()?;
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-    if let Some(captures) = patterns.invalid_user.captures(line) {
-        let user = captures[1].to_string();
-        let source_ip = captures[2].parse().ok()?;
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthFailure,
-            source_ip,
-            user,
-            invalid_user: true,
-            raw_line: line.to_string(),
-        });
-    }
-    if let Some(captures) = patterns.accepted_password.captures(line) {
-        let user = captures[1].to_string();
-        let source_ip = captures[2].parse().ok()?;
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthSuccess,
-            source_ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-    if let Some(captures) = patterns.accepted_publickey.captures(line) {
-        let user = captures[1].to_string();
-        let source_ip = captures[2].parse().ok()?;
-        return Some(SshEvent {
-            timestamp_str,
-            event_type: EventType::AuthSuccess,
-            source_ip,
-            user,
-            invalid_user: false,
-            raw_line: line.to_string(),
-        });
-    }
-
-    trace!(line = line, "ssh line did not match any known pattern");
-    None
 }
 
 fn ssh_patterns() -> &'static SshPatterns {
@@ -990,6 +918,60 @@ mod tests {
             },
             CancellationToken::new(),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_failure_does_not_stop_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("auth.log");
+        let state = dir.path().join("state");
+        // Deterministic ENOTDIR, including when tests run as root.
+        std::fs::write(&state, "not a directory").unwrap();
+        assert!(save_offset(&state, "ssh", 0).await.is_err());
+        std::fs::write(&log, "Oct  4 10:00:00 host sshd[12]: Failed password for root from 127.0.0.1 port 1234 ssh2\n").unwrap();
+        let mut plugin = FileSourcePlugin::create_ssh(
+            test_context(SSH_PLUGIN_ID, state),
+            serde_json::json!({ "path": log, "seek_to_end": false }),
+        ).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move { plugin.run(tx, token).await });
+        rx.recv().await.unwrap();
+        tokio::time::advance(OFFSET_SAVE_INTERVAL + std::time::Duration::from_secs(1)).await;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(file, "Oct  4 10:00:01 host sshd[12]: Failed password for root from 127.0.0.2 port 1234 ssh2").unwrap();
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.source_ip, "127.0.0.2".parse::<IpAddr>().unwrap());
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_sink_checkpoints_delivered_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("auth.log");
+        let state = dir.path().join("state");
+        let line = "Oct  4 10:00:00 host sshd[12]: Accepted password for root from 127.0.0.1 port 1234 ssh2\n";
+        std::fs::write(&log, line).unwrap();
+        let mut plugin = FileSourcePlugin::create_ssh(
+            test_context(SSH_PLUGIN_ID, state.clone()),
+            serde_json::json!({ "path": log, "seek_to_end": false }),
+        ).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = tokio::spawn(async move { plugin.run(tx, CancellationToken::new()).await });
+        rx.recv().await.unwrap();
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+        assert_eq!(load_offset(&state, &source_key("ssh", &log)).await.unwrap(), line.len() as u64);
+    }
+
+    #[test]
+    fn ssh_source_uses_safe_shared_parser() {
+        let line = "Oct  4 10:00:00 host sshd[12]: Invalid user a Failed password for victim from 198.51.100.42 port 22 from 127.0.0.1 port 60540";
+        let event = parse_ssh_normalized(line).unwrap();
+        assert_eq!(event.source_ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(event.metadata.get("invalid_user").map(String::as_str), Some("true"));
     }
 
     #[tokio::test]

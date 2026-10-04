@@ -18,6 +18,7 @@ mod siem_buffer;
 mod siem_exporter;
 mod socket_server;
 mod ui_api;
+mod whitelist_sync;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -353,33 +354,22 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
         std::process::exit(1);
     }
 
-    {
-        let st = state.lock().await;
-        let current_bans: Vec<ipnet::IpNet> =
-            st.ban_store().get_all_bans().iter().map(|b| b.subject).collect();
-        if !current_bans.is_empty() {
-            tracing::info!(count = current_bans.len(), "Syncing existing bans to enforcer");
-            if let Err(e) = enforcer.sync_full(&current_bans).await {
-                tracing::error!("Failed to sync bans to enforcer: {e}");
-            }
-        }
+    // --- Step 3: Initialize whitelist from config ---
+    //
+    // Must run BEFORE the enforcer sync below. The snapshot carries the *old*
+    // whitelist, so syncing first pushes bans to the firewall that the config
+    // whitelist covers — they then survive until expiry, since nothing else
+    // re-checks stored bans against the whitelist.
+    let config_whitelist = config.parsed_whitelist().unwrap_or_else(|e| {
+        tracing::warn!("Failed to parse whitelist from config: {e}");
+        Vec::new()
+    });
+    if let Err(e) = whitelist_sync::init_whitelist_and_sync(&state, config_whitelist, &mut *enforcer).await {
+        tracing::error!("Failed to initialize whitelist/firewall: {e}");
+        std::process::exit(1);
     }
 
     let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(enforcer));
-
-    // --- Step 3: Initialize whitelist from config ---
-    {
-        let mut st = state.lock().await;
-        if let Ok(parsed_wl) = config.parsed_whitelist() {
-            for net in parsed_wl {
-                if !st.whitelist().is_whitelisted(&net.addr()) {
-                    if let Err(e) = st.add_whitelist(net) {
-                        tracing::warn!("Failed to add whitelist entry {}: {}", net, e);
-                    }
-                }
-            }
-        }
-    }
 
     // --- Step 4: Initialize detectors and scoring ---
     //
@@ -449,7 +439,8 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
         let policy = match rc.policy.to_lowercase().as_str() {
             "block" => BotPolicy::Block,
             "monitor" => BotPolicy::Monitor,
-            _ => BotPolicy::Allow,
+            "allow" => BotPolicy::Allow,
+            _ => BotPolicy::Monitor,
         };
         BotRule {
             name: rc.name.clone(),
@@ -481,12 +472,14 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
     // Spawn plugin log sources via the supervisor — they emit into the same
     // `event_tx` as legacy sources and shut down when `plugin_shutdown_token`
     // fires (bridged above).
+    let source_status = plugin_supervisor::SourceStatus::default();
     let mut plugin_source_handles = Vec::new();
     for plugin in loaded.log_sources.drain(..) {
-        let h = plugin_supervisor::spawn_log_source(
+        let h = plugin_supervisor::spawn_log_source_monitored(
             plugin,
             event_tx.clone(),
             plugin_shutdown_token.clone(),
+            source_status.clone(),
         );
         plugin_source_handles.push(h);
     }
@@ -586,6 +579,16 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
     // --- Step 9: Handle Ctrl+C / SIGTERM ---
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("Received shutdown signal");
         let _ = shutdown_tx_clone.send(true);
@@ -607,7 +610,7 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
         Some(metrics.clone()),
         Some(bot_registry.clone()),
         Some(event_tx.clone()),
-    ));
+    ).with_source_status(source_status));
     let ui_sniffer = ui_api::UiSniffer::from_arc(daemon_ui_api.clone());
 
     // --- Step 9b: Cluster gossip runtime ---
@@ -785,7 +788,16 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
 
     drop(event_tx);
 
-    pipeline.run().await;
+    let mut pipeline_shutdown = shutdown_rx.clone();
+    tokio::select! {
+        _ = pipeline.run() => {},
+        _ = pipeline_shutdown.changed() => {
+            pipeline.close_input();
+            if tokio::time::timeout(Duration::from_secs(5), pipeline.run()).await.is_err() {
+                tracing::warn!("Pipeline shutdown drain timed out");
+            }
+        }
+    }
 
     // ===== GRACEFUL SHUTDOWN SEQUENCE =====
     tracing::info!("Beginning graceful shutdown");

@@ -9,30 +9,63 @@
     },
     "routes": {
       "type": "array",
-      "items": { "$ref": "#/definitions/route" },
+      "items": {
+        "$ref": "#/definitions/route"
+      },
       "default": []
+    },
+    "trusted_senders": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 3
+      },
+      "description": "Allowed transport peer CIDRs. Defaults to loopback without mTLS, or any authenticated peer with ca_cert. Empty list denies all."
     }
   },
   "definitions": {
     "route": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["match", "parser"],
+      "required": [
+        "match",
+        "parser"
+      ],
       "properties": {
         "match": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "app_name": { "type": "string" },
-            "hostname_pattern": { "type": "string" },
-            "facility": { "type": "string" }
+            "app_name": {
+              "type": "string"
+            },
+            "hostname_pattern": {
+              "type": "string"
+            },
+            "facility": {
+              "type": "string"
+            }
           }
         },
         "parser": {
           "type": "string",
-          "enum": ["ssh", "nginx", "postfix", "iptables", "cisco_asa", "pfsense", "custom", "drop"]
+          "enum": [
+            "ssh",
+            "nginx",
+            "postfix",
+            "iptables",
+            "cisco_asa",
+            "pfsense",
+            "custom",
+            "drop"
+          ]
         },
-        "pattern": { "type": ["string", "null"] }
+        "pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     }
   }

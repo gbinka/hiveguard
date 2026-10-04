@@ -218,8 +218,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/api/stats
 curl http://127.0.0.1:8443/metrics
 ```
 
-A standalone React web panel is maintained as a separate project alongside this
-repository (`hiveguard-web/`). It is a pure API client; serve its build output
+A standalone React web panel is maintained in [`web-panel/`](web-panel/), outside
+the Rust workspace. It is a pure API client; serve its build output
 through the `ui.rest` `static_dir` option or host it separately and whitelist
 its origin via `cors_origins`.
 
@@ -291,6 +291,39 @@ cargo clippy --workspace
   over localhost or a private network.
 - Never commit real config: `config.yaml`, node identity keys, and tokens are
   git-ignored. Only `config.example.yaml` (with placeholders) is tracked.
+
+### Audit fixes (2026-10-04)
+
+The unverified User-Agent bot policy `allow` now behaves as `monitor`. The
+`detector.distributed_slow` plugin remains loadable but emits no ban signals:
+ordinary traffic from one subnet is not sufficient evidence for a subnet ban.
+Previously stored subnet bans remain and need an operator's review.
+
+All new bans, including manual bans and imports, respect overlapping whitelist
+entries. nftables updates are atomic, retain covered host bans, and are retried
+by full reconciliation every 60 seconds. Administrative errors distinguish a
+saved intent awaiting firewall retry from a successful application.
+
+Remote bans default to minimum prefixes `/24` (IPv4), `/48` (IPv6), and a maximum
+lifetime of 86400 seconds; permanent remote bans are rejected. Configure these
+under `trust.remote_min_prefix_v4`, `trust.remote_min_prefix_v6`, and
+`trust.remote_max_ttl_secs`. Quorum counts independent originators, requiring
+direct connections to enough reporting nodes; relays do not add votes.
+Administrative unban persists a **local** cutoff against older remote records.
+Cluster-wide signed revocations and durable forwarding of original signatures
+remain future protocol work; apply cluster-wide unbans on every relevant node.
+
+New snapshots use format V4 and read V1–V3. Back up the data directory before
+upgrading; older binaries cannot read V4 or the new revocation WAL entry.
+For syslog, remote collectors without mTLS now require an explicit
+`trusted_senders` allowlist (see the source-syslog plugin README). Source health
+shows task status; it does not certify end-to-end log delivery. SSH parsing
+still does not deduplicate `Invalid user` and `Failed password` from one attempt.
+
+The legacy Rules editor is disabled because it did not change active plugin
+configuration. Configuration writes validate core settings and plugin schemas,
+replace the file atomically, and take effect after restart. QUIC/TLS dependencies
+were updated; older AWS/NATS/CTI dependency branches still need separate upgrades.
 
 ---
 

@@ -5,6 +5,7 @@ edition = "2021"
 description = "File-backed log source plugins for SSH, Nginx, Postfix, and custom regex logs"
 
 [dependencies]
+hiveguard-plugin-utils = { path = "../../hiveguard-plugin-utils" }
 hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
 hiveguard-core = { path = "../../hiveguard-core" }
 serde = { version = "1", features = ["derive"] }
@@ -19,4 +20,4 @@ prometheus-client = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }

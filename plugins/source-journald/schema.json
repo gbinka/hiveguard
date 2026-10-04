@@ -26,7 +26,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 1024,
-      "description": "Optional regex with named capture (?P<ip>...) to extract the source IP. If omitted, the first IPv4/IPv6 substring is used."
+      "description": "Optional regex with named capture (?P<ip>...) for non-SSH source IPs. For SSH it only filters messages; the semantic parser extracts the connection IP."
     },
     "since_boot": {
       "type": "boolean",
@@ -36,7 +36,7 @@
     "event_type": {
       "type": "string",
       "default": "ConnectionEvent",
-      "description": "EventType to label emitted events. One of AuthFailure, AuthSuccess, HttpRequest, Http4xx, Http5xx, SmtpAuthFailure, PortAccess, ConnectionEvent, or Custom name."
+      "description": "EventType for non-SSH events (SSH is classified from MESSAGE). One of AuthFailure, AuthSuccess, HttpRequest, Http4xx, Http5xx, SmtpAuthFailure, PortAccess, ConnectionEvent, or Custom name."
     }
   }
 }

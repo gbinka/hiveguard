@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use hiveguard_core::ban_store::BanStore;
 use hiveguard_core::bot_registry::{BotPolicy, BotRegistry};
-use hiveguard_core::config::{DetectorsConfig, HiveGuardConfig, KafkaTopicParser};
+use hiveguard_core::config::{HiveGuardConfig, KafkaTopicParser};
 use hiveguard_core::models::{BanRecord, BanSource, DetectionSignal, NormalizedEvent};
 use hiveguard_core::persistence::StateManager;
 use hiveguard_enforce::Enforcer;
@@ -34,6 +34,27 @@ use hiveguard_sigma::{SharedSigmaRules, SharedSigmaStats, SigmaRule};
 
 use crate::metrics::SharedMetrics;
 
+/// Replace configuration atomically without widening its existing permissions.
+fn atomic_config_write(path: &std::path::Path, content: &str) -> PluginResult<()> {
+    use std::io::Write;
+    let write = || -> std::io::Result<()> {
+        let target = std::fs::canonicalize(path)?;
+        let metadata = std::fs::metadata(&target)?;
+        // Atomic rename only needs directory write permission; explicitly respect
+        // a managed read-only config file instead of bypassing its permissions.
+        let _ = std::fs::OpenOptions::new().write(true).open(&target)?;
+        let parent = target.parent().ok_or_else(|| std::io::Error::other("config has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.as_file().set_permissions(metadata.permissions())?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&target).map_err(|e| e.error)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    };
+    write().map_err(|e| PluginError::Runtime(format!("config not saved: {e}")))
+}
+
 /// Maximum number of recent threats kept in the ring buffer. Older entries
 /// are evicted on insert.
 const THREATS_BUFFER_CAP: usize = 500;
@@ -43,6 +64,7 @@ const EVENT_CHANNEL_CAP: usize = 256;
 
 /// Daemon-side state + adapter exposed to UI plugins via `Arc<dyn UiApiHandle>`.
 pub struct DaemonUiApi {
+    source_status: Option<crate::plugin_supervisor::SourceStatus>,
     node_name: String,
     daemon_version: String,
     started_at: Instant,
@@ -94,6 +116,7 @@ impl DaemonUiApi {
     ) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAP);
         Self {
+            source_status: None,
             node_name,
             daemon_version,
             started_at: Instant::now(),
@@ -109,6 +132,11 @@ impl DaemonUiApi {
             bot_registry,
             event_tx,
         }
+    }
+
+    pub fn with_source_status(mut self, status: crate::plugin_supervisor::SourceStatus) -> Self {
+        self.source_status = Some(status);
+        self
     }
 
     /// Record a detection signal from the pipeline. Adds to the ring buffer
@@ -202,14 +230,31 @@ impl UiApiHandle for DaemonUiApi {
     }
 
     async fn list_plugins(&self) -> Vec<PluginInfo> {
-        self.plugins.clone()
+        let mut plugins = self.plugins.clone();
+        if let Some(status) = &self.source_status {
+            if let Ok(sources) = status.read() {
+                for plugin in &mut plugins {
+                    let states: Vec<_> = sources.iter().filter(|(id, _)| id == &plugin.id).collect();
+                    if !states.is_empty() {
+                        plugin.health = states.iter().find(|(_, state)| state != "Running")
+                            .unwrap_or(&states[0]).1.clone();
+                    }
+                }
+            }
+        }
+        plugins
     }
 
-    async fn add_ban(&self, req: BanRequest) -> PluginResult<()> {
+    async fn add_ban(&self, mut req: BanRequest) -> PluginResult<()> {
+        req.subject = req.subject.trunc();
         let now = Utc::now();
-        let expires_at = chrono::Duration::from_std(req.duration)
-            .ok()
-            .map(|d| now + d);
+        let duration = chrono::Duration::from_std(req.duration)
+            .map_err(|_| PluginError::ConfigValidation("ban duration out of range".into()))?;
+        if duration <= chrono::Duration::zero() {
+            return Err(PluginError::ConfigValidation("ban duration must be positive".into()));
+        }
+        let expires_at = Some(now.checked_add_signed(duration)
+            .ok_or_else(|| PluginError::ConfigValidation("ban expiry out of range".into()))?);
         let evidence_hash = [0u8; 32];
         let record = BanRecord {
             subject: req.subject,
@@ -222,8 +267,8 @@ impl UiApiHandle for DaemonUiApi {
             geo_info: None,
         };
 
+        let mut state = self.state.lock().await;
         {
-            let mut state = self.state.lock().await;
             state.add_ban(record).map_err(|e| {
                 hiveguard_plugin_api::PluginError::Runtime(format!(
                     "failed to persist manual ban: {e}"
@@ -235,38 +280,36 @@ impl UiApiHandle for DaemonUiApi {
             let mut enf = self.enforcer.lock().await;
             if let Err(e) = enf.apply_ban(&req.subject).await {
                 warn!(subject = %req.subject, error = %e, "enforcer rejected manual ban");
-                // Don't undo persistence — operator intent was captured.
+                return Err(PluginError::Runtime(format!("ban saved; firewall apply failed (pending retry): {e}")));
             }
         }
 
+        drop(state);
         // Broadcast new snapshot to live UIs.
         self.broadcast_bans().await;
         Ok(())
     }
 
     async fn remove_ban(&self, subject: IpNet) -> PluginResult<()> {
-        let removed = {
-            let mut state = self.state.lock().await;
-            state.remove_ban(&subject).map_err(|e| {
+        let subject = subject.trunc();
+        let mut state = self.state.lock().await;
+        {
+            state.revoke_ban(&subject).map_err(|e| {
                 hiveguard_plugin_api::PluginError::Runtime(format!(
                     "failed to remove ban: {e}"
                 ))
             })?
         };
 
-        if !removed {
-            return Err(hiveguard_plugin_api::PluginError::Runtime(format!(
-                "ban {subject} not found"
-            )));
-        }
-
         {
             let mut enf = self.enforcer.lock().await;
             if let Err(e) = enf.remove_ban(&subject).await {
                 warn!(subject = %subject, error = %e, "enforcer remove_ban failed");
+                return Err(PluginError::Runtime(format!("unban saved; firewall removal failed (pending retry): {e}")));
             }
         }
 
+        drop(state);
         self.broadcast_bans().await;
         Ok(())
     }
@@ -295,9 +338,20 @@ impl UiApiHandle for DaemonUiApi {
 
     async fn add_whitelist(&self, cidr: IpNet) -> PluginResult<()> {
         let mut st = self.state.lock().await;
-        st.add_whitelist(cidr)
-            .map_err(|e| PluginError::Runtime(format!("failed to whitelist {cidr}: {e}")))?;
-        info!(cidr = %cidr, "Whitelisted via ui.rest");
+        let revoked = {
+            st.add_whitelist(cidr)
+                .map_err(|e| PluginError::Runtime(format!("failed to whitelist {cidr}: {e}")))?
+        };
+        // Drop the bans the new entry covers from the firewall as well; the
+        // store side was handled by `add_whitelist`.
+        let now = Utc::now();
+        let desired: Vec<_> = st.ban_store().get_all_bans().into_iter()
+            .filter(|b| !st.whitelist().overlaps(&b.subject))
+            .filter(|b| b.expires_at.is_none_or(|expiry| expiry > now))
+            .map(|b| b.subject).collect();
+        self.enforcer.lock().await.sync_full(&desired).await
+            .map_err(|e| PluginError::Runtime(format!("whitelist saved; firewall sync failed (pending retry): {e}")))?;
+        info!(cidr = %cidr, revoked = revoked.len(), "Whitelisted via ui.rest");
         Ok(())
     }
 
@@ -351,41 +405,24 @@ impl UiApiHandle for DaemonUiApi {
         let Some(ref path) = self.config_path else {
             return Err(PluginError::Runtime("Config path not available".to_string()));
         };
-        // Validate before persisting — reject malformed YAML (parity with legacy).
-        serde_yaml::from_str::<HiveGuardConfig>(&content)
+        let cfg: HiveGuardConfig = serde_yaml::from_str(&content)
             .map_err(|e| PluginError::ConfigValidation(format!("YAML parse error: {e}")))?;
-        std::fs::write(path, &content).map_err(|e| PluginError::Runtime(e.to_string()))?;
+        cfg.validate().map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        let loader = hiveguard_host::Loader::resolve_only(Arc::new(
+            hiveguard_plugin_api::secrets::SecretResolver::new()
+        ));
+        loader.resolve(&crate::plugin_bridge::to_loader_config(&cfg))
+            .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        atomic_config_write(path, &content)?;
         Ok(())
     }
 
     async fn get_detectors(&self) -> PluginResult<Value> {
-        let Some(ref path) = self.config_path else {
-            return Err(PluginError::Runtime("Config path not available".to_string()));
-        };
-        let cfg = HiveGuardConfig::load(path)
-            .map_err(|e| PluginError::Runtime(e.to_string()))?;
-        serde_json::to_value(cfg.detectors).map_err(|e| PluginError::Runtime(e.to_string()))
+        Err(PluginError::Runtime("Detectors are configured in plugins; legacy Rules editor is unavailable. Edit plugins in configuration and restart.".into()))
     }
 
-    async fn put_detectors(&self, detectors: Value) -> PluginResult<()> {
-        let Some(ref path) = self.config_path else {
-            return Err(PluginError::Runtime("Config path not available".to_string()));
-        };
-        // Validate the incoming block against the typed schema first.
-        let new_detectors: DetectorsConfig = serde_json::from_value(detectors)
-            .map_err(|e| PluginError::ConfigValidation(format!("Invalid detectors config: {e}")))?;
-        // Splice the `detectors:` key into the existing YAML, preserving the rest.
-        let current_yaml = std::fs::read_to_string(path)
-            .map_err(|e| PluginError::Runtime(e.to_string()))?;
-        let mut yaml_val: serde_yaml::Value = serde_yaml::from_str(&current_yaml)
-            .map_err(|e| PluginError::Runtime(e.to_string()))?;
-        let det_val = serde_yaml::to_value(&new_detectors)
-            .map_err(|e| PluginError::Runtime(e.to_string()))?;
-        yaml_val["detectors"] = det_val;
-        let new_yaml = serde_yaml::to_string(&yaml_val)
-            .map_err(|e| PluginError::Runtime(e.to_string()))?;
-        std::fs::write(path, new_yaml).map_err(|e| PluginError::Runtime(e.to_string()))?;
-        Ok(())
+    async fn put_detectors(&self, _detectors: Value) -> PluginResult<()> {
+        Err(PluginError::Runtime("Detectors are configured in plugins; legacy Rules editor is unavailable. Edit plugins in configuration and restart.".into()))
     }
 
     async fn list_sigma_rules(&self) -> PluginResult<Vec<SigmaRuleSummary>> {
@@ -508,11 +545,7 @@ impl UiApiHandle for DaemonUiApi {
                     continue;
                 }
             };
-            if st.ban_store().is_banned(&ip_addr).is_some() {
-                info.skipped += 1;
-                continue;
-            }
-            let record = BanRecord {
+            let mut record = BanRecord {
                 subject: IpNet::from(ip_addr),
                 created_at: ban.banned_at,
                 expires_at: ban.expires_at,
@@ -522,10 +555,27 @@ impl UiApiHandle for DaemonUiApi {
                 source: BanSource::ManualAdmin,
                 geo_info: None,
             };
+            // Import must not shorten an existing manual or detector ban.
+            // Still apply it below so a previous firewall failure can recover.
+            if let Some(existing) = st.ban_store().get_all_bans().into_iter()
+                .find(|existing| existing.subject == record.subject) {
+                if existing.expires_at.is_none()
+                    || matches!((existing.expires_at, record.expires_at), (Some(old), Some(new)) if old >= new) {
+                    record = existing.clone();
+                }
+            }
             match st.add_ban(record) {
                 Ok(()) => {
-                    info!(ip = %ip_addr, jail = %ban.jail, "Imported fail2ban ban via ui.rest");
-                    info.imported += 1;
+                    match self.enforcer.lock().await.apply_ban(&IpNet::from(ip_addr)).await {
+                        Ok(()) => {
+                            info!(ip = %ip_addr, jail = %ban.jail, "Imported fail2ban ban via ui.rest");
+                            info.imported += 1;
+                        }
+                        Err(e) => {
+                            info.errors.push(format!("{}: ban saved; firewall failed (pending retry): {e}", ban.ip));
+                            info.skipped += 1;
+                        }
+                    }
                 }
                 Err(e) => {
                     info.errors.push(format!("{}: {e}", ban.ip));

@@ -1,23 +1,11 @@
 # detector.distributed_slow
 
-Detects coordinated slow attacks from multiple IPs within one subnet.
+Automatic detection is disabled. Counting distinct addresses in a /24 or /48
+cannot distinguish legitimate visitors from a coordinated attack. The plugin
+loads existing configurations but emits no detection signals and creates no
+subnet bans. Other detectors remain responsible for abuse detection.
 
-## YAML
-
-```yaml
-plugins:
-  - id: detector.distributed_slow
-    name: dist-slow
-    config:
-      window_secs: 600
-      subnet_threshold: 5
-      ban_duration_secs: 43200
-      ban_scope: "/24"
-```
-
-## Config fields
-
-- `window_secs`: tracking window in seconds.
-- `subnet_threshold`: unique IP threshold per subnet.
-- `ban_duration_secs`: suggested ban duration in seconds.
-- `ban_scope`: compatibility field from legacy config.
+Legacy `window_secs`, `subnet_threshold`, `ban_duration_secs` and `ban_scope`
+fields are accepted for configuration compatibility and have no effect.
+Existing bans are not removed by this change; review them separately across
+cluster peers. Re-enabling subnet bans requires independent abuse correlation.
