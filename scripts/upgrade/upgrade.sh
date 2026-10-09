@@ -40,7 +40,7 @@ PYPROFILE
 digest=$(sha256sum SHA256SUMS)
 digest=${digest%% *}
 parent=/var/lib/hiveguard-upgrades
-stage="$parent/20261004-${digest:0:16}"
+stage="$parent/20261009-${digest:0:16}"
 install -d -o root -g root -m 0755 "$parent"
 [[ ! -L "$parent" && ! -L "$stage" ]] || { echo 'Nieoczekiwany symlink.' >&2; exit 1; }
 if [[ ! -e "$stage" ]]; then
@@ -64,7 +64,7 @@ sha256sum --strict --check SHA256SUMS
 
 case "$action" in
   check) unit="hiveguard-upgrade-check-$(date -u +%Y%m%dT%H%M%S)"; args=(check --ssh-ip "$argument") ;;
-  install) unit=hiveguard-upgrade-20261004; args=(install --ssh-ip "$argument") ;;
+  install) unit=hiveguard-upgrade-20261009; args=(install --ssh-ip "$argument") ;;
   rollback) unit="hiveguard-upgrade-manual-rollback-$(date -u +%Y%m%dT%H%M%S)"; args=(rollback --backup "$argument") ;;
 esac
 echo "Praca pod kontrolą systemd: $unit (przetrwa zerwanie SSH)."

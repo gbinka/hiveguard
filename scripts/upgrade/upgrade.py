@@ -24,8 +24,8 @@ import sys
 import tempfile
 import time
 
-RELEASE = "20261004-audit"
-UNIT = "hiveguard-upgrade-20261004"
+RELEASE = "20261009-agent"
+UNIT = "hiveguard-upgrade-20261009"
 DATA = Path("/var/lib/hiveguard")
 CONFIG = Path("/etc/hiveguard/config.yaml")
 BINARY = Path("/usr/local/bin/hiveguard")
@@ -33,7 +33,7 @@ CONTROL = "/run/hiveguard/hiveguard.sock"
 DROPIN = Path("/etc/systemd/system/hiveguard.service.d/90-upgrade-resources.conf")
 BACKUPS = Path("/var/backups/hiveguard")
 PACKAGE = Path(__file__).resolve().parent
-OLD_SHA = "112dbb2b7e34ab7880c0b846c39155dd7fc65a5ce4ed400d9efda41383d860a4"
+OLD_SHA = "f250af08cd6de5ae74f6f21d293c9bff3a576599fbf8543c2935f8af327acd90"
 # Defaults remain available for offline helper tests. Every actual invocation
 # replaces these values from its required, checksummed package target.json.
 HOSTNAME = "node-a"
