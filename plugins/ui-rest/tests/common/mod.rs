@@ -21,6 +21,11 @@ pub struct MockUiApi {
     pub daemon_version: String,
     pub started_at: Instant,
     pub events: broadcast::Sender<UiEvent>,
+    /// Incremental agent events (`/api/agent/stream`). Tests push into it.
+    pub agent_events: broadcast::Sender<AgentEvent>,
+    /// When `true` the agent methods return `Runtime` errors (→ 503) to
+    /// emulate a host without the analysis surface.
+    pub agent_unsupported: bool,
 }
 
 impl MockUiApi {
@@ -35,7 +40,29 @@ impl MockUiApi {
             daemon_version: "0.0.0-test".to_string(),
             started_at: Instant::now(),
             events: tx,
+            agent_events: broadcast::channel(16).0,
+            agent_unsupported: false,
         }
+    }
+
+    pub fn without_agent() -> Self {
+        let mut m = Self::new();
+        m.agent_unsupported = true;
+        m
+    }
+
+    fn agent_echo(&self, op: &str, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        if self.agent_unsupported {
+            return Err(PluginError::Runtime("agent surface disabled".into()));
+        }
+        // Emulate the daemon's error mapping so the REST layer can be tested.
+        if params.get("source").and_then(|v| v.as_str()) == Some("missing") {
+            return Err(PluginError::NotFound("unknown log source `missing`".into()));
+        }
+        if params.get("since").and_then(|v| v.as_str()) == Some("garbage") {
+            return Err(PluginError::ConfigValidation("`since`: cannot parse".into()));
+        }
+        Ok(serde_json::json!({ "op": op, "params": params }))
     }
 }
 
@@ -75,6 +102,7 @@ impl UiApiHandle for MockUiApi {
             reason: req.reason,
             expires_at: None,
             source: "admin".to_string(),
+            created_at: None,
         });
         Ok(())
     }
@@ -117,6 +145,51 @@ impl UiApiHandle for MockUiApi {
         Some("# HELP hiveguard_up 1\nhiveguard_up 1\n".to_string())
     }
 
+    // --- Agent analysis surface ---
+    async fn agent_overview(&self) -> PluginResult<serde_json::Value> {
+        self.agent_echo("overview", serde_json::json!({}))
+    }
+    async fn agent_bans(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("bans", params)
+    }
+    async fn agent_threats(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("threats", params)
+    }
+    async fn agent_log_sources(&self) -> PluginResult<serde_json::Value> {
+        self.agent_echo("log_sources", serde_json::json!({}))
+    }
+    async fn agent_log_query(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("log_query", params)
+    }
+    async fn agent_log_stats(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("log_stats", params)
+    }
+    async fn agent_ip_profile(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("ip", params)
+    }
+    async fn agent_journal(&self, params: serde_json::Value) -> PluginResult<serde_json::Value> {
+        self.agent_echo("journal", params)
+    }
+    async fn agent_detectors(&self) -> PluginResult<serde_json::Value> {
+        self.agent_echo("detectors", serde_json::json!({}))
+    }
+    async fn agent_catalog(&self, kind: Option<String>) -> PluginResult<serde_json::Value> {
+        self.agent_echo("catalog", serde_json::json!({ "kind": kind }))
+    }
+    async fn agent_config_validate(&self, content: String) -> PluginResult<serde_json::Value> {
+        if self.agent_unsupported {
+            return Err(PluginError::Runtime("agent surface disabled".into()));
+        }
+        Ok(serde_json::json!({ "valid": !content.contains("INVALID"), "errors": [], "warnings": [], "plugins": [] }))
+    }
+    fn subscribe_agent(&self) -> Option<broadcast::Receiver<AgentEvent>> {
+        if self.agent_unsupported {
+            None
+        } else {
+            Some(self.agent_events.subscribe())
+        }
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
         self.events.subscribe()
     }
@@ -129,6 +202,7 @@ fn sample_ban(cidr: &str) -> BanInfo {
         reason: "test".to_string(),
         expires_at: Some("2099-01-01T00:00:00Z".to_string()),
         source: "detector:test".to_string(),
+        created_at: Some("2026-01-01T00:00:00Z".to_string()),
     }
 }
 
@@ -154,7 +228,13 @@ fn sample_plugin(id: &str) -> PluginInfo {
 
 /// Build a test `Router` with a mock API and a known auth token.
 pub fn test_router(token: &str) -> axum::Router {
-    let api: Arc<dyn UiApiHandle> = Arc::new(MockUiApi::new());
+    test_router_with(token, Arc::new(MockUiApi::new()))
+}
+
+/// Build a test `Router` around a caller-provided mock (so the test keeps a
+/// handle to it, e.g. to push agent events).
+pub fn test_router_with(token: &str, mock: Arc<MockUiApi>) -> axum::Router {
+    let api: Arc<dyn UiApiHandle> = mock;
     let state = Arc::new(AppState {
         api,
         auth_token: token.to_string(),

@@ -25,13 +25,14 @@ use hiveguard_core::models::{BanRecord, BanSource, DetectionSignal, NormalizedEv
 use hiveguard_core::persistence::StateManager;
 use hiveguard_enforce::Enforcer;
 use hiveguard_plugin_api::{
-    BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo, PluginError, PluginInfo,
-    PluginResult, SigmaLogSource, SigmaRuleDetail, SigmaRuleSummary, SigmaStatsInfo, StatsInfo,
-    ThreatInfo, UiApiHandle, UiEvent,
+    AgentEvent, BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo, PluginError,
+    PluginInfo, PluginResult, SigmaLogSource, SigmaRuleDetail, SigmaRuleSummary, SigmaStatsInfo,
+    StatsInfo, ThreatInfo, UiApiHandle, UiEvent,
 };
 use hiveguard_queue::deserializer::MessageRouter;
 use hiveguard_sigma::{SharedSigmaRules, SharedSigmaStats, SigmaRule};
 
+use crate::agent_api::{self, AgentSupport};
 use crate::metrics::SharedMetrics;
 
 /// Replace configuration atomically without widening its existing permissions.
@@ -97,6 +98,12 @@ pub struct DaemonUiApi {
     bot_registry: Option<Arc<Mutex<BotRegistry>>>,
     /// Pipeline ingest channel, for `ingest_logs`. `None` → 503.
     event_tx: Option<mpsc::Sender<NormalizedEvent>>,
+
+    /// Agent analysis surface (`/api/agent/*`): plugin entries, log engine,
+    /// incremental event fan-out. See `agent_api.rs` / `agent_logs.rs`.
+    agent: AgentSupport,
+    /// Hard cap on items per agent response (`agent.max_results`).
+    agent_max_results: usize,
 }
 
 impl DaemonUiApi {
@@ -131,7 +138,33 @@ impl DaemonUiApi {
             metrics,
             bot_registry,
             event_tx,
+            agent: AgentSupport::empty(),
+            agent_max_results: 5000,
         }
+    }
+
+    /// Attach the agent analysis surface: the config's `plugins:` entries
+    /// (effective detector configuration) and a log engine built from the
+    /// same config.
+    pub fn with_agent(mut self, support: AgentSupport, max_results: usize) -> Self {
+        self.agent = support;
+        self.agent_max_results = max_results.max(1);
+        self
+    }
+
+    /// Re-diff the ban snapshot and emit `ban_added`/`ban_removed` agent
+    /// events. Called after every ban change and periodically (expiry has no
+    /// hook of its own).
+    pub async fn sync_agent_ban_events(&self) {
+        if self.agent.events.receiver_count() == 0 {
+            // Still prime the baseline so the first subscriber does not get a
+            // burst of historical "added" events.
+            let bans = self.list_bans_inner().await;
+            self.agent.emit_ban_diff(&bans);
+            return;
+        }
+        let bans = self.list_bans_inner().await;
+        self.agent.emit_ban_diff(&bans);
     }
 
     pub fn with_source_status(mut self, status: crate::plugin_supervisor::SourceStatus) -> Self {
@@ -145,6 +178,7 @@ impl DaemonUiApi {
     /// wake-ups on every connected UI client.
     pub async fn record_signal(&self, signal: &DetectionSignal) {
         let info = signal_to_threat_info(signal);
+        self.agent.emit_signal(&info);
         let mut buf = self.threats.write().await;
         if buf.len() >= THREATS_BUFFER_CAP {
             buf.pop_front();
@@ -165,6 +199,7 @@ impl DaemonUiApi {
     /// ban is added or removed.
     pub async fn broadcast_bans(&self) {
         let bans = self.list_bans_inner().await;
+        self.agent.emit_ban_diff(&bans);
         let _ = self.events.send(UiEvent::BansSnapshot(bans));
     }
 
@@ -627,8 +662,206 @@ impl UiApiHandle for DaemonUiApi {
         Ok((accepted, rejected))
     }
 
+    // -----------------------------------------------------------------------
+    // Agent analysis surface (docs/AGENT_API.md)
+    // -----------------------------------------------------------------------
+
+    async fn agent_overview(&self) -> PluginResult<Value> {
+        let now = Utc::now();
+        let (bans, whitelisted) = {
+            let st = self.state.lock().await;
+            let records: Vec<BanRecord> = st.ban_store().get_all_bans().into_iter().cloned().collect();
+            (records, st.whitelist().entries().len())
+        };
+        let threats: Vec<ThreatInfo> = self.list_threats().await;
+        let metrics_text = self.render_metrics().await;
+        let mut counters = metrics_text
+            .as_deref()
+            .map(agent_api::counters_from_metrics)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Value::Object(ref mut m) = counters {
+            m.insert("whitelisted".into(), serde_json::json!(whitelisted));
+        }
+        let plugins = self.list_plugins().await;
+        let unhealthy: Vec<Value> = plugins
+            .iter()
+            .filter(|p| p.kind == "Source" && p.health != "Running" && p.health != "Healthy")
+            .map(|p| serde_json::json!({ "id": p.id, "health": p.health }))
+            .collect();
+        let log_sources = self
+            .agent
+            .log_engine
+            .as_ref()
+            .map(|e| e.source_names())
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "node": {
+                "name": self.node_name,
+                "version": self.daemon_version,
+                "uptime_secs": self.started_at.elapsed().as_secs(),
+                "now": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            },
+            "bans": agent_api::bans_overview(&bans, now),
+            "threats": agent_api::threats_overview(&threats, now),
+            "counters": counters,
+            "plugins": plugins,
+            "unhealthy_sources": unhealthy,
+            "log_sources": log_sources,
+        }))
+    }
+
+    async fn agent_bans(&self, params: Value) -> PluginResult<Value> {
+        let records: Vec<BanRecord> = {
+            let st = self.state.lock().await;
+            st.ban_store().get_all_bans().into_iter().cloned().collect()
+        };
+        agent_api::filter_bans(records, &params, Utc::now(), self.agent_max_results, ban_record_to_info)
+            .map_err(agent_api::to_plugin_error)
+    }
+
+    async fn agent_threats(&self, params: Value) -> PluginResult<Value> {
+        let threats = self.list_threats().await;
+        agent_api::filter_threats(&threats, &params, Utc::now(), self.agent_max_results)
+            .map_err(agent_api::to_plugin_error)
+    }
+
+    async fn agent_log_sources(&self) -> PluginResult<Value> {
+        let engine = self.log_engine()?;
+        Ok(engine.list_sources())
+    }
+
+    async fn agent_log_query(&self, params: Value) -> PluginResult<Value> {
+        let engine = self.log_engine()?;
+        engine.query(params).await.map_err(agent_api::to_plugin_error)
+    }
+
+    async fn agent_log_stats(&self, params: Value) -> PluginResult<Value> {
+        let engine = self.log_engine()?;
+        let mut result = engine.stats(params).await.map_err(agent_api::to_plugin_error)?;
+        // Enrich per-IP groups with ban/whitelist status from the live state.
+        let is_ip_grouping = result
+            .get("group_by")
+            .and_then(Value::as_str)
+            .is_some_and(|g| matches!(g, "ip" | "ip24" | "ip48"));
+        if is_ip_grouping {
+            if let Some(groups) = result.get_mut("groups").and_then(Value::as_array_mut) {
+                let st = self.state.lock().await;
+                for g in groups.iter_mut() {
+                    let key = g.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+                    let net: Option<IpNet> = key
+                        .parse::<IpNet>()
+                        .ok()
+                        .or_else(|| key.parse::<IpAddr>().ok().map(IpNet::from));
+                    let (banned, whitelisted) = match net {
+                        Some(net) => {
+                            let banned = if net.prefix_len() == net.max_prefix_len() {
+                                st.ban_store().is_banned(&net.addr()).is_some()
+                            } else {
+                                st.ban_store().get_all_bans().iter().any(|b| {
+                                    b.subject.contains(&net) || net.contains(&b.subject)
+                                })
+                            };
+                            (banned, st.whitelist().overlaps(&net))
+                        }
+                        None => (false, false),
+                    };
+                    if let Some(Value::Object(extras)) = g.get_mut("extras") {
+                        extras.insert("banned".into(), Value::Bool(banned));
+                        extras.insert("whitelisted".into(), Value::Bool(whitelisted));
+                    } else if let Value::Object(obj) = g {
+                        obj.insert(
+                            "extras".into(),
+                            serde_json::json!({ "banned": banned, "whitelisted": whitelisted }),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn agent_ip_profile(&self, params: Value) -> PluginResult<Value> {
+        let ip_str = params
+            .get("ip")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| PluginError::ConfigValidation("`ip` is required".into()))?;
+        let ip: IpAddr = ip_str
+            .parse()
+            .map_err(|_| PluginError::ConfigValidation(format!("`ip`: not an IP address: `{ip_str}`")))?;
+        let since = params.get("since").and_then(Value::as_str).map(str::to_string);
+
+        let (ban, whitelisted) = {
+            let st = self.state.lock().await;
+            let ban = st.ban_store().is_banned(&ip).cloned().map(ban_record_to_info);
+            (ban, st.whitelist().is_whitelisted(&ip))
+        };
+        let threats = self.list_threats().await;
+        let mine: Vec<&ThreatInfo> = threats.iter().filter(|t| t.ip == ip_str).collect();
+        let mut by_det: HashMap<String, u64> = HashMap::new();
+        for t in &mine {
+            *by_det.entry(t.detector.clone()).or_default() += 1;
+        }
+        let logs = match self.agent.log_engine.as_ref() {
+            Some(engine) => engine
+                .ip_profile_logs(ip, since.as_deref())
+                .await
+                .map_err(agent_api::to_plugin_error)?,
+            None => Value::Null,
+        };
+        Ok(serde_json::json!({
+            "ip": ip_str,
+            "ban": { "banned": ban.is_some(), "record": ban },
+            "whitelisted": whitelisted,
+            "threats": {
+                "count": mine.len(),
+                "by_detector": by_det,
+                "last": mine.first(),
+            },
+            "logs": logs,
+            "geo": Value::Null,
+        }))
+    }
+
+    async fn agent_journal(&self, params: Value) -> PluginResult<Value> {
+        let engine = self.log_engine()?;
+        engine.journal(params).await.map_err(agent_api::to_plugin_error)
+    }
+
+    async fn agent_detectors(&self) -> PluginResult<Value> {
+        let metrics_text = self.render_metrics().await;
+        Ok(agent_api::detectors_view(&self.agent.plugin_entries, metrics_text.as_deref()))
+    }
+
+    async fn agent_catalog(&self, kind: Option<String>) -> PluginResult<Value> {
+        agent_api::catalog_view(&self.agent.plugin_entries, kind.as_deref())
+            .map_err(agent_api::to_plugin_error)
+    }
+
+    async fn agent_config_validate(&self, content: String) -> PluginResult<Value> {
+        // Validation resolves plugin schemas and secrets; run it off the
+        // async executor like the config write path does implicitly.
+        tokio::task::spawn_blocking(move || agent_api::validate_config(&content))
+            .await
+            .map_err(|e| PluginError::Runtime(format!("validation task failed: {e}")))
+    }
+
+    fn subscribe_agent(&self) -> Option<broadcast::Receiver<AgentEvent>> {
+        Some(self.agent.events.subscribe())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
         self.events.subscribe()
+    }
+}
+
+impl DaemonUiApi {
+    fn log_engine(&self) -> PluginResult<&std::sync::Arc<crate::agent_logs::LogEngine>> {
+        self.agent
+            .log_engine
+            .as_ref()
+            .ok_or_else(|| PluginError::Runtime("log engine not available on this daemon".into()))
     }
 }
 
@@ -688,6 +921,7 @@ fn ban_record_to_info(record: BanRecord) -> BanInfo {
         reason: record.reason,
         expires_at: record.expires_at.map(|t: DateTime<Utc>| t.to_rfc3339()),
         source,
+        created_at: Some(record.created_at.to_rfc3339()),
     }
 }
 

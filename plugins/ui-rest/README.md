@@ -186,3 +186,15 @@ Response: `{"accepted":N,"rejected":M}`. The endpoint uses its own Bearer token
 - WS metrics: connected clients, lag count, send errors.
 - Bidirectional unban / temporary mute via WS commands.
 - mTLS / OIDC auth modes beyond static bearer tokens.
+
+## Agent analysis surface (`/api/agent/*`)
+
+Since 2026-10 the plugin also mounts the AI-agent / analyst API documented in
+[`docs/AGENT_API.md`](../../docs/AGENT_API.md): `overview`, filtered `bans` /
+`threats`, `logs/sources|query|stats`, `ip`, `journal`, `detectors`,
+`catalog`, `config/validate` (all behind the same bearer token) and an SSE
+stream at `GET /api/agent/stream` (token via `Authorization` header or
+`?token=`). Behaviour is configured by the daemon's top-level `agent:` section,
+not by this plugin. An MCP server for these endpoints lives in
+[`tools/mcp/`](../../tools/mcp/README.md). The classic `GET /api/bans` items
+now also carry `created_at`.

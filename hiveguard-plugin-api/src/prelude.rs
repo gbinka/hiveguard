@@ -17,7 +17,7 @@ pub use crate::traits::{
     scoring_engine::{BanDecision, ScoringEnginePlugin},
     siem_sink::{SiemBatch, SiemSinkPlugin},
     ui_server::{
-        plugin_kind_name, BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo,
+        plugin_kind_name, AgentEvent, BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo,
         PeerInfo, PluginInfo, SigmaLogSource, SigmaRuleDetail, SigmaRuleSummary, SigmaStatsInfo,
         StatsInfo, ThreatInfo, UiApiHandle, UiEvent, UiServerPlugin,
     },

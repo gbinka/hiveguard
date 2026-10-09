@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+pub mod agent;
 pub mod auth;
 pub mod routes;
 pub mod state;

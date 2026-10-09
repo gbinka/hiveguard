@@ -151,6 +151,14 @@ pub struct HiveGuardConfig {
     #[serde(default)]
     pub sigma: SigmaConfig,
 
+    /// AI-agent / analyst interface (`/api/agent/*` in `ui.rest`): extra log
+    /// files and journal units an agent may query, plus scan limits. Log
+    /// files tailed by `source.file.*` / `source.firewall` plugins and units
+    /// of `source.journald` are discovered automatically; this section only
+    /// adds to that list. Unknown to older binaries (silently ignored).
+    #[serde(default)]
+    pub agent: AgentConfig,
+
     /// Plugin instances to load (INT phase — new plugin architecture).
     ///
     /// Each entry references a registered `PluginDescriptor` by `id`. The
@@ -184,6 +192,86 @@ pub struct PluginConfigEntry {
 
 fn default_plugin_config() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
+}
+
+// ---------------------------------------------------------------------------
+// Agent interface (`agent:` section)
+// ---------------------------------------------------------------------------
+
+/// Configuration of the AI-agent analysis surface exposed by `ui.rest` under
+/// `/api/agent/*`. Everything here is read-only from the daemon's point of
+/// view: it never changes detection or enforcement, only what an authenticated
+/// agent may *read*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Additional log files an agent may query/aggregate, beyond the ones
+    /// discovered from `source.file.*` / `source.firewall` plugin entries.
+    #[serde(default)]
+    pub log_sources: Vec<AgentLogSourceConfig>,
+    /// systemd units an agent may read via `journalctl` (in addition to the
+    /// units configured on `source.journald` plugins). Default: `["hiveguard"]`.
+    #[serde(default = "default_agent_journal_units")]
+    pub journal_units: Vec<String>,
+    /// Hard cap on bytes scanned per log query (read backwards from the end
+    /// of the file). Default 256 MiB.
+    #[serde(default = "default_agent_max_scan_bytes")]
+    pub max_scan_bytes: u64,
+    /// Hard cap on items returned by a single query. Default 5000.
+    #[serde(default = "default_agent_max_results")]
+    pub max_results: usize,
+    /// Timeout for a single `journalctl` invocation, seconds. Default 20.
+    #[serde(default = "default_agent_journal_timeout_secs")]
+    pub journal_timeout_secs: u64,
+    /// Also scan the most recent rotated copy (`<path>.1`) when the time
+    /// window starts before the live file does. Default true.
+    #[serde(default = "default_true")]
+    pub include_rotated: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            log_sources: Vec::new(),
+            journal_units: default_agent_journal_units(),
+            max_scan_bytes: default_agent_max_scan_bytes(),
+            max_results: default_agent_max_results(),
+            journal_timeout_secs: default_agent_journal_timeout_secs(),
+            include_rotated: true,
+        }
+    }
+}
+
+/// One extra log file exposed to agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLogSourceConfig {
+    /// Stable name used in queries (e.g. `nginx_error`). Must be unique.
+    pub name: String,
+    /// Absolute path of the live log file.
+    pub path: PathBuf,
+    /// Line format: `nginx`, `ssh`, `postfix`, `ufw`, `syslog` or `raw`.
+    /// Default `raw` (timestamp detection only, no field extraction).
+    #[serde(default = "default_agent_log_format")]
+    pub format: String,
+}
+
+fn default_agent_journal_units() -> Vec<String> {
+    vec!["hiveguard".to_string()]
+}
+
+fn default_agent_max_scan_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_agent_max_results() -> usize {
+    5000
+}
+
+fn default_agent_journal_timeout_secs() -> u64 {
+    20
+}
+
+fn default_agent_log_format() -> String {
+    "raw".to_string()
 }
 
 /// Configuration for a known bot rule.

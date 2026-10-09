@@ -35,6 +35,10 @@ pub struct BanInfo {
     pub expires_at: Option<String>,
     /// `"detector:ssh_bruteforce"`, `"peer:node-2"`, or `"admin"`.
     pub source: String,
+    /// ISO 8601 timestamp of when the ban was issued. Optional on the wire so
+    /// older clients/doubles that omit it keep round-tripping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +88,32 @@ pub enum UiEvent {
     PluginsSnapshot(Vec<PluginInfo>),
     /// Heartbeat — keepalive every ~30s. Renderer can ignore.
     Tick,
+}
+
+/// Incremental event for the agent stream (`GET /api/agent/stream`, SSE).
+/// Unlike [`UiEvent`] these carry single records, not full snapshots, so a
+/// consumer can follow an attack as it develops without re-reading the whole
+/// ban list on every change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// One detection signal (emitted for every signal, banned or not).
+    Signal(ThreatInfo),
+    /// A ban appeared in the store (detector, peer or admin).
+    BanAdded(BanInfo),
+    /// A ban disappeared from the store (expired, revoked or whitelisted).
+    BanRemoved { subject: String },
+}
+
+impl AgentEvent {
+    /// SSE `event:` name for this variant.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AgentEvent::Signal(_) => "signal",
+            AgentEvent::BanAdded(_) => "ban_added",
+            AgentEvent::BanRemoved { .. } => "ban_removed",
+        }
+    }
 }
 
 /// Ban request from the UI (operator clicks "Ban" in the form).
@@ -336,6 +366,80 @@ pub trait UiApiHandle: Send + Sync + 'static {
     /// `(accepted, rejected)`. `parser` is a parser name or `"auto"`.
     async fn ingest_logs(&self, _lines: Vec<String>, _parser: String) -> PluginResult<(usize, usize)> {
         Err(unsupported())
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent analysis surface (`/api/agent/*`, see docs/AGENT_API.md).
+    //
+    // Payloads are `serde_json::Value` on purpose: the shapes are documented in
+    // AGENT_API.md and evolve with the daemon, and keeping them untyped here
+    // means new fields never require a plugin-API bump. Error mapping in the
+    // REST layer: `ConfigValidation` → 400, `NotFound` → 404, anything else →
+    // 503 (defaults below → "not supported by this UiApiHandle").
+    // -----------------------------------------------------------------------
+
+    /// One-call situation report (§3.1).
+    async fn agent_overview(&self) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Filtered / aggregated bans (§3.2). `params` = query parameters as a
+    /// JSON object of strings.
+    async fn agent_bans(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Filtered recent detection signals (§3.3).
+    async fn agent_threats(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Log sources an agent may query (§3.4).
+    async fn agent_log_sources(&self) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Last-N matching log lines of one source (§3.5). `params` = request body.
+    async fn agent_log_query(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Aggregated statistics over one source (§3.6). `params` = request body.
+    async fn agent_log_stats(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Cross-source profile of one IP (§3.7). `params` = request body.
+    async fn agent_ip_profile(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// systemd journal of an allow-listed unit (§3.8). `params` = query parameters.
+    async fn agent_journal(&self, _params: Value) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Loaded detectors with effective config + counters (§3.9).
+    async fn agent_detectors(&self) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Every plugin linked into the binary, enabled or not (§3.10).
+    async fn agent_catalog(&self, _kind: Option<String>) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Dry-run validation of a full config document (§3.11). Returns
+    /// `{valid, errors, warnings, plugins}`; `Err` only when validation itself
+    /// cannot run.
+    async fn agent_config_validate(&self, _content: String) -> PluginResult<Value> {
+        Err(unsupported())
+    }
+
+    /// Subscribe to incremental agent events (§3.12). `None` → the host does
+    /// not produce them (REST layer answers 503).
+    fn subscribe_agent(&self) -> Option<broadcast::Receiver<AgentEvent>> {
+        None
     }
 
     // --- Live updates ---

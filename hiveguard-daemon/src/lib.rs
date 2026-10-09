@@ -1,4 +1,6 @@
 // Stage 3 of INT: `alert_manager` removed — see `hiveguard_host::AlertDispatcher`.
+pub mod agent_api;
+pub mod agent_logs;
 pub mod cli;
 #[cfg(feature = "cluster")]
 pub mod cluster;

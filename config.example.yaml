@@ -327,6 +327,23 @@ alerting:
 # `hiveguard-migrate-config --input legacy.yaml` to convert older configs
 # that still use the top-level `sources:`, `enforcement:`, `cti:`,
 # `alerting.destinations:` sections.
+# ── AI-agent / analyst interface (`/api/agent/*` in ui.rest; docs/AGENT_API.md) ──
+# Read-only analysis surface: log query + statistics over the files the daemon
+# already tails, the daemon journal, detector config, plugin catalogue, config
+# validation and an SSE event stream. Files tailed by `source.file.*` /
+# `source.firewall` and units of `source.journald` are discovered automatically;
+# this section only ADDS sources and sets scan limits. Older binaries ignore it.
+agent:
+  log_sources:                       # extra files an agent may query
+    - name: nginx_error
+      path: /var/log/nginx/error.log
+      format: raw                    # nginx | ssh | postfix | ufw | syslog | raw
+  journal_units: [hiveguard]         # readable via GET /api/agent/journal
+  max_scan_bytes: 268435456          # per query, read backwards from EOF (256 MiB)
+  max_results: 5000                  # hard cap on items per response
+  journal_timeout_secs: 20
+  include_rotated: true              # also scan <path>.1 when the window predates the live file
+
 plugins:
   # ── Mandatory: a scoring engine plugin ──────────────────────────────────
   - id: scoring.default

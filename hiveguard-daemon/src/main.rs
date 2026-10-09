@@ -7,7 +7,9 @@ mod cluster;
 // `hiveguard_host::AlertDispatcher`. Legacy source archived under
 // `obsolete/daemon-src/alert_manager.rs`.
 mod fail2ban_import;
+mod agent_api;
 mod metrics;
+mod agent_logs;
 mod pipeline;
 mod plugin_bridge;
 // Force-links first-party plugin crates so their `inventory::submit!`
@@ -610,8 +612,34 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
         Some(metrics.clone()),
         Some(bot_registry.clone()),
         Some(event_tx.clone()),
-    ).with_source_status(source_status));
+    )
+    .with_source_status(source_status)
+    .with_agent(
+        agent_api::AgentSupport::new(
+            config.plugins.clone(),
+            Some(agent_logs::LogEngine::from_config(&config)),
+        ),
+        config.agent.max_results,
+    ));
     let ui_sniffer = ui_api::UiSniffer::from_arc(daemon_ui_api.clone());
+
+    // Agent SSE stream: ban expiry has no change hook, so re-diff the ban
+    // snapshot periodically to emit `ban_removed` for expired entries.
+    {
+        let api = daemon_ui_api.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => api.sync_agent_ban_events().await,
+                    changed = rx.changed() => {
+                        if changed.is_err() || *rx.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
 
     // --- Step 9b: Cluster gossip runtime ---
     // Brings up QUIC/SWIM/CRDT ban replication when `node.listen_gossip` is set.

@@ -2677,6 +2677,7 @@ dependencies = [
  "postcard",
  "prometheus-client",
  "quinn",
+ "regex",
  "reqwest",
  "sd-notify",
  "serde",

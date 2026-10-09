@@ -23,6 +23,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use hiveguard_plugin_api::prelude::{BanRequest, PluginError};
 
+use crate::agent::{agent_routes, sse_handler};
 use crate::auth::{ct_eq, require_auth};
 use crate::state::AppState;
 use crate::ws::ws_handler;
@@ -56,6 +57,8 @@ pub fn build_router(
         .route("/api/sigma/stats", get(get_sigma_stats))
         .route("/api/threats", get(get_threats))
         .route("/api/plugins", get(get_plugins))
+        // Agent analysis surface (docs/AGENT_API.md).
+        .merge(agent_routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -66,6 +69,9 @@ pub fn build_router(
     let public = Router::new()
         .route("/api/health", get(get_health))
         .route("/api/stream", get(ws_handler))
+        // SSE agent stream: token via Bearer header or `?token=` (checked in
+        // the handler, like the WebSocket route).
+        .route("/api/agent/stream", get(sse_handler))
         .route("/metrics", get(get_metrics));
 
     let mut router = Router::new().merge(public).merge(api);

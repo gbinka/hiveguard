@@ -231,6 +231,7 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 hyper = { version = "1", features = ["full"] }
 prometheus-client = "0.23"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
