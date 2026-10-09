@@ -88,8 +88,8 @@ detectors:
     ban_duration: "24h"
   port_scan:
     enabled: true
-    threshold: 20
-    window: "30s"
+    threshold: 6              # unique ports (UFW logs are rate-limited samples)
+    window: "10m"
     ban_duration: "48h"
   distributed_slow:
     enabled: true

@@ -37,6 +37,11 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
       "description": "Optional protocol allow-list (e.g. [\"TCP\", \"UDP\"]). When set, lines whose PROTO is not listed are skipped. Empty/omitted = all protocols."
+    },
+    "connection_attempts_only": {
+      "type": "boolean",
+      "default": true,
+      "description": "Only emit packets that try to open a connection: TCP bare SYN, UDP not sent from a well-known service port (53, 123, 443, ...). Filters out late replies of expired flows (e.g. DNS/HTTPS servers answering to ephemeral ports), which otherwise look like port scans."
     }
   }
 }

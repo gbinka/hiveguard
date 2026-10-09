@@ -52,8 +52,8 @@ impl PortScanPlugin {
 
     fn from_config(cfg: Config) -> PortScanDetector {
         PortScanDetector::with_config(
-            Duration::from_secs(cfg.window_secs.unwrap_or(30)),
-            cfg.threshold.unwrap_or(20),
+            Duration::from_secs(cfg.window_secs.unwrap_or(600)),
+            cfg.threshold.unwrap_or(6),
             Duration::from_secs(cfg.ban_duration_secs.unwrap_or(172_800)),
         )
     }

@@ -1118,9 +1118,9 @@ impl Default for SmtpBruteforceConfig {
 pub struct PortScanConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_threshold_20")]
+    #[serde(default = "default_threshold_6")]
     pub threshold: u32,
-    #[serde(default = "default_window_30s")]
+    #[serde(default = "default_window_10m")]
     pub window: HumanDuration,
     #[serde(default = "default_ban_48h")]
     pub ban_duration: HumanDuration,
@@ -1130,8 +1130,8 @@ impl Default for PortScanConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold: 20,
-            window: HumanDuration::from_secs(30),
+            threshold: 6,
+            window: HumanDuration::from_secs(600),
             ban_duration: HumanDuration::from_secs(172800),
         }
     }
@@ -1488,8 +1488,8 @@ fn default_true() -> bool {
 fn default_threshold_3() -> u32 {
     3
 }
-fn default_threshold_20() -> u32 {
-    20
+fn default_threshold_6() -> u32 {
+    6
 }
 fn default_threshold_50() -> u32 {
     50
@@ -1501,9 +1501,6 @@ fn default_severity_250() -> u8 {
     250
 }
 
-fn default_window_30s() -> HumanDuration {
-    HumanDuration::from_secs(30)
-}
 fn default_window_1m() -> HumanDuration {
     HumanDuration::from_secs(60)
 }
@@ -2586,7 +2583,7 @@ node:
         );
 
         assert_eq!(config.detectors.http_4xx_flood.threshold, 50);
-        assert_eq!(config.detectors.port_scan.threshold, 20);
+        assert_eq!(config.detectors.port_scan.threshold, 6);
         assert!(config.detectors.honeypot.ban_duration.is_permanent());
         assert_eq!(config.detectors.honeypot.severity, 250);
 

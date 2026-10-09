@@ -48,6 +48,8 @@ struct Config {
     block_marker: String,
     #[serde(default)]
     protocols: Vec<String>,
+    #[serde(default = "default_connection_attempts_only")]
+    connection_attempts_only: bool,
 }
 
 fn default_adapter() -> String { "ufw_file".to_string() }
@@ -55,6 +57,12 @@ fn default_path() -> PathBuf { PathBuf::from("/var/log/ufw.log") }
 fn default_seek_to_end() -> bool { true }
 fn default_event_type() -> String { "PortAccess".to_string() }
 fn default_block_marker() -> String { "[UFW BLOCK]".to_string() }
+fn default_connection_attempts_only() -> bool { true }
+
+/// UDP source ports of services this host talks to as a client. Blocked UDP
+/// packets *from* these ports are late replies (DNS, NTP, QUIC, ...) arriving
+/// on random ephemeral ports after conntrack forgot the flow — not probes.
+const UDP_REPLY_SOURCE_PORTS: &[u16] = &[53, 67, 68, 123, 443, 500, 853, 3478, 4500, 5353];
 
 pub struct FirewallSourcePlugin {
     manifest: PluginManifest,
@@ -137,9 +145,16 @@ impl LogSourcePlugin for FirewallSourcePlugin {
         let event_type = parse_event_type(&cfg.event_type);
         let block_marker = cfg.block_marker.clone();
         let protocols: Vec<String> = cfg.protocols.iter().map(|p| p.to_uppercase()).collect();
+        let connection_attempts_only = cfg.connection_attempts_only;
 
         let parser = move |line: &str| {
-            parse_ufw_line(line, &block_marker, &protocols, event_type.clone())
+            parse_ufw_line(
+                line,
+                &block_marker,
+                &protocols,
+                connection_attempts_only,
+                event_type.clone(),
+            )
         };
 
         run_file_source(
@@ -184,8 +199,14 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// Parse the leading syslog timestamp (`Jun 15 12:34:56`) if present.
+/// Parse the leading timestamp: RFC 3339 (`2026-10-05T13:13:54.213419+00:00`,
+/// rsyslog's default on recent Ubuntu) or classic syslog (`Jun 15 12:34:56`).
 fn parse_syslog_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    if let Some(first) = line.split_whitespace().next() {
+        if let Ok(ts) = DateTime::parse_from_rfc3339(first) {
+            return Some(ts.with_timezone(&Utc));
+        }
+    }
     // "Jun 15 12:34:56 host kernel: ..." — take the first three space groups.
     let mut it = line.splitn(4, ' ');
     let month = it.next()?;
@@ -202,6 +223,7 @@ fn parse_ufw_line(
     line: &str,
     block_marker: &str,
     protocols: &[String],
+    connection_attempts_only: bool,
     event_type: EventType,
 ) -> Option<NormalizedEvent> {
     if !line.contains(block_marker) {
@@ -219,6 +241,10 @@ fn parse_ufw_line(
             Some(p) if protocols.contains(p) => {}
             _ => return None,
         }
+    }
+
+    if connection_attempts_only && !is_connection_attempt(line, proto.as_deref()) {
+        return None;
     }
 
     let mut metadata: HashMap<String, String> = HashMap::new();
@@ -241,6 +267,23 @@ fn parse_ufw_line(
         raw_line: line.to_string(),
         metadata,
     })
+}
+
+/// True when a blocked packet looks like an attempt to open a connection
+/// rather than a stray packet of an existing/expired flow. TCP must be a bare
+/// SYN; UDP must not come from a well-known service port (late replies).
+fn is_connection_attempt(line: &str, proto: Option<&str>) -> bool {
+    match proto {
+        Some("TCP") => {
+            let has = |flag: &str| line.split_whitespace().any(|t| t == flag);
+            has("SYN") && !has("ACK") && !has("RST") && !has("FIN")
+        }
+        Some("UDP") => match field(line, "SPT").and_then(|p| p.parse::<u16>().ok()) {
+            Some(spt) => !UDP_REPLY_SOURCE_PORTS.contains(&spt),
+            None => true,
+        },
+        _ => true,
+    }
 }
 
 // --- File tailing (mirrors source-file) ----------------------------------
@@ -512,7 +555,7 @@ mod tests {
     #[test]
     fn parses_ufw_block_line() {
         let event =
-            parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &[], EventType::PortAccess).unwrap();
+            parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &[], true, EventType::PortAccess).unwrap();
         assert_eq!(event.source_ip, "203.0.113.5".parse::<IpAddr>().unwrap());
         assert_eq!(event.event_type, EventType::PortAccess);
         assert_eq!(event.metadata.get("port").unwrap(), "23");
@@ -524,21 +567,48 @@ mod tests {
     #[test]
     fn skips_non_block_lines() {
         let line = "Jun 15 12:00:00 host kernel: [UFW ALLOW] SRC=1.2.3.4 DPT=80 PROTO=TCP";
-        assert!(parse_ufw_line(line, "[UFW BLOCK]", &[], EventType::PortAccess).is_none());
+        assert!(parse_ufw_line(line, "[UFW BLOCK]", &[], true, EventType::PortAccess).is_none());
     }
 
     #[test]
     fn skips_lines_missing_dpt() {
         let line = "Jun 15 12:00:00 host kernel: [UFW BLOCK] SRC=1.2.3.4 PROTO=ICMP TYPE=8";
-        assert!(parse_ufw_line(line, "[UFW BLOCK]", &[], EventType::PortAccess).is_none());
+        assert!(parse_ufw_line(line, "[UFW BLOCK]", &[], true, EventType::PortAccess).is_none());
     }
 
     #[test]
     fn protocol_filter_excludes_unlisted() {
         let only_udp = vec!["UDP".to_string()];
-        assert!(parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &only_udp, EventType::PortAccess).is_none());
+        assert!(parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &only_udp, true, EventType::PortAccess).is_none());
         let only_tcp = vec!["TCP".to_string()];
-        assert!(parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &only_tcp, EventType::PortAccess).is_some());
+        assert!(parse_ufw_line(UFW_LINE, "[UFW BLOCK]", &only_tcp, true, EventType::PortAccess).is_some());
+    }
+
+    #[test]
+    fn skips_tcp_packets_of_existing_flows() {
+        // Late HTTPS reply (ACK/RST from :443 to an ephemeral port) is not a probe.
+        for flags in ["ACK RST", "ACK FIN", "ACK", "RST", "ACK SYN"] {
+            let line = format!(
+                "Jun 15 12:00:00 host kernel: [UFW BLOCK] SRC=104.21.10.110 DST=10.0.0.1 PROTO=TCP SPT=443 DPT=48812 WINDOW=0 RES=0x00 {flags} URGP=0"
+            );
+            assert!(parse_ufw_line(&line, "[UFW BLOCK]", &[], true, EventType::PortAccess).is_none(), "{flags}");
+            assert!(parse_ufw_line(&line, "[UFW BLOCK]", &[], false, EventType::PortAccess).is_some(), "{flags}");
+        }
+    }
+
+    #[test]
+    fn skips_udp_replies_from_service_ports() {
+        let dns = "Jun 15 12:00:00 host kernel: [UFW BLOCK] SRC=1.1.1.1 DST=10.0.0.1 PROTO=UDP SPT=53 DPT=40123 LEN=120";
+        assert!(parse_ufw_line(dns, "[UFW BLOCK]", &[], true, EventType::PortAccess).is_none());
+        let probe = "Jun 15 12:00:00 host kernel: [UFW BLOCK] SRC=203.0.113.9 DST=10.0.0.1 PROTO=UDP SPT=51234 DPT=5060 LEN=120";
+        assert!(parse_ufw_line(probe, "[UFW BLOCK]", &[], true, EventType::PortAccess).is_some());
+    }
+
+    #[test]
+    fn parses_rfc3339_timestamp() {
+        let line = "2026-10-05T13:13:54.213419+00:00 host kernel: [UFW BLOCK] SRC=203.0.113.5 DST=10.0.0.1 PROTO=TCP SPT=51000 DPT=23 RES=0x00 SYN URGP=0";
+        let event = parse_ufw_line(line, "[UFW BLOCK]", &[], true, EventType::PortAccess).unwrap();
+        assert_eq!(event.timestamp.to_rfc3339(), "2026-10-05T13:13:54.213419+00:00");
     }
 
     #[tokio::test]
@@ -580,6 +650,7 @@ mod tests {
                 event_type: "PortAccess".into(),
                 block_marker: "[UFW BLOCK]".into(),
                 protocols: Vec::new(),
+                connection_attempts_only: true,
             }),
         };
 

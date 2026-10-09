@@ -148,12 +148,34 @@ def expiry(record):
     return dt.datetime.max.replace(tzinfo=dt.timezone.utc) if text is None else dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
+def from_peer(record):
+    """Ban relayed by a cluster peer, in any of the report/socket/API shapes."""
+    source = record.get("source")
+    if isinstance(source, dict):
+        return "ClusterPeer" in source
+    return isinstance(source, str) and source.startswith(("ClusterPeer(", "peer:"))
+
+
 def assert_preserved(before, after, at=None):
-    """Require exact subjects and no shortened lifetime for every still-live ban."""
+    """Require exact subjects and no shortened lifetime for every still-live ban.
+
+    Exception: a ban relayed by a peer may be shortened while it stays active.
+    Older daemons stamped relayed bans with their own receive time and default
+    duration; the new daemon adopts the originating node's real expiry when
+    the peer re-announces it, which is a correction, not a loss.
+    """
     at = at or now()
     by_subject = {r["subject"]: r for r in after}
-    missing = [r["subject"] for r in before if expiry(r) > at and
-               (r["subject"] not in by_subject or expiry(by_subject[r["subject"]]) < expiry(r))]
+
+    def lost(r):
+        if r["subject"] not in by_subject:
+            return True
+        kept = expiry(by_subject[r["subject"]])
+        if kept >= expiry(r):
+            return False
+        return not (from_peer(r) and kept > at)
+
+    missing = [r["subject"] for r in before if expiry(r) > at and lost(r)]
     if missing:
         raise RuntimeError(f"{len(missing)} active bans disappeared or lost lifetime; first: {missing[:5]}")
 

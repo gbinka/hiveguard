@@ -12,7 +12,9 @@ use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 ///
 /// Note: Full implementation requires netlink/conntrack integration.
 /// This version works with `EventType::PortAccess` events from custom parsers.
-/// Default: >20 unique ports in 30s → ban 48h.
+/// Default: >=6 unique ports in 10 min → ban 48h. The window is long because
+/// firewall logs are rate-limited samples (UFW logs ~3 blocks/min host-wide),
+/// so slow scanners only ever show a few ports per minute.
 pub struct PortScanDetector {
     /// Window for tracking port access.
     window: Duration,
@@ -20,15 +22,15 @@ pub struct PortScanDetector {
     threshold: usize,
     /// Ban duration.
     ban_duration: Duration,
-    /// Per-IP: (port, timestamp) entries.
+    /// Per-IP: (port, last seen) entries, at most one per distinct port.
     port_access: DashMap<IpAddr, Vec<(u16, DateTime<Utc>)>>,
 }
 
 impl PortScanDetector {
     pub fn new() -> Self {
         Self {
-            window: Duration::from_secs(30),
-            threshold: 20,
+            window: Duration::from_secs(600),
+            threshold: 6,
             ban_duration: Duration::from_secs(48 * 3600), // 48h
             port_access: DashMap::new(),
         }
@@ -84,15 +86,14 @@ impl Detector for PortScanDetector {
         self.cleanup_old_entries(&ip, event.timestamp);
 
         let mut entries = self.port_access.entry(ip).or_default();
+        // Keep one entry per port so repeated hits on the same port cannot
+        // grow the list over the (long) window.
+        entries.retain(|(p, _)| *p != port);
         entries.push((port, event.timestamp));
+        let unique_ports = entries.len();
 
-        // Count distinct ports
-        let mut unique_ports: Vec<u16> = entries.iter().map(|(p, _)| *p).collect();
-        unique_ports.sort();
-        unique_ports.dedup();
-
-        if unique_ports.len() >= self.threshold {
-            let evidence = format!("{}:port_scan:{}_ports", ip, unique_ports.len());
+        if unique_ports >= self.threshold {
+            let evidence = format!("{}:port_scan:{}_ports", ip, unique_ports);
             // Clear the entries to avoid repeated firing
             entries.clear();
 
@@ -100,7 +101,7 @@ impl Detector for PortScanDetector {
                 source_ip: Self::ip_to_net(ip),
                 severity: 200,
                 confidence: 0.9,
-                reason: format!("Port scan detected: {} unique ports in {}s", unique_ports.len(), self.window.as_secs()),
+                reason: format!("Port scan detected: {} unique ports in {}s", unique_ports, self.window.as_secs()),
                 evidence_hash: *blake3::hash(evidence.as_bytes()).as_bytes(),
                 suggested_action: Action::Ban(self.ban_duration),
                 detector_name: "port_scan".into(),
@@ -198,18 +199,18 @@ mod tests {
     // --- Phase 20: comprehensive coverage ---
 
     #[test]
-    fn default_threshold_20_ports_in_30s() {
-        let mut d = PortScanDetector::new();
+    fn default_threshold_6_ports_in_10m() {
+        let d = PortScanDetector::new();
         let base = Utc::now();
 
-        // 19 unique ports → no ban
-        for port in 0..19 {
-            let event = make_port_event("10.0.0.1", 1000 + port, base);
+        // 5 unique ports spread over 9 minutes → no ban
+        for port in 0..5 {
+            let event = make_port_event("10.0.0.1", 1000 + port, base + chrono::Duration::seconds(port as i64 * 108));
             assert!(d.process(&event).is_none());
         }
 
-        // 20th unique port → ban
-        let event = make_port_event("10.0.0.1", 1019, base);
+        // 6th unique port within the 10 min window → ban
+        let event = make_port_event("10.0.0.1", 1005, base + chrono::Duration::seconds(590));
         let result = d.process(&event);
         assert!(result.is_some());
         let s = result.unwrap();
@@ -303,9 +304,19 @@ mod tests {
     fn port_scan_default_constructor() {
         let d = PortScanDetector::default();
         assert_eq!(d.name(), "port_scan");
-        assert_eq!(d.threshold, 20);
-        assert_eq!(d.window, Duration::from_secs(30));
+        assert_eq!(d.threshold, 6);
+        assert_eq!(d.window, Duration::from_secs(600));
         assert_eq!(d.ban_duration, Duration::from_secs(48 * 3600));
+    }
+
+    #[test]
+    fn repeated_hits_on_one_port_do_not_accumulate() {
+        let d = PortScanDetector::with_config(Duration::from_secs(600), 3, Duration::from_secs(3600));
+        let base = Utc::now();
+        for i in 0..1000 {
+            assert!(d.process(&make_port_event("10.0.0.1", 23, base + chrono::Duration::milliseconds(i))).is_none());
+        }
+        assert_eq!(d.port_access.get(&"10.0.0.1".parse::<IpAddr>().unwrap()).unwrap().len(), 1);
     }
 
     #[test]

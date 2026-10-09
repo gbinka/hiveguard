@@ -302,8 +302,8 @@ detectors:
     ban_duration: "24h"
   port_scan:
     enabled: true
-    threshold: 20             # Unique ports accessed
-    window: "30s"
+    threshold: 6              # Unique ports accessed (sampled from UFW log)
+    window: "10m"
     ban_duration: "48h"
   distributed_slow:
     enabled: true

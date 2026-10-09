@@ -56,6 +56,23 @@ class BanPreservationTests(unittest.TestCase):
             upgrade.assert_preserved(before, [ban(expiry="2026-10-04T23:59:59Z")], AT)
         upgrade.assert_preserved(before, [ban(expiry="2026-10-06T00:00:00Z")], AT)
 
+    def test_peer_relayed_ban_may_adopt_origin_expiry_while_active(self):
+        for source in ({"ClusterPeer": "bd3b"}, 'ClusterPeer("bd3b")', "peer:bd3b"):
+            relayed = dict(ban(), source=source)
+            shorter = dict(ban(expiry="2026-10-04T18:00:00Z"), source=source)
+            upgrade.assert_preserved([relayed], [shorter], AT)
+            expired = dict(ban(expiry="2026-10-04T11:00:00Z"), source=source)
+            with self.assertRaises(RuntimeError):
+                upgrade.assert_preserved([relayed], [expired], AT)
+            with self.assertRaises(RuntimeError):
+                upgrade.assert_preserved([relayed], [], AT)
+
+    def test_local_ban_still_may_not_be_shortened(self):
+        for source in ({"LocalDetector": "ssh_bruteforce"}, 'LocalDetector("ssh_bruteforce")', "ManualAdmin"):
+            with self.assertRaises(RuntimeError):
+                upgrade.assert_preserved([dict(ban(), source=source)],
+                                         [dict(ban(expiry="2026-10-04T18:00:00Z"), source=source)], AT)
+
     def test_permanent_ban_must_remain_permanent(self):
         before = [ban(expiry=None)]
         with self.assertRaises(RuntimeError):
