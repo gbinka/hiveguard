@@ -356,6 +356,11 @@ impl LogEngine {
         let args = journal_args(&req);
         debug!(?args, "agent: running journalctl");
         let mut cmd = tokio::process::Command::new("journalctl");
+        // Do not let the child inherit systemd's notify socket: journalctl would
+        // otherwise send a READY/STATUS message that systemd logs as
+        // "Got notification message from PID …, but reception only permitted
+        // for main PID" (observed on node-a 2026-10-09).
+        cmd.env_remove("NOTIFY_SOCKET");
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
