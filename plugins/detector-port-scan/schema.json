@@ -5,6 +5,10 @@
   "properties": {
     "window_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
     "threshold": { "type": "integer", "minimum": 1, "maximum": 1000000 },
-    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "long_window_secs": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "Long-window (slow scan) tier window. Default 21600 (6 h)." },
+    "long_threshold": { "type": "integer", "minimum": 0, "maximum": 65536, "description": "Distinct ports within long_window_secs to ban (detector name port_scan_slow). 0 disables the tier. Default 25." },
+    "long_ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000, "description": "Ban duration of the long-window tier. Default 604800 (7 days)." },
+    "max_tracked_ips": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Cap of IPs tracked per tier (memory bound). Default 50000." }
   }
 }

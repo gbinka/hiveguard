@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use hiveguard_core::Detector;
+use hiveguard_core::detectors::port_scan::{
+    DEFAULT_LONG_BAN_SECS, DEFAULT_LONG_THRESHOLD, DEFAULT_LONG_WINDOW_SECS, DEFAULT_MAX_TRACKED_IPS,
+};
 use hiveguard_core::detectors::PortScanDetector;
 use hiveguard_core::models::{EventType, NormalizedEvent};
 use hiveguard_plugin_api::prelude::*;
@@ -16,6 +19,11 @@ struct Config {
     window_secs: Option<u64>,
     threshold: Option<usize>,
     ban_duration_secs: Option<u64>,
+    /// Long-window ("slow scan") tier; `long_threshold: 0` disables it.
+    long_window_secs: Option<u64>,
+    long_threshold: Option<usize>,
+    long_ban_duration_secs: Option<u64>,
+    max_tracked_ips: Option<usize>,
 }
 
 pub struct PortScanPlugin {
@@ -56,6 +64,12 @@ impl PortScanPlugin {
             cfg.threshold.unwrap_or(6),
             Duration::from_secs(cfg.ban_duration_secs.unwrap_or(172_800)),
         )
+        .with_long_tier(
+            Duration::from_secs(cfg.long_window_secs.unwrap_or(DEFAULT_LONG_WINDOW_SECS)),
+            cfg.long_threshold.unwrap_or(DEFAULT_LONG_THRESHOLD),
+            Duration::from_secs(cfg.long_ban_duration_secs.unwrap_or(DEFAULT_LONG_BAN_SECS)),
+        )
+        .with_max_tracked_ips(cfg.max_tracked_ips.unwrap_or(DEFAULT_MAX_TRACKED_IPS))
     }
 }
 
@@ -145,11 +159,50 @@ mod tests {
             serde_json::json!({
                 "window_secs": 45,
                 "threshold": 15,
-                "ban_duration_secs": 3600
+                "ban_duration_secs": 3600,
+                "long_window_secs": 86400,
+                "long_threshold": 40,
+                "long_ban_duration_secs": 604800,
+                "max_tracked_ips": 20000
             }),
         )
         .await;
         assert!(p.is_ok());
+    }
+
+    #[tokio::test]
+    async fn schema_is_strict_and_lists_new_keys() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        for k in ["long_window_secs", "long_threshold", "long_ban_duration_secs", "max_tracked_ips"] {
+            assert!(schema["properties"].get(k).is_some(), "{k} missing from schema");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_scan_fires_through_plugin() {
+        let p = PortScanPlugin::create(
+            test_ctx(),
+            serde_json::json!({"window_secs": 30, "threshold": 20, "long_window_secs": 3600, "long_threshold": 5}),
+        )
+        .await
+        .unwrap();
+        let base = Utc::now();
+        let mut fired = None;
+        for i in 0..5u16 {
+            let mut metadata = HashMap::new();
+            metadata.insert("port".to_string(), (100 + i).to_string());
+            let ev = NormalizedEvent {
+                timestamp: base + chrono::Duration::minutes(10 * i as i64),
+                source_ip: "147.45.112.16".parse().unwrap(),
+                event_type: EventType::PortAccess,
+                source_name: "firewall".into(),
+                raw_line: String::new(),
+                metadata,
+            };
+            fired = p.process(&ev);
+        }
+        assert_eq!(fired.unwrap().detector_name, "port_scan_slow");
     }
 
     #[tokio::test]
