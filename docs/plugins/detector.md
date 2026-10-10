@@ -11,6 +11,13 @@ Fala A3): `plugins/detector-ssh-bruteforce`, `plugins/detector-honeypot`,
 ```rust
 pub trait DetectorPlugin: Plugin {
     fn process(&self, event: &NormalizedEvent) -> Option<DetectionSignal>;
+
+    /// Optional (default wraps `process`). Lets one event yield several
+    /// signals, also for *other* source IPs — used by `detector.campaign`
+    /// to ban every participant of a cross-IP campaign. The daemon pipeline
+    /// calls this method; GeoIP data of the event is attached only to
+    /// signals/bans about `event.source_ip`.
+    fn process_multi(&self, event: &NormalizedEvent) -> Vec<DetectionSignal> { .. }
 }
 ```
 
@@ -20,8 +27,10 @@ lets the pipeline run detectors concurrently across events.
 
 ## What the host guarantees
 
-- `process` is called from many tasks in parallel. It **must** be safe to
-  invoke concurrently — use `DashMap`, `RwLock`, or atomics for any state.
+- Today the daemon calls `process_multi` (→ `process`) from **one sequential
+  pipeline task** for every event of every source, so a slow detector stalls
+  all sources. Still keep it safe to invoke concurrently — use `DashMap`,
+  `Mutex`/`RwLock`, or atomics for any state — and never block or do I/O.
 - Every event is dispatched to every enabled detector in the order they
   appear in the `plugins:` config.
 - Return `None` for the common case (event doesn't match). Return

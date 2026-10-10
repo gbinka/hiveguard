@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "window_secs": { "type": "integer", "minimum": 60, "maximum": 604800, "description": "Per-IP sliding window. Default 21600 (6 h)." },
+    "min_distinct_paths": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Distinct suspicious PHP paths needed. Default 6." },
+    "score_threshold": { "type": "number", "minimum": 0.5, "maximum": 10000, "description": "Score needed (see README for weights). Default 12." },
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000, "description": "Default 259200 (72 h)." },
+    "legit_paths": { "type": "array", "items": { "type": "string" }, "description": "Legitimate PHP paths; replaces the WordPress defaults. '/dir/' = segment anywhere, '/x.php' = exact path, 'x.php' = basename outside /wp-content/." },
+    "extra_legit_paths": { "type": "array", "items": { "type": "string" }, "description": "Appended to legit_paths (or to the defaults)." },
+    "ignore_user_agents": { "type": "array", "items": { "type": "string" }, "description": "Case-insensitive UA substrings never counted; replaces the crawler defaults." },
+    "extra_ignore_user_agents": { "type": "array", "items": { "type": "string" }, "description": "Appended to ignore_user_agents (or to the defaults)." },
+    "ignore_vhosts": { "type": "array", "items": { "type": "string" }, "description": "Vhosts never counted (e.g. a legacy non-WordPress PHP site)." },
+    "shared_path_min_ips": { "type": "integer", "minimum": 0, "maximum": 1000, "description": "Bonus +1 when that many other IPs probed the same path in the window; 0 = off. Default 3." },
+    "max_tracked_ips": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Default 50000." },
+    "max_tracked_paths": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Default 20000." }
+  }
+}

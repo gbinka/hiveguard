@@ -72,6 +72,8 @@ extern crate hiveguard_plugin_cti_spamhaus as _;
 extern crate hiveguard_plugin_cti_tor as _;
 
 // --- Detectors -----------------------------------------------------------
+#[cfg(feature = "detector-campaign")]
+extern crate hiveguard_plugin_detector_campaign as _;
 #[cfg(feature = "detector-distributed-slow")]
 extern crate hiveguard_plugin_detector_distributed_slow as _;
 #[cfg(feature = "detector-entropy")]
@@ -98,6 +100,8 @@ extern crate hiveguard_plugin_detector_smtp_bruteforce as _;
 extern crate hiveguard_plugin_detector_ssh_bruteforce as _;
 #[cfg(feature = "detector-timing")]
 extern crate hiveguard_plugin_detector_timing as _;
+#[cfg(feature = "detector-webshell-probe")]
+extern crate hiveguard_plugin_detector_webshell_probe as _;
 
 // --- Scoring engine ------------------------------------------------------
 #[cfg(feature = "scoring-default")]

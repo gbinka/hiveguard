@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Sensitive endpoints, prefix match without query string. Default [/wp-login.php, /xmlrpc.php]." },
+    "methods": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "HTTP methods counted. Default [POST]." },
+    "window_secs": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "Sliding trigger window. Default 1800." },
+    "min_distinct_ips": { "type": "integer", "minimum": 2, "maximum": 1000000, "description": "Distinct IPs per fingerprint (UA+method+endpoint) to flag a campaign. Default 20." },
+    "min_requests": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Requests per fingerprint to flag a campaign. Default 30." },
+    "hot_secs": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long a flagged campaign stays hot after its last hit. Default 21600." },
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000, "description": "Ban for each participant. Default 86400." },
+    "ignore_user_agents": { "type": "array", "items": { "type": "string" }, "description": "Case-insensitive UA substrings never counted. Replaces the default list." },
+    "extra_ignore_user_agents": { "type": "array", "items": { "type": "string" }, "description": "Appended to ignore_user_agents (or to the defaults)." },
+    "ignore_vhosts": { "type": "array", "items": { "type": "string" }, "description": "Vhosts (exact) never counted." },
+    "ignore_redirects": { "type": "boolean", "description": "Skip 3xx responses (successful WordPress login = 302). Default true." },
+    "vhost_min_distinct_ips": { "type": "integer", "minimum": 0, "maximum": 1000000, "description": "Second key per (vhost, endpoint) regardless of UA; 0 = off (default). Needs the trailing \"$host\" field in the nginx log." },
+    "retro_ban": { "type": "boolean", "description": "Also ban IPs seen before the campaign was flagged. Default true." },
+    "max_retro_bans": { "type": "integer", "minimum": 0, "maximum": 100000, "description": "Max retro bans per campaign trigger. Default 2000." },
+    "retro_batch": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Max retro bans emitted per processed event (pipeline smoothing). Default 32." },
+    "max_keys": { "type": "integer", "minimum": 1, "maximum": 1000000, "description": "Max fingerprints tracked. Default 5000." },
+    "max_hits_per_key": { "type": "integer", "minimum": 1, "maximum": 1000000, "description": "Max remembered hits per fingerprint. Default 4096." }
+  }
+}

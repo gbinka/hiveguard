@@ -413,9 +413,12 @@ impl Pipeline {
             // Pass event through each detector
             let mut detection_signals = Vec::new();
             for detector in &mut self.detectors {
-                if let Some(mut signal) = detector.process(&event) {
+                for mut signal in detector.process_multi(&event) {
+                    // Signals about other IPs (cross-IP campaign detectors)
+                    // must not inherit this event's GeoIP facts.
+                    let about_event_ip = signal.source_ip.contains(&event.source_ip);
                     // Apply datacenter severity multiplier if applicable
-                    if let Some(ref gi) = geo_info {
+                    if let Some(gi) = geo_info.as_ref().filter(|_| about_event_ip) {
                         if gi.is_datacenter && self.datacenter_multiplier != 1.0 {
                             let boosted = (signal.severity as f32 * self.datacenter_multiplier)
                                 .min(255.0) as u8;
@@ -483,8 +486,12 @@ impl Pipeline {
 
                 if let Some(decision) = decision {
                     let mut ban_record = decision_to_record(decision);
-                    // Attach GeoIP enrichment to the ban record
-                    ban_record.geo_info = geo_info.clone();
+                    // Attach GeoIP enrichment to the ban record — only when the
+                    // ban is about this event's source (campaign detectors can
+                    // emit signals for other participants).
+                    if ban_record.subject.contains(&event.source_ip) {
+                        ban_record.geo_info = geo_info.clone();
+                    }
 
                     bans_issued += 1;
                     info!(
@@ -862,6 +869,52 @@ mod tests {
         drop(tx);
         pipeline.run().await;
         assert!(state.lock().await.ban_store().is_banned(&ip).is_some());
+    }
+
+    /// Multi-signal detectors (detector.campaign): one event can ban other
+    /// IPs (retro bans of earlier participants); whitelisted participants are
+    /// still protected and bans stay host-scoped (/32).
+    #[tokio::test]
+    async fn campaign_retro_signals_ban_other_participants_except_whitelisted() {
+        use hiveguard_core::detectors::{CampaignConfig, CampaignDetector};
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(StateManager::new(dir.path(), WalSyncMode::None).unwrap()));
+        let whitelisted: IpAddr = "209.50.164.3".parse().unwrap();
+        state.lock().await.add_whitelist(ipnet::IpNet::from(whitelisted)).unwrap();
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(ObserveOnlyEnforcer::new())));
+        let (tx, rx) = mpsc::channel(100);
+        let detector = CampaignDetector::with_config(CampaignConfig {
+            min_distinct_ips: 10,
+            min_requests: 10,
+            ..Default::default()
+        });
+        let mut pipeline = Pipeline::new(rx, vec![Box::new(detector)], default_scoring().await, state.clone(), enforcer);
+        let ips: Vec<IpAddr> = (0..12u8).map(|i| format!("209.50.164.{}", i + 1).parse().unwrap()).collect();
+        for ip in &ips {
+            tx.send(NormalizedEvent {
+                timestamp: Utc::now(),
+                source_ip: *ip,
+                event_type: EventType::HttpRequest,
+                source_name: "nginx".into(),
+                raw_line: String::new(),
+                metadata: HashMap::from([
+                    ("method".into(), "POST".into()),
+                    ("path".into(), "/wp-login.php".into()),
+                    ("status_code".into(), "200".into()),
+                    ("user_agent".into(), "Goosee-Audit/1.0 (+internal-security-audit)".into()),
+                ]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        pipeline.run().await;
+        let st = state.lock().await;
+        for ip in &ips {
+            let banned = st.ban_store().is_banned(ip).is_some();
+            assert_eq!(banned, *ip != whitelisted, "{ip}");
+        }
+        assert!(st.ban_store().get_all_bans().iter().all(|b| b.subject.prefix_len() == 32));
     }
 
     #[tokio::test]

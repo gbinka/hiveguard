@@ -2635,6 +2635,7 @@ dependencies = [
  "hiveguard-plugin-cti-otx",
  "hiveguard-plugin-cti-spamhaus",
  "hiveguard-plugin-cti-tor",
+ "hiveguard-plugin-detector-campaign",
  "hiveguard-plugin-detector-distributed-slow",
  "hiveguard-plugin-detector-entropy",
  "hiveguard-plugin-detector-honeypot",
@@ -2648,6 +2649,7 @@ dependencies = [
  "hiveguard-plugin-detector-smtp-bruteforce",
  "hiveguard-plugin-detector-ssh-bruteforce",
  "hiveguard-plugin-detector-timing",
+ "hiveguard-plugin-detector-webshell-probe",
  "hiveguard-plugin-enforcer-cloudflare",
  "hiveguard-plugin-enforcer-ipset",
  "hiveguard-plugin-enforcer-nftables",
@@ -2862,6 +2864,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hiveguard-plugin-detector-campaign"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hiveguard-core",
+ "hiveguard-plugin-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hiveguard-plugin-detector-distributed-slow"
 version = "0.1.0"
 dependencies = [
@@ -3009,6 +3023,18 @@ dependencies = [
 
 [[package]]
 name = "hiveguard-plugin-detector-timing"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hiveguard-core",
+ "hiveguard-plugin-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hiveguard-plugin-detector-webshell-probe"
 version = "0.1.0"
 dependencies = [
  "chrono",

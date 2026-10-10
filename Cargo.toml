@@ -35,6 +35,8 @@ members = [
     "plugins/detector-port-scan",
     "plugins/detector-distributed-slow",
     "plugins/detector-http-flood",
+    "plugins/detector-campaign",
+    "plugins/detector-webshell-probe",
     "plugins/scoring-default",
     # Phase A1 — log source plugins.
     "plugins/source-file",

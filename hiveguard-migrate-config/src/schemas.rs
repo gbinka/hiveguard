@@ -38,6 +38,8 @@ pub fn schema_for(id: &str) -> Option<&'static str> {
         }
         "detector.smtp_bruteforce" => include_str!("../../plugins/detector-smtp-bruteforce/schema.json"),
         "detector.port_scan" => include_str!("../../plugins/detector-port-scan/schema.json"),
+        "detector.campaign" => include_str!("../../plugins/detector-campaign/schema.json"),
+        "detector.webshell_probe" => include_str!("../../plugins/detector-webshell-probe/schema.json"),
         "detector.distributed_slow" => include_str!("../../plugins/detector-distributed-slow/schema.json"),
         "detector.honeypot" => include_str!("../../plugins/detector-honeypot/schema.json"),
         "detector.entropy" => include_str!("../../plugins/detector-entropy/schema.json"),

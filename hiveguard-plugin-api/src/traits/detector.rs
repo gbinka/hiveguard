@@ -15,4 +15,13 @@ pub trait DetectorPlugin: Plugin {
     /// Inspect `event`. Return `Some(DetectionSignal)` when it crosses the
     /// detector's threshold, otherwise `None`.
     fn process(&self, event: &NormalizedEvent) -> Option<DetectionSignal>;
+
+    /// Like [`DetectorPlugin::process`] but may return several signals for
+    /// one event, possibly for source IPs other than `event.source_ip`
+    /// (cross-IP campaign detectors). The daemon pipeline calls this method;
+    /// the default implementation wraps `process`, so single-signal detectors
+    /// need not override it.
+    fn process_multi(&self, event: &NormalizedEvent) -> Vec<DetectionSignal> {
+        self.process(event).into_iter().collect()
+    }
 }

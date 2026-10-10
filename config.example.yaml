@@ -377,6 +377,37 @@ plugins:
   - id: detector.scanner_fingerprint
     config:
       ban_duration_secs: 259200
+  # Cross-IP login campaign (distributed credential stuffing): one UA hitting
+  # POST /wp-login.php|/xmlrpc.php from many IPs → ban every participant.
+  # All keys optional; see plugins/detector-campaign/README.md.
+  - id: detector.campaign
+    config:
+      window_secs: 1800
+      min_distinct_ips: 20
+      min_requests: 30
+      hot_secs: 21600
+      ban_duration_secs: 86400
+      extra_ignore_user_agents: []    # added to Googlebot, bingbot, Jetpack, WordPress/, UptimeRobot
+      vhost_min_distinct_ips: 0       # >0 also keys by (vhost, endpoint); needs "$host" last in the nginx log
+  # Webshell/backdoor PHP filename probing, status-code independent (works
+  # behind catch-all vhosts). See plugins/detector-webshell-probe/README.md.
+  - id: detector.webshell_probe
+    config:
+      window_secs: 21600
+      min_distinct_paths: 6
+      score_threshold: 12
+      ban_duration_secs: 259200
+      extra_legit_paths: []
+      ignore_vhosts: []
+  # Port scans from source.firewall; the long tier catches hours-long slow scans.
+  - id: detector.port_scan
+    config:
+      window_secs: 600
+      threshold: 6
+      ban_duration_secs: 172800
+      long_window_secs: 21600         # slow-scan tier (detector name port_scan_slow)
+      long_threshold: 25              # 0 disables the tier
+      long_ban_duration_secs: 604800
 
   # ── UI server plugins ───────────────────────────────────────────────────
   # `ui.rest` is the single REST + WebSocket API for HiveGuard (REFACTOR 2.5).

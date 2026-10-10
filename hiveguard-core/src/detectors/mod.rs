@@ -11,6 +11,8 @@ pub mod timing;
 pub mod port_scan;
 pub mod distributed_slow;
 pub mod http_flood;
+pub mod campaign;
+pub mod webshell_probe;
 pub mod factory;
 
 pub use ssh_bruteforce::SshBruteforceDetector;
@@ -25,4 +27,6 @@ pub use timing::TimingDetector;
 pub use port_scan::PortScanDetector;
 pub use distributed_slow::DistributedSlowDetector;
 pub use http_flood::HttpFloodDetector;
+pub use campaign::{CampaignConfig, CampaignDetector};
+pub use webshell_probe::{WebshellProbeConfig, WebshellProbeDetector};
 pub use factory::create_detectors;

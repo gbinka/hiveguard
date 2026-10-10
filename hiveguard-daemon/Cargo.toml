@@ -93,7 +93,7 @@ cti-otx       = ["dep:hiveguard-plugin-cti-otx"]
 cti-geoip     = ["dep:hiveguard-plugin-cti-geoip"]
 
 # --- Detectors ------------------------------------------------------------
-# `detectors-builtin` is a bundle for the 11 default detectors. Individual
+# `detectors-builtin` is a bundle for the default detectors. Individual
 # crates can also be enabled à la carte.
 detectors-builtin = [
     "detector-ssh-bruteforce",
@@ -108,6 +108,8 @@ detectors-builtin = [
     "detector-port-scan",
     "detector-distributed-slow",
     "detector-http-flood",
+    "detector-campaign",
+    "detector-webshell-probe",
 ]
 detector-ssh-bruteforce       = ["dep:hiveguard-plugin-detector-ssh-bruteforce"]
 detector-path-probe           = ["dep:hiveguard-plugin-detector-path-probe"]
@@ -121,6 +123,8 @@ detector-timing               = ["dep:hiveguard-plugin-detector-timing"]
 detector-port-scan            = ["dep:hiveguard-plugin-detector-port-scan"]
 detector-distributed-slow     = ["dep:hiveguard-plugin-detector-distributed-slow"]
 detector-http-flood           = ["dep:hiveguard-plugin-detector-http-flood"]
+detector-campaign             = ["dep:hiveguard-plugin-detector-campaign"]
+detector-webshell-probe       = ["dep:hiveguard-plugin-detector-webshell-probe"]
 detector-sigma                = ["dep:hiveguard-plugin-detector-sigma"]
 
 # --- Scoring engine ------------------------------------------------------
@@ -200,6 +204,8 @@ hiveguard-plugin-detector-timing                = { path = "../plugins/detector-
 hiveguard-plugin-detector-port-scan             = { path = "../plugins/detector-port-scan", optional = true }
 hiveguard-plugin-detector-distributed-slow      = { path = "../plugins/detector-distributed-slow", optional = true }
 hiveguard-plugin-detector-http-flood            = { path = "../plugins/detector-http-flood", optional = true }
+hiveguard-plugin-detector-campaign              = { path = "../plugins/detector-campaign", optional = true }
+hiveguard-plugin-detector-webshell-probe        = { path = "../plugins/detector-webshell-probe", optional = true }
 hiveguard-plugin-detector-sigma                 = { path = "../plugins/detector-sigma", optional = true }
 
 hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default", optional = true }

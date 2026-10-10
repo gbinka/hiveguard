@@ -45,6 +45,10 @@ impl LegacyDetector for DetectorPluginAdapter {
     fn process(&self, event: &NormalizedEvent) -> Option<DetectionSignal> {
         self.0.process(event)
     }
+
+    fn process_multi(&self, event: &NormalizedEvent) -> Vec<DetectionSignal> {
+        self.0.process_multi(event)
+    }
 }
 
 // ---------------------------------------------------------------------------
