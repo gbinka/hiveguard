@@ -23,3 +23,4 @@ pub mod retry;
 pub mod template;
 
 pub mod ssh;
+pub mod nginx;

@@ -680,6 +680,7 @@ struct NginxEvent {
     path: String,
     status_code: u16,
     user_agent: String,
+    vhost: Option<String>,
     raw_line: String,
 }
 
@@ -716,6 +717,7 @@ fn parse_nginx_line(line: &str, pattern: &NginxPattern) -> Option<NginxEvent> {
     let (method, path) = parse_request_line(&captures[3])?;
     let status_code = captures[4].parse().ok()?;
     let user_agent = captures[6].to_string();
+    let vhost = hiveguard_plugin_utils::nginx::trailing_vhost(&line[captures.get(0)?.end()..]);
 
     Some(NginxEvent {
         source_ip,
@@ -724,6 +726,7 @@ fn parse_nginx_line(line: &str, pattern: &NginxPattern) -> Option<NginxEvent> {
         path,
         status_code,
         user_agent,
+        vhost,
         raw_line: line.to_string(),
     })
 }
@@ -746,6 +749,9 @@ fn parse_nginx_normalized(line: &str) -> Option<NormalizedEvent> {
     metadata.insert("method".to_string(), event.method);
     metadata.insert("user_agent".to_string(), event.user_agent);
     metadata.insert("status_code".to_string(), event.status_code.to_string());
+    if let Some(vhost) = event.vhost {
+        metadata.insert("vhost".to_string(), vhost);
+    }
 
     Some(NormalizedEvent {
         timestamp: event.timestamp,
@@ -1173,5 +1179,15 @@ mod tests {
         assert_eq!(event.source_name, "nginx");
         assert_eq!(event.event_type, EventType::Http4xx);
         assert_eq!(event.metadata.get("path").unwrap(), "/wp-login.php");
+        assert!(event.metadata.get("vhost").is_none());
+    }
+
+    #[test]
+    fn parses_trailing_vhost_field() {
+        let line = r#"40.74.77.37 - - [10/Oct/2026:03:43:27 +0000] "GET /file52.php HTTP/1.1" 200 1087 "-" "-" "catchall.example.org""#;
+        let event = parse_nginx_normalized(line).unwrap();
+        assert_eq!(event.metadata.get("vhost").unwrap(), "catchall.example.org");
+        assert_eq!(event.metadata.get("user_agent").unwrap(), "-");
+        assert_eq!(event.event_type, EventType::HttpRequest);
     }
 }

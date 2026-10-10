@@ -39,6 +39,7 @@ pub struct NginxEvent {
     pub path: String,
     pub status_code: u16,
     pub user_agent: String,
+    pub vhost: Option<String>,
     pub raw_line: String,
 }
 
@@ -76,6 +77,7 @@ pub fn parse_nginx_line(line: &str, pattern: &NginxPattern) -> Option<NginxEvent
         path,
         status_code: caps[4].parse().ok()?,
         user_agent: caps[6].to_string(),
+        vhost: hiveguard_plugin_utils::nginx::trailing_vhost(&line[caps.get(0)?.end()..]),
         raw_line: line.to_string(),
     })
 }
@@ -91,6 +93,9 @@ pub fn nginx_event_to_normalized(event: NginxEvent) -> NormalizedEvent {
     metadata.insert("method".to_string(), event.method);
     metadata.insert("user_agent".to_string(), event.user_agent);
     metadata.insert("status_code".to_string(), event.status_code.to_string());
+    if let Some(vhost) = event.vhost {
+        metadata.insert("vhost".to_string(), vhost);
+    }
     NormalizedEvent {
         timestamp: event.timestamp,
         source_ip: event.source_ip,
@@ -165,6 +170,8 @@ mod tests {
     fn nginx_parser_emits_http4xx() {
         let event = parse_nginx_line(r#"203.0.113.9 - - [08/Apr/2026:14:31:11 +0000] "GET /wp-login.php HTTP/1.1" 404 153 "-" "scanner""#, &NginxPattern::new()).unwrap();
         assert_eq!(nginx_event_to_normalized(event).event_type, EventType::Http4xx);
+        let event = parse_nginx_line(r#"9.9.9.9 - - [10/Oct/2026:03:43:27 +0000] "POST /wp-login.php HTTP/1.1" 200 5 "-" "UA" "site-a.example.org""#, &NginxPattern::new()).unwrap();
+        assert_eq!(nginx_event_to_normalized(event).metadata.get("vhost").map(String::as_str), Some("site-a.example.org"));
     }
 
     #[test]

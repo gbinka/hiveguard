@@ -34,3 +34,11 @@ plugins:
 
 All file-backed sources persist offsets under the plugin `data_dir` so they can
 resume after restart.
+
+## nginx event metadata
+
+`source.file.nginx` parses the `combined` format and sets `metadata` keys
+`path`, `method`, `user_agent`, `status_code` and — when the log line ends with
+an extra quoted field such as `"$host"` (e.g. `log_format` `... "$http_user_agent" "$host"`) —
+`vhost` (lower-cased; `-`/empty ignored). `detector.campaign` and
+`detector.webshell_probe` use `vhost` (per-vhost keys, `ignore_vhosts`).
