@@ -33,3 +33,7 @@ config.yaml
 # === Python deployment helper artifacts ===
 __pycache__/
 *.py[cod]
+
+# === Private operator notes (real hosts, users, IPs) — never commit ===
+README.local.md
+*.local.md

@@ -319,6 +319,9 @@ cargo clippy --workspace
   over localhost or a private network.
 - Never commit real config: `config.yaml`, node identity keys, and tokens are
   git-ignored. Only `config.example.yaml` (with placeholders) is tracked.
+- Keep deployment-specific notes (real host names, SSH users, IP addresses) in
+  `README.local.md` at the repository root; it is git-ignored. Tracked files use
+  placeholders such as `node-a.example.org` and documentation/CGNAT addresses.
 
 ### Audit fixes (2026-10-04)
 
