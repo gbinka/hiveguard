@@ -354,6 +354,20 @@ plugins:
       bind_addr: "127.0.0.1:8443"
       auth_token: "CHANGE-ME-to-a-secure-random-string"
 
+# === Agent API (/api/agent/* in ui.rest, see docs/AGENT_API.md) ===
+# Files tailed by source plugins are discovered automatically; this section
+# only adds extra sources and sets scan limits. Older binaries ignore it.
+agent:
+  log_sources:
+    - name: nginx_error
+      path: /var/log/nginx/error.log
+      format: raw                # nginx | ssh | postfix | ufw | syslog | raw
+  journal_units: [hiveguard]    # needs the service user in group systemd-journal
+  max_scan_bytes: 268435456     # per query, read backwards from EOF
+  max_results: 5000
+  journal_timeout_secs: 20
+  include_rotated: true         # also scan <path>.1
+
 # === Persistence ===
 persistence:
   snapshot_interval: "5m"       # How often to write a full snapshot
@@ -602,6 +616,22 @@ curl -H "Authorization: Bearer TOKEN" http://127.0.0.1:8443/api/peers
 #### GET /metrics (no auth required)
 ```bash
 curl http://127.0.0.1:8443/metrics
+```
+
+### Agent API (`/api/agent/*`)
+
+The same plugin and token also serve a read-mostly analysis API for AI agents
+and analysts: `overview`, filtered `bans` / `threats`, `logs/sources`,
+`logs/query`, `logs/stats`, `ip` (cross-source IP profile), `journal`,
+`detectors`, `catalog`, `config/validate` (dry run) and the SSE stream
+`/api/agent/stream`. Full contract: [`AGENT_API.md`](AGENT_API.md).
+An MCP server exposing these endpoints as tools lives in `tools/mcp/`.
+
+```bash
+curl -H "Authorization: Bearer TOKEN" http://127.0.0.1:8443/api/agent/overview
+curl -X POST -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"source":"nginx","since":"24h","group_by":"ip","top":10}' \
+  http://127.0.0.1:8443/api/agent/logs/stats
 ```
 
 ### Rate Limiting

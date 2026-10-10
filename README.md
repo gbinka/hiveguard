@@ -182,6 +182,7 @@ plugins:
 | `enforcement` | Backend: nftables, ipset, or observe-only |
 | `trust`       | Cluster trust scoring and corroboration thresholds |
 | `persistence` | Snapshot interval and WAL sync mode |
+| `agent`       | Agent API: extra log files and journal units it may read, scan limits |
 | `plugins`     | Loaded plugins and their config (sources, detectors, enforcers, UI, etc.) |
 
 ---
@@ -208,7 +209,9 @@ With the `ui.rest` plugin loaded, HiveGuard serves an HTTP + WebSocket API under
 `/api/...` on its configured `bind_addr` (default `127.0.0.1:8443`).
 
 - **Contract:** [`plugins/ui-rest/openapi.yaml`](plugins/ui-rest/openapi.yaml)
-  (OpenAPI 3.1) is the source of truth for every endpoint and payload.
+  (OpenAPI 3.1) is the source of truth for the operator endpoints and payloads;
+  the agent endpoints under `/api/agent/*` are specified in
+  [`docs/AGENT_API.md`](docs/AGENT_API.md).
 - **Auth:** Bearer token (`Authorization: Bearer <auth_token>`). Public
   endpoints: `GET /api/health`, `GET /api/stream` (WebSocket), `GET /metrics`.
 - **Live updates:** WebSocket at `/api/stream`.
@@ -222,6 +225,24 @@ A standalone React web panel is maintained in [`web-panel/`](web-panel/), outsid
 the Rust workspace. It is a pure API client; serve its build output
 through the `ui.rest` `static_dir` option or host it separately and whitelist
 its origin via `cors_origins`.
+
+### Agent API and MCP server
+
+`ui.rest` also serves a read-mostly analysis surface for AI agents and analysts
+under `/api/agent/*` (same bearer token): a one-call `overview`, filtered bans
+and detection signals, query and statistics over the logs the daemon already
+tails (plus allow-listed extra files and journal units from the top-level
+`agent:` section), per-IP profiles, the plugin catalogue, a config dry-run
+validator and a Server-Sent Events stream (`/api/agent/stream`). See
+[`docs/AGENT_API.md`](docs/AGENT_API.md).
+
+[`tools/mcp/`](tools/mcp/) contains a stdio MCP server (Python ≥ 3.10, stdlib
+only) that exposes every agent endpoint as an `hg_*` tool, either against a local
+API or over SSH. Write tools are disabled unless `HG_MCP_ALLOW_WRITE=1`.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/api/agent/overview
+```
 
 ### Selected Prometheus metrics
 
@@ -268,7 +289,10 @@ Core crates:
 | `hiveguard-ui` | Render-agnostic UI library shared by ui-tui and ui-web |
 
 Plugins live under [`plugins/`](plugins/); each is an independent crate with its
-own `schema.json` and `README.md`.
+own `schema.json` and `README.md`. Outside the Rust workspace:
+[`web-panel/`](web-panel/) (React panel), [`tools/mcp/`](tools/mcp/) (MCP server
+for the Agent API) and [`scripts/upgrade/`](scripts/upgrade/) (guarded upgrade
+packages).
 
 ---
 
@@ -278,6 +302,10 @@ own `schema.json` and `README.md`.
 cargo build --release -p hiveguard-daemon
 cargo test --workspace
 cargo clippy --workspace
+
+# Python helpers (stdlib unittest)
+(cd scripts/upgrade && python3 -m unittest discover)
+(cd tools/mcp && python3 -m unittest discover tests)
 ```
 
 ---
