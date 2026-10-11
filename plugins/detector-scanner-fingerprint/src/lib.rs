@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use hiveguard_core::Detector;
+use hiveguard_core::detectors::netkey::{validate_ipv6_prefix, DEFAULT_IPV6_PREFIX};
+use hiveguard_core::detectors::scanner_fingerprint::default_scanner_signatures;
 use hiveguard_core::detectors::ScannerFingerprintDetector;
 use hiveguard_core::models::{EventType, NormalizedEvent};
 use hiveguard_plugin_api::prelude::*;
@@ -14,7 +16,13 @@ pub const PLUGIN_VERSION: &str = "0.1.0";
 #[derive(Debug, Deserialize, Default)]
 struct Config {
     scanners: Option<Vec<String>>,
+    /// Appended to `scanners` (or to the defaults) — lets a config add
+    /// signatures without copying the default list.
+    #[serde(default)]
+    extra_scanners: Vec<String>,
     ban_duration_secs: Option<u64>,
+    /// IPv6 ban prefix (default 64; 0/128 = per address).
+    ipv6_prefix: Option<u8>,
 }
 
 pub struct ScannerFingerprintPlugin {
@@ -50,15 +58,11 @@ impl ScannerFingerprintPlugin {
     }
 
     fn from_config(cfg: Config) -> ScannerFingerprintDetector {
-        let scanners = cfg.scanners.unwrap_or_else(|| {
-            vec![
-                "nikto".into(), "sqlmap".into(), "nuclei".into(), "nessus".into(),
-                "openvas".into(), "w3af".into(), "skipfish".into(), "wpscan".into(),
-                "dirbuster".into(), "gobuster".into(), "masscan".into(), "zgrab".into(),
-            ]
-        });
+        let mut scanners = cfg.scanners.unwrap_or_else(default_scanner_signatures);
+        scanners.extend(cfg.extra_scanners);
         let ban_duration = Duration::from_secs(cfg.ban_duration_secs.unwrap_or(259_200));
         ScannerFingerprintDetector::with_config(scanners, ban_duration)
+            .with_ipv6_prefix(cfg.ipv6_prefix.unwrap_or(DEFAULT_IPV6_PREFIX))
     }
 }
 
@@ -71,6 +75,8 @@ impl Plugin for ScannerFingerprintPlugin {
     async fn init(&mut self, cfg: serde_json::Value) -> PluginResult<()> {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        validate_ipv6_prefix("ipv6_prefix", cfg.ipv6_prefix.unwrap_or(DEFAULT_IPV6_PREFIX))
+            .map_err(PluginError::ConfigValidation)?;
         self.detector = Self::from_config(cfg);
         Ok(())
     }
@@ -160,5 +166,44 @@ mod tests {
             .await
             .unwrap();
         assert!(p.process(&unrelated_event()).is_none());
+    }
+
+    fn ua_event(ip: &str, ua: &str) -> NormalizedEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert("path".to_string(), "/".to_string());
+        metadata.insert("user_agent".to_string(), ua.to_string());
+        NormalizedEvent {
+            timestamp: Utc::now(),
+            source_ip: ip.parse().unwrap(),
+            event_type: EventType::HttpRequest,
+            source_name: "nginx".into(),
+            raw_line: String::new(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_scanners_extend_an_overridden_list() {
+        let p = ScannerFingerprintPlugin::create(
+            test_ctx(),
+            serde_json::json!({ "scanners": ["nikto"], "extra_scanners": ["L9Scan"], "ipv6_prefix": 128 }),
+        )
+        .await
+        .unwrap();
+        assert!(p.process(&ua_event("100.64.0.1", "Nikto/2.5")).is_some());
+        assert!(p.process(&ua_event("100.64.0.1", "l9scan/2.0")).is_some());
+        assert!(p.process(&ua_event("100.64.0.1", "wp2shell")).is_none(), "override drops defaults");
+        let s = p.process(&ua_event("2001:db8::5", "nikto")).unwrap();
+        assert_eq!(s.source_ip.prefix_len(), 128);
+    }
+
+    #[tokio::test]
+    async fn defaults_include_new_signatures() {
+        let p = ScannerFingerprintPlugin::create(test_ctx(), serde_json::json!({})).await.unwrap();
+        assert!(p.process(&ua_event("100.64.0.1", "wp2shell/1.0")).is_some());
+        assert!(p.process(&ua_event("100.64.0.1", "${jndi:ldap://x}")).is_some());
+        assert!(ScannerFingerprintPlugin::create(test_ctx(), serde_json::json!({"ipv6_prefix": 20}))
+            .await
+            .is_err());
     }
 }

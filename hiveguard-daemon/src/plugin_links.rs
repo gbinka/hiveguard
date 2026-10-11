@@ -74,6 +74,8 @@ extern crate hiveguard_plugin_cti_tor as _;
 // --- Detectors -----------------------------------------------------------
 #[cfg(feature = "detector-campaign")]
 extern crate hiveguard_plugin_detector_campaign as _;
+#[cfg(feature = "detector-distributed-crawl")]
+extern crate hiveguard_plugin_detector_distributed_crawl as _;
 #[cfg(feature = "detector-distributed-slow")]
 extern crate hiveguard_plugin_detector_distributed_slow as _;
 #[cfg(feature = "detector-entropy")]

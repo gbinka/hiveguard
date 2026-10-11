@@ -15,6 +15,10 @@ struct Config {
     set_name: String,
     #[serde(default = "default_batch_interval")]
     batch_interval_secs: u64,
+    /// Also drop banned sources on a `prerouting` hook chain (priority -300),
+    /// covering DNAT-ed traffic such as Docker published ports. Default off.
+    #[serde(default)]
+    prerouting_hook: bool,
 }
 
 fn default_batch_interval() -> u64 {
@@ -73,11 +77,14 @@ impl Plugin for NftablesPlugin {
         let parsed: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
 
-        self.inner = Some(NftablesEnforcer::new(
-            parsed.table,
-            parsed.set_name,
-            Duration::from_secs(parsed.batch_interval_secs),
-        ));
+        self.inner = Some(
+            NftablesEnforcer::new(
+                parsed.table,
+                parsed.set_name,
+                Duration::from_secs(parsed.batch_interval_secs),
+            )
+            .with_prerouting_hook(parsed.prerouting_hook),
+        );
         Ok(())
     }
 }
@@ -152,6 +159,32 @@ mod tests {
             "batch_interval_secs": 1
         });
         let _plugin = NftablesPlugin::create(test_ctx(), cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prerouting_hook_defaults_off_and_can_be_enabled() {
+        let mut plugin = NftablesPlugin {
+            manifest: NftablesPlugin::manifest_fn(),
+            inner: None,
+        };
+        let base = serde_json::json!({"table": "hiveguard", "set_name": "hiveguard_blocklist"});
+        plugin.init(base.clone()).await.unwrap();
+        assert!(!plugin.inner_ref().unwrap().prerouting_hook());
+        let mut enabled = base;
+        enabled["prerouting_hook"] = serde_json::json!(true);
+        plugin.init(enabled).await.unwrap();
+        assert!(plugin.inner_ref().unwrap().prerouting_hook());
+    }
+
+    #[test]
+    fn schema_accepts_prerouting_hook_boolean_only() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schema.json")).unwrap();
+        assert_eq!(
+            schema["properties"]["prerouting_hook"]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 
     #[tokio::test]

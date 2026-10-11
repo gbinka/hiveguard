@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -16,6 +17,7 @@ use tokio::sync::broadcast;
 use hiveguard_core::config::{HiveGuardConfig, PluginConfigEntry};
 use hiveguard_core::models::{BanRecord, BanSource};
 use hiveguard_plugin_api::registry::{find_descriptor, iter_descriptors};
+use hiveguard_plugin_api::secrets::Placeholder;
 use hiveguard_plugin_api::{plugin_kind_name, AgentEvent, BanInfo, PluginError, ThreatInfo};
 
 use crate::agent_logs::{parse_time_spec, AgentError, LogEngine};
@@ -85,7 +87,15 @@ pub fn to_plugin_error(e: AgentError) -> PluginError {
         AgentError::BadRequest(m) => PluginError::ConfigValidation(m),
         AgentError::NotFound(m) => PluginError::NotFound(m),
         AgentError::Unavailable(m) | AgentError::Internal(m) => PluginError::Runtime(m),
+        AgentError::Busy(m) => PluginError::Busy(m),
     }
+}
+
+/// Sanitise an agent response built from log/event data and mark it as
+/// untrusted (`data_trust`, per-element `instruction_like`). See
+/// `hiveguard_plugin_api::sanitize`.
+pub fn finalize_untrusted(v: Value) -> Value {
+    hiveguard_plugin_api::sanitize::finalize_untrusted_response(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +619,7 @@ pub fn detectors_view(entries: &[PluginConfigEntry], metrics_text: Option<&str>)
                 "version": manifest.as_ref().map(|m| m.version),
                 "linked": desc.is_some(),
                 "optional": e.optional,
-                "config": e.config,
+                "config": redacted_json(&e.config),
                 "schema": desc.map(|d| Value::Object(schema_summary(d.config_schema))).unwrap_or(json!({})),
                 "signals_total": signals.get(&e.id).cloned().unwrap_or(json!(0)),
                 "bans_total": bans.get(core).cloned().unwrap_or(json!(0)),
@@ -618,7 +628,7 @@ pub fn detectors_view(entries: &[PluginConfigEntry], metrics_text: Option<&str>)
             // The daemon uses the LAST scoring entry.
             scoring = json!({
                 "id": e.id,
-                "config": e.config,
+                "config": redacted_json(&e.config),
                 "schema": desc.map(|d| Value::Object(schema_summary(d.config_schema))).unwrap_or(json!({})),
             });
         }
@@ -678,7 +688,7 @@ pub fn catalog_view(entries: &[PluginConfigEntry], kind: Option<&str>) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// Config validation (dry run)
+// Config validation (dry run) + secret handling for GET/PUT /api/config
 // ---------------------------------------------------------------------------
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
@@ -687,15 +697,342 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 ];
 const LEGACY_SECTIONS: &[&str] = &["sources", "detectors", "enforcement", "scoring"];
 const PLUGIN_ENTRY_KEYS: &[&str] = &["id", "name", "config", "optional"];
+const AGENT_KEYS: &[&str] = &[
+    "log_sources", "journal_units", "max_scan_bytes", "max_results", "journal_timeout_secs",
+    "include_rotated", "read_token_file", "max_concurrent_scans", "max_streams",
+];
 
-/// `POST /api/agent/config/validate` (§3.11). Never writes anything.
+/// Marker that replaces secret values in `GET /api/config`. A `PUT` carrying
+/// it is refused (it would overwrite the real secret with the marker).
+pub const REDACTED: &str = "<redacted>";
+
+/// Directories `${file:…}` placeholders may point into when a config is
+/// written through `PUT /api/config`.
+pub const ALLOWED_SECRET_FILE_DIRS: &[&str] = &["/etc/hiveguard", "/run/credentials"];
+
+/// Config keys (case-insensitive) whose values are secrets.
+const SECRET_KEYS: &[&str] = &[
+    "auth_token", "token", "password", "passwd", "secret", "api_key", "apikey", "access_token",
+    "refresh_token", "client_secret", "private_key", "secret_key", "bearer_token", "bot_token",
+    "webhook_secret", "routing_key", "integration_key", "license_key", "hmac_key", "shared_secret",
+    "sasl_password",
+];
+/// Key suffixes that mark a secret (`*_token`, `*_key`, `*_secret`, `*_password`).
+const SECRET_SUFFIXES: &[&str] = &["_token", "_key", "_secret", "_password"];
+
+/// `true` for config keys whose values must not be shown (`auth_token`,
+/// `token`, `password`, `*_key` …). Keys naming a *file* that holds the
+/// secret (`read_token_file`, `credentials_file`) are not secrets.
+pub fn is_secret_key(key: &str) -> bool {
+    let k = key.trim().to_ascii_lowercase();
+    SECRET_KEYS.contains(&k.as_str()) || SECRET_SUFFIXES.iter().any(|s| k.ends_with(s))
+}
+
+/// A value that is (only) a `${…}` placeholder is a reference, not a secret.
+fn is_placeholder_value(v: &str) -> bool {
+    let v = v.trim();
+    v.starts_with("${") && v.ends_with('}')
+}
+
+/// Replace secret values in a JSON config fragment (plugin `config:` blocks).
+pub fn redacted_json(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, val)| {
+                    let out = match val {
+                        Value::String(s) if is_secret_key(k) && !s.is_empty() && !is_placeholder_value(s) => {
+                            Value::String(REDACTED.into())
+                        }
+                        Value::Number(_) if is_secret_key(k) => Value::String(REDACTED.into()),
+                        other => redacted_json(other),
+                    };
+                    (k.clone(), out)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(redacted_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Split `key: value  # comment` after the key. Returns (value, rest-after-value).
+fn split_scalar(after_colon: &str) -> (&str, &str) {
+    let t = after_colon;
+    let bytes = t.as_bytes();
+    match bytes.first() {
+        Some(b'"') => {
+            let mut i = 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => return (&t[..=i], &t[i + 1..]),
+                    _ => i += 1,
+                }
+            }
+            (t, "")
+        }
+        Some(b'\'') => {
+            let mut i = 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    return (&t[..=i], &t[i + 1..]);
+                }
+                i += 1;
+            }
+            (t, "")
+        }
+        _ => {
+            // Plain scalar: ends at ` #` (comment) or end of line.
+            let end = t.find(" #").or_else(|| t.find("\t#")).unwrap_or(t.len());
+            let v = t[..end].trim_end();
+            (v, &t[v.len()..])
+        }
+    }
+}
+
+/// Parse a block-style `[- ]key: rest` line. Returns (indent, key, rest).
+fn yaml_key_line(line: &str) -> Option<(usize, &str, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let mut t = &line[indent..];
+    let mut item_indent = indent;
+    while let Some(after) = t.strip_prefix("- ") {
+        let trimmed = after.trim_start_matches(' ');
+        item_indent += t.len() - trimmed.len();
+        t = trimmed;
+    }
+    if t.starts_with('#') {
+        return None;
+    }
+    let (key, after_key) = if let Some(q) = t.strip_prefix('"') {
+        let end = q.find('"')?;
+        (&q[..end], &q[end + 1..])
+    } else if let Some(q) = t.strip_prefix('\'') {
+        let end = q.find('\'')?;
+        (&q[..end], &q[end + 1..])
+    } else {
+        let end = t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))?;
+        (&t[..end], &t[end..])
+    };
+    if key.is_empty() {
+        return None;
+    }
+    let rest = after_key.trim_start_matches([' ', '\t']).strip_prefix(':')?;
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    Some((item_indent, key, rest))
+}
+
+fn flow_secret_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r#"(?P<pre>[{,]\s*["']?)(?P<key>[A-Za-z0-9_.-]+)(?P<mid>["']?\s*:\s*)(?P<val>"(?:[^"\\]|\\.)*"|'[^']*'|[^,}\s][^,}]*)"#)
+            .expect("static regex")
+    })
+}
+
+/// Redact secret values in a YAML document **line by line**, keeping
+/// everything else byte-for-byte (comments, indentation, `plugins:` at
+/// column 0, key order). Handles `key: value`, quoted values, trailing
+/// comments, list items (`- token: x`), block scalars (`key: |` + indented
+/// lines), a plain scalar on the next line, and flow mappings
+/// (`{token: x}`). Values that are only a `${env:…}`/`${file:…}`
+/// placeholder, empty strings and `null` are kept.
+pub fn redact_config_text(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    // Some(indent): drop continuation lines indented deeper than `indent`.
+    let mut skip_deeper_than: Option<usize> = None;
+    // Some(indent): secret key with an empty value; inspect the next line.
+    let mut pending: Option<usize> = None;
+    for raw in content.split_inclusive('\n') {
+        let (line, eol) = match raw.strip_suffix('\n') {
+            Some(l) => match l.strip_suffix('\r') {
+                Some(l2) => (l2, "\r\n"),
+                None => (l, "\n"),
+            },
+            None => (raw, ""),
+        };
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let blank = line.trim().is_empty();
+
+        if let Some(base) = skip_deeper_than {
+            if blank || indent > base {
+                continue; // drop secret block-scalar continuation
+            }
+            skip_deeper_than = None;
+        }
+        if let Some(base) = pending.take() {
+            if !blank && indent > base && !line.trim_start().starts_with('#') {
+                let trimmed = line.trim_start();
+                if yaml_key_line(line).is_none() && !trimmed.starts_with("- ") && trimmed != "-" {
+                    // Plain/quoted scalar continuing the secret on the next line.
+                    out.push_str(&line[..indent]);
+                    out.push('"');
+                    out.push_str(REDACTED);
+                    out.push('"');
+                    out.push_str(eol);
+                    skip_deeper_than = Some(base);
+                    continue;
+                }
+            } else if blank {
+                pending = Some(base);
+            }
+        }
+
+        let mut redacted_line: Option<String> = None;
+        if let Some((key_indent, key, rest)) = yaml_key_line(line) {
+            if is_secret_key(key) {
+                let after = rest.trim_start_matches([' ', '\t']);
+                let lead = &rest[..rest.len() - after.len()];
+                let head = &line[..line.len() - rest.len()];
+                if after.is_empty() || after.starts_with('#') {
+                    pending = Some(key_indent);
+                } else if after.starts_with('|') || after.starts_with('>') {
+                    let (_, tail) = split_scalar(after);
+                    redacted_line = Some(format!("{head}{lead}\"{REDACTED}\"{tail}"));
+                    skip_deeper_than = Some(key_indent);
+                } else {
+                    let (value, tail) = split_scalar(after);
+                    let unquoted = value.trim_matches(['"', '\'']);
+                    let keep = unquoted.is_empty()
+                        || is_placeholder_value(unquoted)
+                        || matches!(value, "~" | "null" | "Null" | "NULL");
+                    if !keep {
+                        redacted_line = Some(format!("{head}{lead}\"{REDACTED}\"{tail}"));
+                    }
+                }
+            }
+        }
+        let line_out = redacted_line.unwrap_or_else(|| line.to_string());
+        // Flow mappings on the same line: `{enabled: true, token: abc}`.
+        let line_out = if line_out.contains('{') {
+            flow_secret_regex()
+                .replace_all(&line_out, |c: &regex::Captures| {
+                    let val = &c["val"];
+                    let unq = val.trim().trim_matches(['"', '\'']);
+                    if is_secret_key(&c["key"]) && !unq.is_empty() && !is_placeholder_value(unq) && unq != REDACTED {
+                        format!("{}{}{}\"{REDACTED}\"", &c["pre"], &c["key"], &c["mid"])
+                    } else {
+                        c[0].to_string()
+                    }
+                })
+                .into_owned()
+        } else {
+            line_out
+        };
+        out.push_str(&line_out);
+        out.push_str(eol);
+    }
+    out
+}
+
+/// `true` when `path` is absolute, has no `..` and lies under one of
+/// [`ALLOWED_SECRET_FILE_DIRS`].
+pub fn secret_file_allowed(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        && ALLOWED_SECRET_FILE_DIRS.iter().any(|d| path.starts_with(d))
+}
+
+/// Outcome of the placeholder policy check for one config.
+#[derive(Debug, Default)]
+pub struct PlaceholderReport {
+    /// Problems that make `PUT /api/config` refuse the document.
+    pub put_errors: Vec<String>,
+}
+
+/// Policy for `${…}` placeholders found by `Loader::check_unresolved`:
+/// `${file:}` only under [`ALLOWED_SECRET_FILE_DIRS`] and existing;
+/// `${env:}` set in the daemon's environment. Never reads a file or an env
+/// value — only existence is checked, and only inside the allowed dirs.
+pub fn placeholder_policy(found: &[(String, String, Placeholder)]) -> PlaceholderReport {
+    let mut r = PlaceholderReport::default();
+    for (id, ptr, p) in found {
+        let at = if ptr.is_empty() { "/".to_string() } else { ptr.clone() };
+        match p {
+            Placeholder::File(path) => {
+                if !secret_file_allowed(path) {
+                    r.put_errors.push(format!(
+                        "plugin `{id}` config {at}: `${{file:{}}}` must point under {} (PUT /api/config refuses other paths)",
+                        path.display(),
+                        ALLOWED_SECRET_FILE_DIRS.join("/ or ")
+                    ));
+                } else if !path.is_file() {
+                    r.put_errors.push(format!(
+                        "plugin `{id}` config {at}: `${{file:{}}}` does not exist",
+                        path.display()
+                    ));
+                }
+            }
+            Placeholder::Env(name) => {
+                if std::env::var_os(name).is_none() {
+                    r.put_errors.push(format!(
+                        "plugin `{id}` config {at}: `${{env:{name}}}` is not set in the daemon environment"
+                    ));
+                }
+            }
+        }
+    }
+    r
+}
+
+/// Error for content carrying the redaction marker.
+pub fn redacted_marker_error() -> String {
+    format!(
+        "content contains `{REDACTED}` — GET /api/config hides secrets; put the real value back, \
+         or better reference it as `${{file:/etc/hiveguard/<name>}}` / `${{env:NAME}}`"
+    )
+}
+
+/// Structural + plugin validation shared by `validate_config` and
+/// `PUT /api/config`, **without resolving any secret**. Returns the parsed
+/// config and the placeholders found, or the list of errors.
+pub fn check_config_document(
+    content: &str,
+) -> Result<(HiveGuardConfig, Vec<(String, String, Placeholder)>), Vec<String>> {
+    let cfg: HiveGuardConfig =
+        serde_yaml::from_str(content).map_err(|e| vec![format!("config parse error: {e}")])?;
+    let mut errors = Vec::new();
+    if let Err(e) = cfg.validate() {
+        errors.push(format!("validation: {e}"));
+    }
+    let loader = hiveguard_host::Loader::resolve_only(Arc::new(
+        hiveguard_plugin_api::secrets::SecretResolver::new(),
+    ));
+    let found = match loader.check_unresolved(&crate::plugin_bridge::to_loader_config(&cfg)) {
+        Ok(f) => f,
+        Err(e) => {
+            errors.push(format!("plugin resolution: {e}"));
+            Vec::new()
+        }
+    };
+    if errors.is_empty() {
+        Ok((cfg, found))
+    } else {
+        Err(errors)
+    }
+}
+
+/// `POST /api/agent/config/validate` (§3.11). Never writes anything and
+/// never resolves `${file:…}` / `${env:…}` (placeholders are checked for
+/// syntax; schema rules are not applied to placeholder-valued fields).
 pub fn validate_config(content: &str) -> Value {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut plugin_ids: Vec<String> = Vec::new();
 
+    if content.contains(REDACTED) {
+        errors.push(redacted_marker_error());
+    }
+
     // Structural warnings from the raw document (the typed parse ignores
     // unknown top-level keys silently — exactly what bites operators).
+    let mut structural_ok = true;
     match serde_yaml::from_str::<serde_yaml::Value>(content) {
         Ok(serde_yaml::Value::Mapping(map)) => {
             for (k, v) in &map {
@@ -706,6 +1043,17 @@ pub fn validate_config(content: &str) -> Value {
                     warnings.push(format!(
                         "legacy section `{key}` is validated but NOT used at runtime (runtime behaviour comes from `plugins:`)"
                     ));
+                }
+                if key == "agent" {
+                    if let serde_yaml::Value::Mapping(m) = v {
+                        for (ak, _) in m {
+                            if let Some(ak) = ak.as_str() {
+                                if !AGENT_KEYS.contains(&ak) {
+                                    warnings.push(format!("unknown key `agent.{ak}` is silently ignored by the daemon"));
+                                }
+                            }
+                        }
+                    }
                 }
                 if key == "plugins" {
                     if let serde_yaml::Value::Sequence(items) = v {
@@ -730,17 +1078,20 @@ pub fn validate_config(content: &str) -> Value {
                 }
             }
         }
-        Ok(_) => errors.push("document root must be a mapping".into()),
-        Err(e) => errors.push(format!("YAML parse error: {e}")),
+        Ok(_) => {
+            structural_ok = false;
+            errors.push("document root must be a mapping".into());
+        }
+        Err(e) => {
+            structural_ok = false;
+            errors.push(format!("YAML parse error: {e}"));
+        }
     }
 
-    if errors.is_empty() {
+    if structural_ok {
         match serde_yaml::from_str::<HiveGuardConfig>(content) {
             Err(e) => errors.push(format!("config parse error: {e}")),
             Ok(cfg) => {
-                if let Err(e) = cfg.validate() {
-                    errors.push(format!("validation: {e}"));
-                }
                 plugin_ids = cfg.plugins.iter().map(|p| p.id.clone()).collect();
                 let has = |prefix: &str| cfg.plugins.iter().any(|p| p.id.starts_with(prefix));
                 if cfg.plugins.is_empty() {
@@ -771,11 +1122,20 @@ pub fn validate_config(content: &str) -> Value {
                         }
                     }
                 }
-                let loader = hiveguard_host::Loader::resolve_only(Arc::new(
-                    hiveguard_plugin_api::secrets::SecretResolver::new(),
-                ));
-                if let Err(e) = loader.resolve(&crate::plugin_bridge::to_loader_config(&cfg)) {
-                    errors.push(format!("plugin resolution: {e}"));
+                agent_warnings(&cfg, &mut warnings);
+                match check_config_document(content) {
+                    Ok((_, found)) => {
+                        // Placeholder problems only matter for PUT (a config
+                        // deployed by hand may use other paths) → warnings.
+                        warnings.extend(placeholder_policy(&found).put_errors);
+                    }
+                    Err(list) => {
+                        for e in list {
+                            if !errors.contains(&e) && !e.contains("not linked into this binary") {
+                                errors.push(e);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -787,6 +1147,39 @@ pub fn validate_config(content: &str) -> Value {
         "warnings": warnings,
         "plugins": plugin_ids,
     })
+}
+
+/// Warnings about the `agent:` section (read-only token, limits).
+fn agent_warnings(cfg: &HiveGuardConfig, warnings: &mut Vec<String>) {
+    let a = &cfg.agent;
+    match &a.read_token_file {
+        None => warnings.push(
+            "agent.read_token_file is not set — AI agents can only use the admin token (full write access); \
+             give them a read-only token file instead"
+                .into(),
+        ),
+        Some(p) if !secret_file_allowed(p) => warnings.push(format!(
+            "agent.read_token_file `{}` should live under /etc/hiveguard/ (mode 0640)",
+            p.display()
+        )),
+        Some(p) => match std::fs::metadata(p) {
+            Err(_) => warnings.push(format!(
+                "agent.read_token_file `{}` does not exist or is not readable — the read-only token will be disabled",
+                p.display()
+            )),
+            Ok(m) if m.len() == 0 => warnings.push(format!(
+                "agent.read_token_file `{}` is empty — the read-only token will be disabled",
+                p.display()
+            )),
+            Ok(_) => {}
+        },
+    }
+    if a.max_concurrent_scans == 0 {
+        warnings.push("agent.max_concurrent_scans: 0 is treated as 1".into());
+    }
+    if a.max_streams == 0 {
+        warnings.push("agent.max_streams: 0 is treated as 1".into());
+    }
 }
 
 #[cfg(test)]
@@ -1004,6 +1397,156 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("unknown top-level key `detectorss`")), "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("`enabled` is ignored")), "{warnings:?}");
         assert_eq!(v["plugins"][0], "enforcer.observe");
+    }
+
+    // Lib unit tests do not include `plugin_links.rs` (binary only): link the
+    // plugins the validation tests need so their descriptors are registered.
+    #[cfg(feature = "detector-ssh-bruteforce")]
+    extern crate hiveguard_plugin_detector_ssh_bruteforce as _;
+    #[cfg(feature = "enforcer-observe")]
+    extern crate hiveguard_plugin_enforcer_observe as _;
+    #[cfg(feature = "scoring-default")]
+    extern crate hiveguard_plugin_scoring_default as _;
+
+    const BASE_CFG: &str = "node:\n  name: t\n  data_dir: /tmp/hg-validate-test\nplugins:\n  - id: enforcer.observe\n  - id: scoring.default\n";
+
+    #[test]
+    #[cfg(all(feature = "detector-ssh-bruteforce", feature = "enforcer-observe", feature = "scoring-default"))]
+    fn validate_never_expands_file_placeholders() {
+        // Regression (security review 2026-10-11): `${file:…}` in an integer
+        // field used to be resolved and the schema error quoted the content.
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret.txt");
+        std::fs::write(&secret_path, "node-a-TOP-SECRET-CONTENT\n").unwrap();
+        let mut paths = vec![secret_path.display().to_string()];
+        let hostname = std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_string());
+        if hostname.as_deref().is_some_and(|h| h.len() >= 4) {
+            paths.push("/etc/hostname".into());
+        }
+        for path in paths {
+            for field in ["window_secs: \"${file:PATH}\"", "threshold: \"x${file:PATH}\""] {
+                let yaml = format!(
+                    "{BASE_CFG}  - id: detector.ssh_bruteforce\n    config:\n      {}\n",
+                    field.replace("PATH", &path)
+                );
+                let v = validate_config(&yaml);
+                let text = v.to_string();
+                assert!(!text.contains("TOP-SECRET"), "{text}");
+                if path == "/etc/hostname" {
+                    assert!(!text.contains(hostname.as_deref().unwrap()), "{text}");
+                }
+                assert_eq!(v["valid"], true, "{text}");
+                // Outside /etc/hiveguard → PUT would refuse: reported as a warning.
+                assert!(text.contains("must point under /etc/hiveguard"), "{text}");
+            }
+        }
+        // Without a placeholder the type error is reported (field + rule only).
+        let yaml = format!("{BASE_CFG}  - id: detector.ssh_bruteforce\n    config:\n      window_secs: \"abc\"\n");
+        let v = validate_config(&yaml);
+        assert_eq!(v["valid"], false);
+        assert!(v["errors"].to_string().contains("/window_secs: expected integer"), "{v}");
+        // Bad placeholder syntax is an error.
+        let yaml = format!("{BASE_CFG}  - id: detector.ssh_bruteforce\n    config:\n      window_secs: \"${{vault:x}}\"\n");
+        let v = validate_config(&yaml);
+        assert_eq!(v["valid"], false, "{v}");
+        assert!(v["errors"].to_string().contains("unknown placeholder"), "{v}");
+    }
+
+    #[test]
+    fn validate_rejects_redacted_marker_and_warns_about_agent_keys() {
+        let yaml = format!("{BASE_CFG}agent:\n  read_token_fil: /etc/hiveguard/agent-token\n  max_streams: 0\nauth: \"<redacted>\"\n");
+        let v = validate_config(&yaml);
+        assert_eq!(v["valid"], false);
+        assert!(v["errors"][0].as_str().unwrap().contains("<redacted>"), "{v}");
+        let w = v["warnings"].to_string();
+        assert!(w.contains("unknown key `agent.read_token_fil`"), "{w}");
+        assert!(w.contains("agent.read_token_file is not set"), "{w}");
+        assert!(w.contains("agent.max_streams: 0"), "{w}");
+    }
+
+    #[test]
+    fn redaction_keeps_layout_and_placeholders() {
+        let cfg = "\
+# HiveGuard production config
+node:
+  name: node-a
+plugins:
+- id: ui.rest
+  config:
+    bind_addr: 127.0.0.1:8443
+    auth_token: \"s3cr3t-admin\"   # admin token
+    ingest: {enabled: true, token: inl1ne-T0K, parser: auto}
+- id: notifier.webhook
+  config:
+    url: https://example.org/hook
+    password: ${env:HG_PW}
+    api_key: 'k''ey-123'
+    webhook_secret: plainvalue
+    empty_token: \"\"
+    private_key: |
+      -----BEGIN KEY-----
+      AAAABBBB
+    after: kept
+    routing_key:
+      deep-secret-on-next-line
+    oauth:
+      client_secret: cs-999
+agent:
+  read_token_file: /etc/hiveguard/agent-token
+  max_streams: 4
+";
+        let out = redact_config_text(cfg);
+        for secret in ["s3cr3t-admin", "inl1ne-T0K", "k''ey-123", "plainvalue", "AAAABBBB", "BEGIN KEY", "deep-secret-on-next-line", "cs-999"] {
+            assert!(!out.contains(secret), "{secret} leaked:\n{out}");
+        }
+        assert!(out.contains("    auth_token: \"<redacted>\"   # admin token\n"), "{out}");
+        assert!(out.contains("ingest: {enabled: true, token: \"<redacted>\", parser: auto}"), "{out}");
+        assert!(out.contains("password: ${env:HG_PW}\n"), "{out}");
+        assert!(out.contains("empty_token: \"\"\n"), "{out}");
+        assert!(out.contains("    private_key: \"<redacted>\"\n    after: kept\n"), "{out}");
+        assert!(out.contains("read_token_file: /etc/hiveguard/agent-token"), "{out}");
+        assert!(out.starts_with("# HiveGuard production config\nnode:\n"), "{out}");
+        assert!(out.contains("\nplugins:\n- id: ui.rest\n"), "{out}");
+        assert!(out.contains("url: https://example.org/hook"), "{out}");
+        // The redacted document is still valid YAML.
+        serde_yaml::from_str::<serde_yaml::Value>(&out).unwrap();
+        // Idempotent.
+        assert_eq!(redact_config_text(&out), out);
+        // JSON plugin configs (detectors view).
+        let j = redacted_json(&json!({"token": "x", "api_key": "${file:/etc/hiveguard/k}", "nested": {"secret": "y"}, "window_secs": 5}));
+        assert_eq!(j, json!({"token": "<redacted>", "api_key": "${file:/etc/hiveguard/k}", "nested": {"secret": "<redacted>"}, "window_secs": 5}));
+    }
+
+    #[test]
+    fn secret_key_classification() {
+        for k in ["auth_token", "TOKEN", "password", "api_key", "license_key", "client_secret", "sasl_password", "bot_token"] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        for k in ["read_token_file", "credentials_file", "token_file", "key", "path", "bind_addr", "max_streams", "keys"] {
+            assert!(!is_secret_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "detector-ssh-bruteforce", feature = "enforcer-observe", feature = "scoring-default"))]
+    fn put_placeholder_policy() {
+        assert!(secret_file_allowed(Path::new("/etc/hiveguard/agent-token")));
+        assert!(secret_file_allowed(Path::new("/run/credentials/hiveguard.service/token")));
+        assert!(!secret_file_allowed(Path::new("/etc/hiveguard/../shadow")));
+        assert!(!secret_file_allowed(Path::new("/etc/hostname")));
+        assert!(!secret_file_allowed(Path::new("/etc/hiveguardx/t")));
+        let found = vec![
+            ("p".to_string(), "/a".to_string(), Placeholder::File("/etc/passwd".into())),
+            ("p".to_string(), "/b".to_string(), Placeholder::File("/etc/hiveguard/does-not-exist-xyz".into())),
+            ("p".to_string(), "/c".to_string(), Placeholder::Env("HG_SURELY_UNSET_VAR_123".into())),
+        ];
+        let r = placeholder_policy(&found);
+        assert_eq!(r.put_errors.len(), 3, "{:?}", r.put_errors);
+        assert!(r.put_errors[0].contains("must point under"));
+        assert!(r.put_errors[1].contains("does not exist"));
+        assert!(r.put_errors[2].contains("not set"));
+        let ok = check_config_document(BASE_CFG);
+        assert!(ok.is_ok(), "{:?}", ok.err());
     }
 
     #[test]

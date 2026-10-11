@@ -118,9 +118,86 @@ impl SecretResolver {
     }
 }
 
+/// One `${…}` placeholder found in a config string (not resolved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placeholder {
+    /// `${env:NAME}`
+    Env(String),
+    /// `${file:/abs/path}`
+    File(PathBuf),
+}
+
+/// `true` when `input` contains a `${` placeholder opener.
+pub fn contains_placeholder(input: &str) -> bool {
+    input.contains("${")
+}
+
+/// Parse (but never resolve) every `${…}` placeholder in `input`.
+///
+/// This is the syntax check used by dry-run validation: it never reads an
+/// environment variable or a file, so it cannot leak a secret or the contents
+/// of an arbitrary file. Rules: the brace must be closed, the prefix must be
+/// `env:` or `file:`, an env name must match `[A-Za-z_][A-Za-z0-9_]*`, a file
+/// path must be absolute (an unterminated `${` is a literal, as in
+/// [`SecretResolver::resolve`]). Errors name the placeholder text only.
+pub fn parse_placeholders(input: &str) -> Result<Vec<Placeholder>, String> {
+    let mut out = Vec::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // Same rule as `SecretResolver::resolve`: an unterminated `${` is
+            // kept literally, not an error.
+            return Ok(out);
+        };
+        let body = &after[..end];
+        if let Some(name) = body.strip_prefix("env:") {
+            let mut chars = name.chars();
+            let valid = matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+            if !valid {
+                return Err(format!("invalid env placeholder `${{env:{name}}}` (expected [A-Za-z_][A-Za-z0-9_]*)"));
+            }
+            out.push(Placeholder::Env(name.to_string()));
+        } else if let Some(path) = body.strip_prefix("file:") {
+            if !path.starts_with('/') {
+                return Err(format!("file placeholder `${{file:{path}}}` must use an absolute path"));
+            }
+            out.push(Placeholder::File(PathBuf::from(path)));
+        } else {
+            return Err(format!(
+                "unknown placeholder `${{{body}}}` — expected `env:` or `file:` prefix"
+            ));
+        }
+        rest = &after[end + 1..];
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_syntax_is_checked_without_resolving() {
+        assert_eq!(parse_placeholders("plain").unwrap(), vec![]);
+        assert_eq!(
+            parse_placeholders("a${env:HG_TOKEN}b${file:/etc/hiveguard/t}").unwrap(),
+            vec![Placeholder::Env("HG_TOKEN".into()), Placeholder::File("/etc/hiveguard/t".into())]
+        );
+        // A file that does exist is still not read.
+        assert_eq!(
+            parse_placeholders("${file:/etc/hostname}").unwrap(),
+            vec![Placeholder::File("/etc/hostname".into())]
+        );
+        assert!(parse_placeholders("${env:1BAD}").is_err());
+        assert!(parse_placeholders("${env:}").is_err());
+        assert!(parse_placeholders("${file:relative/path}").is_err());
+        assert!(parse_placeholders("${vault:x}").is_err());
+        assert_eq!(parse_placeholders("${env:OPEN").unwrap(), vec![]);
+        assert!(contains_placeholder("x${env:A}"));
+        assert!(!contains_placeholder("$ {x}"));
+    }
 
     #[test]
     fn passes_through_plain_string() {

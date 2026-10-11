@@ -8,6 +8,7 @@
     "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
     "enum_threshold": { "type": "integer", "minimum": 1, "maximum": 100000 },
     "enum_window_secs": { "type": "integer", "minimum": 1, "maximum": 604800 },
-    "enum_ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+    "enum_ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "ipv6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "IPv6 sources are counted and banned per this prefix (address rotation inside a /64). 0 or 128 = per address; otherwise 48..128. Default 64. IPv4 is always per address." }
   }
 }

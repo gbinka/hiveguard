@@ -97,8 +97,11 @@ impl Detector for Http4xxFloodDetector {
             deque.clear();
             return Some(DetectionSignal {
                 source_ip: Self::ip_to_net(ip),
+                // 120 × 0.85 = 102 ≥ the default ban threshold (100): one
+                // flood signal must ban on its own. With 0.8 it scored 96 and
+                // needed a second signal inside the scoring window.
                 severity: 120,
-                confidence: 0.8,
+                confidence: 0.85,
                 reason,
                 evidence_hash,
                 suggested_action: Action::Ban(self.ban_duration),
@@ -158,7 +161,8 @@ mod tests {
 
         let s = signal.expect("should have triggered at 50");
         assert_eq!(s.severity, 120);
-        assert_eq!(s.confidence, 0.8);
+        assert_eq!(s.confidence, 0.85);
+        assert!(s.severity as f32 * s.confidence >= 100.0, "single signal must reach the ban threshold");
         assert_eq!(s.suggested_action, Action::Ban(Duration::from_secs(3600)));
         assert_eq!(s.detector_name, "http_4xx_flood");
     }

@@ -22,6 +22,12 @@ use hiveguard_cti::enricher::CtiEnricher;
 use crate::metrics::{CtiLabels, DetectorLabels, OperationLabels, SharedMetrics, SourceLabels};
 use crate::siem_exporter::{SiemEvent, SiemSyslogExporter};
 
+use hiveguard_core::bot_registry::BOT_POLICY_DETECTOR;
+/// Minimum interval between two bot-policy signals for one source.
+const BOT_SIGNAL_INTERVAL: Duration = Duration::from_secs(60);
+/// Bound of the bot-policy rate-limit map.
+const BOT_SIGNAL_TRACKED_MAX: usize = 10_000;
+
 /// Event processing pipeline: ingest → detect → score → enforce.
 pub struct Pipeline {
     receiver: mpsc::Receiver<NormalizedEvent>,
@@ -30,6 +36,8 @@ pub struct Pipeline {
     state: Arc<Mutex<StateManager>>,
     enforcer: Arc<Mutex<Box<dyn Enforcer>>>,
     bot_registry: Option<Arc<Mutex<BotRegistry>>>,
+    /// Last bot-policy signal per source (rate limit, bounded).
+    bot_signal_last: std::collections::HashMap<std::net::IpAddr, std::time::Instant>,
     metrics: Option<SharedMetrics>,
     /// Shared hot-reloadable GeoIP database (None = enrichment disabled).
     geoip_db: Option<SharedGeoIpDb>,
@@ -71,6 +79,7 @@ impl Pipeline {
             state,
             enforcer,
             bot_registry: None,
+            bot_signal_last: std::collections::HashMap::new(),
             metrics: None,
             geoip_db: None,
             trusted_asns: HashSet::new(),
@@ -150,6 +159,32 @@ impl Pipeline {
 
     pub fn close_input(&mut self) {
         self.receiver.close();
+    }
+
+    /// Ban signal for a User-Agent matching a `policy: block` bot rule.
+    /// Rate-limited to one signal per source per [`BOT_SIGNAL_INTERVAL`] so a
+    /// burst from one client does not flood scoring and the log while the
+    /// ban is being applied.
+    fn bot_block_signal(
+        &mut self,
+        event: &NormalizedEvent,
+        m: &hiveguard_core::bot_registry::BotMatch,
+    ) -> Option<hiveguard_core::models::DetectionSignal> {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.bot_signal_last.get(&event.source_ip) {
+            if now.duration_since(*last) < BOT_SIGNAL_INTERVAL {
+                return None;
+            }
+        }
+        if self.bot_signal_last.len() >= BOT_SIGNAL_TRACKED_MAX {
+            self.bot_signal_last
+                .retain(|_, t| now.duration_since(*t) < BOT_SIGNAL_INTERVAL);
+            if self.bot_signal_last.len() >= BOT_SIGNAL_TRACKED_MAX {
+                self.bot_signal_last.clear();
+            }
+        }
+        self.bot_signal_last.insert(event.source_ip, now);
+        Some(m.block_signal(event))
     }
 
     /// Persist a ban decision unless an active ban already covers it, then
@@ -271,14 +306,17 @@ impl Pipeline {
                 None
             };
 
+            // Signals for this event (bot policy first, then detectors).
+            let mut detection_signals = Vec::new();
+
             // --- Bot classification: check User-Agent before running detectors ---
-            if let Some(ref bot_reg) = self.bot_registry {
+            if let Some(bot_reg) = self.bot_registry.clone() {
                 let ua = event.metadata.get("user_agent").map(|s| s.as_str()).unwrap_or("");
                 if !ua.is_empty() {
                     let ip_str = event.source_ip.to_string();
-                    let mut reg = bot_reg.lock().await;
-                    if let Some(policy) = reg.classify(ua, &ip_str) {
-                        match policy {
+                    let matched = bot_reg.lock().await.classify_rule(ua, &ip_str);
+                    if let Some(m) = matched {
+                        match m.policy {
                             BotPolicy::Allow => {
                                 debug!(
                                     ip = %event.source_ip,
@@ -287,13 +325,28 @@ impl Pipeline {
                                 );
                             }
                             BotPolicy::Block => {
-                                info!(
-                                    ip = %event.source_ip,
-                                    ua = ua,
-                                    "Bot marked block — running detectors"
-                                );
-                                // Block policy events still go through detectors
-                                // (they'll likely trigger scanner_fingerprint anyway)
+                                // `policy: block` bans (short, per rule
+                                // `ban_duration_secs`, default 1 h) through the
+                                // normal signal path: whitelisted / trusted-ASN
+                                // sources (verified crawlers) are never banned,
+                                // and detectors still run for this event.
+                                if let Some(signal) = self.bot_block_signal(&event, &m) {
+                                    if let Some(ref met) = self.metrics {
+                                        met.detection_signals_total
+                                            .get_or_create(&DetectorLabels {
+                                                detector: BOT_POLICY_DETECTOR.to_string(),
+                                            })
+                                            .inc();
+                                    }
+                                    info!(
+                                        detector = BOT_POLICY_DETECTOR,
+                                        ip = %signal.source_ip,
+                                        severity = signal.severity,
+                                        reason = %signal.reason,
+                                        "Detection signal generated"
+                                    );
+                                    detection_signals.push(signal);
+                                }
                             }
                             BotPolicy::Monitor => {
                                 // Monitor: just track, run detectors normally
@@ -449,7 +502,6 @@ impl Pipeline {
             }
 
             // Pass event through each detector
-            let mut detection_signals = Vec::new();
             for detector in &mut self.detectors {
                 for mut signal in detector.process_multi(&event) {
                     // Signals about other IPs (cross-IP campaign detectors)
@@ -898,6 +950,92 @@ mod tests {
         drop(tx);
         pipeline.run().await;
         assert!(state.lock().await.ban_store().is_banned(&ip).is_some());
+    }
+
+    fn ua_event(ip: IpAddr, ua: &str) -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: Utc::now(),
+            source_ip: ip,
+            event_type: EventType::HttpRequest,
+            source_name: "nginx".into(),
+            raw_line: "GET /".into(),
+            metadata: HashMap::from([
+                ("user_agent".into(), ua.into()),
+                ("path".into(), "/".into()),
+                ("method".into(), "GET".into()),
+            ]),
+        }
+    }
+
+    /// `bots: [{policy: block}]` used to only log; it now bans (short) via
+    /// the normal signal path. Whitelisted sources and `allow` rules never
+    /// ban, and a burst from one client yields a single signal.
+    #[tokio::test]
+    async fn bot_policy_block_bans_except_whitelisted_and_allow() {
+        use hiveguard_core::bot_registry::BotRule;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(StateManager::new(dir.path(), WalSyncMode::None).unwrap()));
+        let whitelisted: IpAddr = "100.64.10.2".parse().unwrap();
+        state.lock().await.add_whitelist(ipnet::IpNet::from(whitelisted)).unwrap();
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(ObserveOnlyEnforcer::new())));
+        let (tx, rx) = mpsc::channel(32);
+        let registry = BotRegistry::new(vec![
+            BotRule { name: "BadScraper".into(), ua_contains: "badscraper".into(), org: String::new(), policy: BotPolicy::Block },
+            BotRule { name: "Googlebot".into(), ua_contains: "Googlebot".into(), org: String::new(), policy: BotPolicy::Allow },
+        ])
+        .with_block_ban_durations([("BadScraper".to_string(), Duration::from_secs(1800))]);
+        let mut pipeline = Pipeline::new(rx, vec![], default_scoring().await, state.clone(), enforcer)
+            .with_bot_registry(Arc::new(Mutex::new(registry)));
+
+        let blocked: IpAddr = "100.64.10.1".parse().unwrap();
+        let google: IpAddr = "100.64.10.3".parse().unwrap();
+        for _ in 0..5 {
+            tx.send(ua_event(blocked, "BadScraper/3.0")).await.unwrap();
+        }
+        tx.send(ua_event(whitelisted, "BadScraper/3.0")).await.unwrap();
+        tx.send(ua_event(google, "Mozilla/5.0 (compatible; Googlebot/2.1)")).await.unwrap();
+        drop(tx);
+        pipeline.run().await;
+
+        let st = state.lock().await;
+        let ban = st.ban_store().is_banned(&blocked).expect("block policy bans");
+        assert_eq!(ban.source, hiveguard_core::models::BanSource::LocalDetector("bot_policy".into()));
+        let ttl = ban.expires_at.expect("temporary") - ban.created_at;
+        assert!(ttl.num_seconds() > 1700 && ttl.num_seconds() <= 1800, "rule duration used: {ttl}");
+        assert!(st.ban_store().is_banned(&whitelisted).is_none(), "whitelist protects");
+        assert!(st.ban_store().is_banned(&google).is_none(), "allow never bans");
+        assert_eq!(pipeline.bot_signal_last.len(), 2, "rate-limited per source");
+    }
+
+    /// Subnet signals (login brute force from a UA-rotating /24) must ban the
+    /// whole /24 end to end — regression guard for the July /24 → /32 bug.
+    #[tokio::test]
+    async fn login_bruteforce_subnet_signal_bans_whole_subnet() {
+        use hiveguard_core::detectors::HttpLoginBruteforceDetector;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(StateManager::new(dir.path(), WalSyncMode::None).unwrap()));
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> = Arc::new(Mutex::new(Box::new(ObserveOnlyEnforcer::new())));
+        let (tx, rx) = mpsc::channel(64);
+        let detector = HttpLoginBruteforceDetector::with_config(
+            vec!["/wp-login.php".into()],
+            5,
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        )
+        .with_subnet_aggregation(24, 0, 10, 5);
+        let mut pipeline = Pipeline::new(rx, vec![Box::new(detector)], default_scoring().await, state.clone(), enforcer);
+        for i in 1..=10u8 {
+            let mut ev = ua_event(format!("100.64.53.{i}").parse().unwrap(), &format!("UA-{i}"));
+            ev.metadata.insert("method".into(), "POST".into());
+            ev.metadata.insert("path".into(), "/wp-login.php".into());
+            tx.send(ev).await.unwrap();
+        }
+        drop(tx);
+        pipeline.run().await;
+        let st = state.lock().await;
+        let other_member: IpAddr = "100.64.53.200".parse().unwrap();
+        let ban = st.ban_store().is_banned(&other_member).expect("whole /24 banned");
+        assert_eq!(ban.subject.to_string(), "100.64.53.0/24");
     }
 
     /// Multi-signal detectors (detector.campaign): one event can ban other

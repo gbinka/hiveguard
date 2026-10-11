@@ -227,3 +227,85 @@ async fn preexisting_ban_reconciles_via_anti_entropy() {
         "whitelisted, permanent and broad bans must be rejected before quota");
 
 }
+
+/// Local bans longer than the peer's `remote_max_ttl_secs` (24 h) — e.g.
+/// path_probe/scanner 72 h — are announced as a 24 h window instead of being
+/// rejected by the peer. Node A keeps its full 72 h ban. A /64 IPv6 ban (the
+/// single-host equivalent) replicates as well.
+#[tokio::test]
+async fn long_local_bans_replicate_as_bounded_window() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let fp_a = NodeIdentity::generate(dir_a.path()).unwrap().node_id().to_string();
+    let fp_b = NodeIdentity::generate(dir_b.path()).unwrap().node_id().to_string();
+    let port_a = free_udp_port();
+    let port_b = free_udp_port();
+    let cfg_a = make_config("node-a", dir_a.path(), port_a, port_b, &fp_b);
+    let cfg_b = make_config("node-b", dir_b.path(), port_b, port_a, &fp_a);
+    let state_a = make_state(dir_a.path());
+    let state_b = make_state(dir_b.path());
+
+    let now = Utc::now();
+    let long_v4: IpNet = "100.64.7.9/32".parse().unwrap();
+    let long_v6: IpNet = "2001:db8:7:9::/64".parse().unwrap();
+    let mut records = Vec::new();
+    for (subject, ttl_h, ago_h) in [(long_v4, 72, 0), (long_v6, 72, 30)] {
+        let created_at = now - chrono::Duration::hours(ago_h);
+        records.push(BanRecord {
+            subject,
+            created_at,
+            expires_at: Some(created_at + chrono::Duration::hours(ttl_h)),
+            severity: 150,
+            reason: "path probe".into(),
+            evidence_hash: [7u8; 32],
+            source: BanSource::LocalDetector("path_probe".into()),
+            geo_info: None,
+        });
+    }
+    // The v6 ban pre-exists (anti-entropy path); the v4 one is announced live.
+    state_a.lock().await.add_ban(records[1].clone()).unwrap();
+
+    let (_sd_tx_a, sd_rx_a) = watch::channel(false);
+    let (_sd_tx_b, sd_rx_b) = watch::channel(false);
+    let handle_a = spawn_cluster(&cfg_a, state_a.clone(), make_enforcer(), None, sd_rx_a)
+        .await
+        .expect("node A cluster");
+    let _b = spawn_cluster(&cfg_b, state_b.clone(), make_enforcer(), None, sd_rx_b)
+        .await
+        .expect("node B cluster");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    state_a.lock().await.add_ban(records[0].clone()).unwrap();
+    handle_a.announce_local_ban(&records[0]);
+
+    let mut got = Vec::new();
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let st = state_b.lock().await;
+        got = [long_v4, long_v6]
+            .iter()
+            .filter_map(|s| st.ban_store().is_banned(&s.addr()).cloned())
+            .collect();
+        if got.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(got.len(), 2, "long bans did not replicate: {got:?}");
+    for (remote, local) in got.iter().zip(&records) {
+        assert_eq!(remote.subject, local.subject);
+        assert!(matches!(&remote.source, BanSource::ClusterPeer(n) if *n == fp_a));
+        let lifetime = remote.expires_at.unwrap() - remote.created_at;
+        assert!(lifetime <= chrono::Duration::hours(24), "{lifetime:?}");
+        assert!(remote.expires_at.unwrap() > Utc::now());
+        assert!(remote.expires_at.unwrap() <= local.expires_at.unwrap());
+    }
+    // The second-day v6 ban is announced as its second 24 h slice.
+    assert_eq!(got[1].created_at, records[1].created_at + chrono::Duration::hours(24));
+    // Node A keeps the full local lifetime.
+    let st = state_a.lock().await;
+    for local in &records {
+        let kept = st.ban_store().is_banned(&local.subject.addr()).unwrap();
+        assert_eq!(kept.expires_at, local.expires_at);
+    }
+}

@@ -13,6 +13,9 @@ pub mod distributed_slow;
 pub mod http_flood;
 pub mod campaign;
 pub mod webshell_probe;
+pub mod distributed_crawl;
+pub mod attack_state;
+pub mod netkey;
 pub mod factory;
 
 pub use ssh_bruteforce::SshBruteforceDetector;
@@ -29,4 +32,5 @@ pub use distributed_slow::DistributedSlowDetector;
 pub use http_flood::HttpFloodDetector;
 pub use campaign::{CampaignConfig, CampaignDetector};
 pub use webshell_probe::{WebshellProbeConfig, WebshellProbeDetector};
+pub use distributed_crawl::{DistributedCrawlConfig, DistributedCrawlDetector};
 pub use factory::create_detectors;

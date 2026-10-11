@@ -2,6 +2,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use hiveguard_core::Detector;
+use hiveguard_core::detectors::netkey::validate_ipv6_prefix;
+use hiveguard_core::detectors::path_probe::{
+    default_exact_paths, default_probe_paths, default_query_patterns, default_segment_paths,
+};
 use hiveguard_core::detectors::PathProbeDetector;
 use hiveguard_core::models::EventType;
 use hiveguard_plugin_api::prelude::*;
@@ -14,6 +18,14 @@ pub const PLUGIN_VERSION: &str = "0.1.0";
 struct Config {
     paths: Option<Vec<String>>,
     ban_duration_secs: Option<u64>,
+    /// Segment patterns anywhere in the path (default list; `[]` = off).
+    segment_paths: Option<Vec<String>>,
+    /// Query substrings after ≤ 2 percent-decodes (default list; `[]` = off).
+    query_patterns: Option<Vec<String>>,
+    /// Exact paths (default MCP/LLM recon list; `[]` = off).
+    exact_paths: Option<Vec<String>>,
+    /// IPv6 ban prefix (default 128 = per address).
+    ipv6_prefix: Option<u8>,
 }
 
 pub struct PathProbePlugin {
@@ -49,17 +61,15 @@ impl PathProbePlugin {
     }
 
     fn from_config(cfg: Config) -> PathProbeDetector {
-        let paths = cfg.paths.unwrap_or_else(|| {
-            vec![
-                "/wp-login.php".to_string(),
-                "/xmlrpc.php".to_string(),
-                "/.env".to_string(),
-                "/phpmyadmin".to_string(),
-                "/wp-admin".to_string(),
-            ]
-        });
+        let paths = cfg.paths.unwrap_or_else(default_probe_paths);
         let ban_duration = Duration::from_secs(cfg.ban_duration_secs.unwrap_or(259_200));
         PathProbeDetector::with_config(paths, ban_duration)
+            .with_extended_matching(
+                cfg.segment_paths.unwrap_or_else(default_segment_paths),
+                cfg.query_patterns.unwrap_or_else(default_query_patterns),
+                cfg.exact_paths.unwrap_or_else(default_exact_paths),
+            )
+            .with_ipv6_prefix(cfg.ipv6_prefix.unwrap_or(128))
     }
 }
 
@@ -72,6 +82,8 @@ impl Plugin for PathProbePlugin {
     async fn init(&mut self, cfg: serde_json::Value) -> PluginResult<()> {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        validate_ipv6_prefix("ipv6_prefix", cfg.ipv6_prefix.unwrap_or(128))
+            .map_err(PluginError::ConfigValidation)?;
         self.detector = Self::from_config(cfg);
         Ok(())
     }
@@ -190,5 +202,50 @@ mod tests {
         assert!(plugin
             .process(&path_probe_event("1.2.3.4", "/wp-login.php"))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn default_extended_matching_is_on_even_with_custom_paths() {
+        let plugin = PathProbePlugin::create(test_ctx(), serde_json::json!({ "paths": ["/secret"] }))
+            .await
+            .unwrap();
+        for p in [
+            "/kontakt/.git/config",
+            "/?pagename=templates%252f%252e%252e%252fusr/lib/php/peclcmd",
+            "/mcp",
+        ] {
+            assert!(plugin.process(&path_probe_event("100.64.0.5", p)).is_some(), "{p}");
+        }
+        assert!(plugin.process(&path_probe_event("100.64.0.5", "/llms.txt")).is_none());
+        assert!(plugin.process(&path_probe_event("100.64.0.5", "/wp-json/batch/v1")).is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_lists_disable_extended_matching() {
+        let plugin = PathProbePlugin::create(
+            test_ctx(),
+            serde_json::json!({
+                "paths": ["/secret"],
+                "segment_paths": [],
+                "query_patterns": [],
+                "exact_paths": [],
+                "ipv6_prefix": 64,
+                "ban_duration_secs": 3600
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(plugin.process(&path_probe_event("100.64.0.5", "/kontakt/.git/config")).is_none());
+        assert!(plugin.process(&path_probe_event("100.64.0.5", "/x?f=/etc/passwd")).is_none());
+        assert!(plugin.process(&path_probe_event("100.64.0.5", "/mcp")).is_none());
+        let s = plugin.process(&path_probe_event("2001:db8:5::9", "/secret")).unwrap();
+        assert_eq!(s.source_ip.to_string(), "2001:db8:5::/64");
+    }
+
+    #[tokio::test]
+    async fn rejects_too_wide_ipv6_prefix() {
+        assert!(PathProbePlugin::create(test_ctx(), serde_json::json!({ "ipv6_prefix": 8 }))
+            .await
+            .is_err());
     }
 }

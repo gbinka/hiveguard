@@ -149,6 +149,11 @@ pub struct Metrics {
     pub datadog_exported_total: Family<DatadogLabels, Counter>,
     pub datadog_export_errors_total: Family<DatadogLabels, Counter>,
     pub datadog_flush_duration_seconds: Family<DatadogLabels, Histogram, fn() -> Histogram>,
+
+    // Non-banning "under attack" states (detector.distributed_crawl), copied
+    // from `hiveguard_core::detectors::attack_state` on every render.
+    pub under_attack: Family<DetectorLabels, Gauge<i64, AtomicI64>>,
+    pub under_attack_value: Family<DetectorLabels, Gauge<i64, AtomicI64>>,
 }
 
 impl Metrics {
@@ -376,8 +381,23 @@ impl Metrics {
             datadog_flush_duration_seconds.clone(),
         );
 
+        let under_attack = Family::<DetectorLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "hiveguard_under_attack",
+            "1 while a non-banning detector (e.g. distributed_crawl) reports the site under attack",
+            under_attack.clone(),
+        );
+        let under_attack_value = Family::<DetectorLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "hiveguard_under_attack_fresh_ips",
+            "Last measured value of the under-attack detector (distributed_crawl: fresh IPs in the window)",
+            under_attack_value.clone(),
+        );
+
         Self {
             registry,
+            under_attack,
+            under_attack_value,
             active_bans,
             whitelisted_count,
             peer_count,
@@ -411,6 +431,13 @@ impl Metrics {
 
     /// Render all metrics in OpenMetrics text exposition format.
     pub fn render(&self) -> String {
+        for (detector, st) in hiveguard_core::detectors::attack_state::snapshot() {
+            let labels = DetectorLabels { detector };
+            self.under_attack.get_or_create(&labels).set(i64::from(st.on));
+            self.under_attack_value
+                .get_or_create(&labels)
+                .set(st.value.min(i64::MAX as u64) as i64);
+        }
         let mut buffer = String::new();
         if let Err(e) = encode(&mut buffer, &self.registry) {
             error!("Failed to encode metrics: {e}");
@@ -594,5 +621,18 @@ mod tests {
         assert!(output.contains(r#"source="ssh"}"#));
         assert!(output.contains(r#"source="nginx"}"#));
         assert!(output.contains(r#"source="postfix"}"#));
+    }
+
+    #[test]
+    fn under_attack_state_is_rendered() {
+        use hiveguard_core::detectors::attack_state::{self, AttackState};
+        attack_state::publish(
+            "metrics_unit_test",
+            AttackState { on: true, value: 42, since: chrono::Utc::now() },
+        );
+        let output = Metrics::new().render();
+        attack_state::clear("metrics_unit_test");
+        assert!(output.contains(r#"hiveguard_under_attack{detector="metrics_unit_test"} 1"#), "{output}");
+        assert!(output.contains(r#"hiveguard_under_attack_fresh_ips{detector="metrics_unit_test"} 42"#));
     }
 }

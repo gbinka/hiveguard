@@ -9,6 +9,10 @@
     "long_window_secs": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "Long-window (slow scan) tier window. Default 21600 (6 h)." },
     "long_threshold": { "type": "integer", "minimum": 0, "maximum": 65536, "description": "Distinct ports within long_window_secs to ban (detector name port_scan_slow). 0 disables the tier. Default 25." },
     "long_ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000, "description": "Ban duration of the long-window tier. Default 604800 (7 days)." },
-    "max_tracked_ips": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Cap of IPs tracked per tier (memory bound). Default 50000." }
+    "max_tracked_ips": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Cap of IPs tracked per tier (memory bound). Default 50000." },
+    "ipv6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "IPv6 sources are counted and banned per this prefix in both tiers (address rotation inside a /64). 0 or 128 = per address; otherwise 48..128. Default 64." },
+    "long_subnet_v4_prefix": { "type": "integer", "minimum": 0, "maximum": 32, "description": "Distributed slow tier: count distinct ports per IPv4 subnet of this prefix (e.g. 24) within long_window_secs and ban the subnet (port_scan_slow). 0 = off (default); otherwise 16..32." },
+    "long_subnet_threshold": { "type": "integer", "minimum": 0, "maximum": 65536, "description": "Distinct ports from one subnet within long_window_secs to fire; 0 disables the subnet tier. Default 40." },
+    "long_subnet_min_ips": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Distinct source addresses of the subnet required to fire. Default 3." }
   }
 }

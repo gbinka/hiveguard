@@ -84,17 +84,26 @@ duration of the operation; never await across it.
 - `severity: u8` (0–255) — how bad this finding is on its own.
 - `confidence: f32` (0.0–1.0) — how sure you are.
 
-The scoring engine accumulates `severity × confidence`. Calibration
-guidelines:
+The scoring engine accumulates `severity × confidence` per bucket and bans at
+`ban_severity_threshold` (default **100**). A detector whose single signal is
+meant to ban on its own must therefore weigh ≥ 100; below that it only
+contributes. Built-in values (2026-10):
 
-| Detector type | Severity | Confidence |
-|---------------|----------|------------|
-| Honeypot hit | 250 | 1.0 |
-| Scanner UA match | 90 | 0.95 |
-| Path probe (`/.env`, `/wp-login.php`) | 80 | 0.9 |
-| Brute-force (5 failures in 5 min) | 60 | 0.85 |
-| HTTP 4xx flood | 50 | 0.8 |
-| Entropy anomaly | 30–80 | 0.5–0.9 |
+| Detector | Severity | Confidence | Weight | Bans alone? |
+|---|---|---|---|---|
+| honeypot | 250 | 1.0 | 250 | yes |
+| path_probe | 200 | 0.95 | 190 | yes |
+| webshell_probe, campaign, port_scan(_slow) | 200 | 0.9 | 180 | yes |
+| http_flood, scanner_fingerprint | 200 | 0.85 | 170 | yes |
+| http_login_bruteforce (IP and subnet) | 180 | 0.9 | 162 | yes |
+| ssh_bruteforce (enumeration) | 180 | 0.9 | 162 | yes |
+| ssh_bruteforce, smtp_bruteforce | 150 | 0.9 | 135 | yes |
+| bot_policy (`bots:` rule with `policy: block`) | 150 | 1.0 | 150 | yes |
+| http_4xx_flood | 120 | 0.85 | 102 | yes (was 0.8 = 96 before 2026-10) |
+| sigma (critical / high / medium) | 120 / 80 / 60 | 0.85 | 102 / 68 / 51 | critical only |
+| entropy | 30–80 | 0.5–0.85 | ≤ 68 | no (contributing) |
+| timing | 40 | 0.5 | 20 | no (contributing) |
+| distributed_crawl, distributed_slow | — | — | no signal | never |
 
 If you're uncertain about calibration, **err on the side of low
 confidence** — a noisy detector that always fires at confidence 0.5 is

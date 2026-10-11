@@ -35,8 +35,8 @@ from DNS/HTTPS servers (to random ephemeral ports) can look like scans.
 
 ### Long-window ("slow scan") tier
 
-Scanners that probe a couple of ports per 10 minutes for a whole day (e.g.
-147.45.112.16: 1757 blocked ports in 24 h; 169.255.58.185: 502) never reach
+Scanners that probe a couple of ports per 10 minutes for a whole day (one
+production scanner: 1757 blocked ports in 24 h; another: 502) never reach
 the short threshold. A second tier counts distinct ports per IP over
 `long_window_secs` and bans with detector name `port_scan_slow`:
 
@@ -50,3 +50,31 @@ the short threshold. A second tier counts distinct ports per IP over
 
 All keys are optional; configs without them keep working (the tier is on with
 the defaults above).
+
+### IPv6 prefix aggregation
+
+- `ipv6_prefix`: default `64`. IPv6 sources are counted per /64 in both tiers
+  and banned as that /64 (a scanner rotated 37 addresses inside one /64).
+  `0` or `128` = per address; otherwise `48..128`. IPv4 is always per address.
+
+### Distributed slow tier (per IPv4 subnet, optional)
+
+Several hosts of one /24, each probing 17–25 ports in 6 h (under the per-IP
+`long_threshold`), are counted together:
+
+- `long_subnet_v4_prefix`: `0` = off (default); e.g. `24`. Allowed `16..32`.
+- `long_subnet_threshold`: distinct ports from the subnet within
+  `long_window_secs` (default 40; `0` disables).
+- `long_subnet_min_ips`: distinct source addresses required (default 3).
+
+Fires `port_scan_slow` with the subnet as subject and `long_ban_duration_secs`.
+Memory: one entry per (port, address) per subnet, capped at
+`4 × long_subnet_threshold + 64`; subnets are counted against `max_tracked_ips`.
+
+```yaml
+      ipv6_prefix: 64
+      long_subnet_v4_prefix: 24
+      long_subnet_threshold: 40
+      long_subnet_min_ips: 3
+```
+

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,8 @@ use tracing::{debug, warn};
 
 use hiveguard_plugin_api::prelude::{AgentEvent, PluginError};
 
-use crate::auth::ct_eq;
+use crate::auth::{bearer, classify_token};
+use crate::routes::busy_response;
 use crate::state::AppState;
 
 /// Interval of SSE keep-alive comments.
@@ -47,6 +49,7 @@ pub fn agent_routes() -> Router<Arc<AppState>> {
         .route("/api/agent/journal", get(get_journal))
         .route("/api/agent/detectors", get(get_detectors))
         .route("/api/agent/catalog", get(get_catalog))
+        .route("/api/agent/config", get(get_agent_config))
         .route("/api/agent/config/validate", post(post_config_validate))
 }
 
@@ -111,6 +114,16 @@ async fn get_catalog(
     respond(state.api.agent_catalog(q.kind).await)
 }
 
+/// `GET /api/agent/config`: the config file with secrets replaced by
+/// `<redacted>` (same text as `GET /api/config`), reachable with the
+/// read-only token and through agent proxies that only pass `/api/agent/*`.
+async fn get_agent_config(State(state): State<Arc<AppState>>) -> Response {
+    match state.api.get_config().await {
+        Ok(content) => Json(json!({ "content": content, "redacted": true })).into_response(),
+        Err(e) => respond(Err(e)),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ValidateRequest {
     content: String,
@@ -124,15 +137,25 @@ async fn post_config_validate(
 }
 
 // ---------------------------------------------------------------------------
-// SSE stream — public route with its own token check (header or `?token=`),
-// mirroring the WebSocket endpoint so browser `EventSource` clients work.
+// SSE stream — public route with its own token check: `Authorization:
+// Bearer` header only (a `?token=` would end up in access logs and proxy
+// logs). Admin and read-only tokens are accepted. At most `max_streams`
+// concurrent streams (429 beyond).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
-    token: Option<String>,
     /// Comma-separated subset of `signal,ban_added,ban_removed`.
     types: Option<String>,
+}
+
+/// Decrements the open-stream counter when the SSE stream is dropped.
+struct StreamSlot(Arc<AtomicUsize>);
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Axum handler for `GET /api/agent/stream`.
@@ -141,16 +164,10 @@ pub async fn sse_handler(
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let header_token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let token = match header_token.or(q.token) {
-        Some(t) => t,
-        None => return unauthorized("missing token"),
+    let Some(token) = bearer(&headers) else {
+        return unauthorized("missing token (send `Authorization: Bearer <token>`; `?token=` is not accepted)");
     };
-    if !ct_eq(token.as_bytes(), state.auth_token.as_bytes()) {
+    if classify_token(&state, token.as_bytes()).is_none() {
         return unauthorized("invalid token");
     }
 
@@ -169,9 +186,20 @@ pub async fn sse_handler(
             .collect()
     });
 
+    // Reserve a stream slot (released when the stream is dropped).
+    let max = state.max_streams.max(1);
+    let prev = state.active_streams.fetch_add(1, Ordering::SeqCst);
+    let slot = StreamSlot(state.active_streams.clone());
+    if prev >= max {
+        drop(slot);
+        return busy_response(format!(
+            "too many agent streams open ({max}, agent.max_streams); retry later"
+        ));
+    }
+
     debug!("ui.rest: agent SSE client connected");
     let shutdown = state.shutdown.clone();
-    let events = agent_event_stream(rx, wanted, shutdown);
+    let events = agent_event_stream(rx, wanted, shutdown, slot);
     Sse::new(events)
         .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE).text("keep-alive"))
         .into_response()
@@ -184,8 +212,9 @@ fn agent_event_stream(
     rx: tokio::sync::broadcast::Receiver<AgentEvent>,
     wanted: Option<Vec<String>>,
     shutdown: tokio_util::sync::CancellationToken,
+    slot: StreamSlot,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
-    stream::unfold((rx, wanted, shutdown), |(mut rx, wanted, shutdown)| async move {
+    stream::unfold((rx, wanted, shutdown, slot), |(mut rx, wanted, shutdown, slot)| async move {
         loop {
             tokio::select! {
                 biased;
@@ -198,13 +227,16 @@ fn agent_event_stream(
                                 continue;
                             }
                         }
-                        let data = match &ev {
-                            AgentEvent::Signal(t) => serde_json::to_string(t),
-                            AgentEvent::BanAdded(b) => serde_json::to_string(b),
-                            AgentEvent::BanRemoved { subject } => {
-                                serde_json::to_string(&json!({ "subject": subject }))
-                            }
+                        // Payloads carry attacker-controlled text (signal
+                        // reasons, ban reasons): sanitise + mark untrusted.
+                        let value = match &ev {
+                            AgentEvent::Signal(t) => serde_json::to_value(t),
+                            AgentEvent::BanAdded(b) => serde_json::to_value(b),
+                            AgentEvent::BanRemoved { subject } => Ok(json!({ "subject": subject })),
                         };
+                        let data = value.and_then(|v| {
+                            serde_json::to_string(&hiveguard_plugin_api::sanitize::finalize_untrusted_response(v))
+                        });
                         let data = match data {
                             Ok(d) => d,
                             Err(e) => {
@@ -213,13 +245,13 @@ fn agent_event_stream(
                             }
                         };
                         let event = Event::default().event(kind).data(data);
-                        return Some((Ok(event), (rx, wanted, shutdown)));
+                        return Some((Ok(event), (rx, wanted, shutdown, slot)));
                     }
                     Err(RecvError::Lagged(n)) => {
                         let event = Event::default()
                             .event("lagged")
                             .data(json!({ "skipped": n }).to_string());
-                        return Some((Ok(event), (rx, wanted, shutdown)));
+                        return Some((Ok(event), (rx, wanted, shutdown, slot)));
                     }
                     Err(RecvError::Closed) => return None,
                 },
@@ -236,11 +268,13 @@ fn params_to_value(params: HashMap<String, String>) -> Value {
     Value::Object(params.into_iter().map(|(k, v)| (k, Value::String(v))).collect())
 }
 
-/// `ConfigValidation`/`MissingConfig` → 400, `NotFound` → 404, everything
-/// else → 503 (unsupported subsystem or runtime failure).
+/// `ConfigValidation`/`MissingConfig` → 400, `NotFound` → 404, `Busy` → 429
+/// (+ `Retry-After`), everything else → 503 (unsupported subsystem or
+/// runtime failure).
 fn respond(result: Result<Value, PluginError>) -> Response {
     match result {
         Ok(v) => Json(v).into_response(),
+        Err(PluginError::Busy(m)) => busy_response(m),
         Err(err) => {
             let status = match &err {
                 PluginError::ConfigValidation(_) | PluginError::MissingConfig(_) => {

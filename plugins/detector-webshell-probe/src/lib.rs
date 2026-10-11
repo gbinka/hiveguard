@@ -28,6 +28,8 @@ struct Config {
     shared_path_min_ips: Option<usize>,
     max_tracked_ips: Option<usize>,
     max_tracked_paths: Option<usize>,
+    /// IPv6 counting/ban prefix (default 64; 0/128 = per address).
+    ipv6_prefix: Option<u8>,
 }
 
 pub struct WebshellProbePlugin {
@@ -82,6 +84,7 @@ impl WebshellProbePlugin {
             shared_path_min_ips: cfg.shared_path_min_ips.unwrap_or(d.shared_path_min_ips),
             max_tracked_ips: cfg.max_tracked_ips.unwrap_or(d.max_tracked_ips),
             max_tracked_paths: cfg.max_tracked_paths.unwrap_or(d.max_tracked_paths),
+            ipv6_prefix: cfg.ipv6_prefix.unwrap_or(d.ipv6_prefix),
         })
     }
 }
@@ -95,6 +98,11 @@ impl Plugin for WebshellProbePlugin {
     async fn init(&mut self, cfg: serde_json::Value) -> PluginResult<()> {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        hiveguard_core::detectors::netkey::validate_ipv6_prefix(
+            "ipv6_prefix",
+            cfg.ipv6_prefix.unwrap_or(hiveguard_core::detectors::netkey::DEFAULT_IPV6_PREFIX),
+        )
+        .map_err(PluginError::ConfigValidation)?;
         if cfg
             .score_threshold
             .is_some_and(|s| !s.is_finite() || s <= 0.0)

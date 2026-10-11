@@ -13,10 +13,37 @@ use hiveguard_core::errors::HiveGuardError;
 
 type Result<T> = std::result::Result<T, HiveGuardError>;
 
+/// Name of the optional HiveGuard-owned chain on the `prerouting` hook.
+pub const PREROUTING_CHAIN: &str = "prerouting";
+
+/// Priority of the optional `prerouting` drop chain.
+///
+/// `-300` is the `raw` slot: it runs before defragmentation-dependent
+/// conntrack (`-200`), mangle (`-150`) and destination NAT (`-100`, where
+/// Docker rewrites published ports). A banned source is therefore dropped
+/// before Docker's DNAT can route it to a container through `forward`, and
+/// before it can create a conntrack entry. Locally generated traffic never
+/// traverses prerouting, and loopback/local sources are always whitelisted.
+pub const PREROUTING_PRIORITY: i32 = -300;
+
+/// Observed state of the optional prerouting chain before setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreroutingState {
+    Absent,
+    /// Exists with exactly the hook/type/priority/policy this build creates.
+    Matching,
+    /// Exists with a different definition (e.g. another priority); it must be
+    /// replaced, because `add chain` cannot change a base chain's priority.
+    Mismatched,
+}
+
 /// Enforcer that manages bans via the `nft` command-line tool.
 ///
 /// Creates an inet table with IPv4 and IPv6 sets, and filter rules
-/// that drop traffic from addresses in those sets.
+/// that drop traffic from addresses in those sets. The `input` chain is
+/// always present; an optional `prerouting` chain carries the same drop rules
+/// so that traffic DNAT-ed to containers (Docker published ports, which go
+/// prerouting → forward and never reach `input`) is blocked as well.
 pub struct NftablesEnforcer {
     table_name: String,
     set_name_v4: String,
@@ -33,6 +60,8 @@ pub struct NftablesEnforcer {
     nft_binary: PathBuf,
     command_timeout: Duration,
     initialized: bool,
+    /// Also install the drop rules on a `prerouting` hook chain.
+    prerouting_hook: bool,
 }
 
 impl NftablesEnforcer {
@@ -55,7 +84,21 @@ impl NftablesEnforcer {
             nft_binary: PathBuf::from("nft"),
             command_timeout: Duration::from_secs(10),
             initialized: false,
+            prerouting_hook: false,
         }
+    }
+
+    /// Enable/disable the additional `prerouting` drop chain (default: off).
+    ///
+    /// When disabled, `setup` removes a chain left behind by an earlier run
+    /// that had it enabled, so the kernel layout always follows the config.
+    pub fn with_prerouting_hook(mut self, enabled: bool) -> Self {
+        self.prerouting_hook = enabled;
+        self
+    }
+
+    pub fn prerouting_hook(&self) -> bool {
+        self.prerouting_hook
     }
 
     /// Create with default config values.
@@ -136,7 +179,43 @@ impl NftablesEnforcer {
         execute_nft(&self.nft_binary, args, input, self.command_timeout).await
     }
 
-    fn build_setup_batch(&self) -> String {
+    /// Inspect the current kernel chains of the managed table (read-only).
+    async fn prerouting_state(&self) -> Result<PreroutingState> {
+        let output = self
+            .execute(&["-j", "list", "chains", "inet"], None)
+            .await?;
+        Ok(parse_prerouting_state(&output, &self.table_name))
+    }
+
+    fn drop_rules(&self, chain: &str, batch: &mut String) {
+        let table = &self.table_name;
+        for (family, sets) in [
+            (
+                "ip",
+                [
+                    &self.set_name_v4,
+                    &self.sync_set_name_v4,
+                    &self.sync_next_set_name_v4,
+                ],
+            ),
+            (
+                "ip6",
+                [
+                    &self.set_name_v6,
+                    &self.sync_set_name_v6,
+                    &self.sync_next_set_name_v6,
+                ],
+            ),
+        ] {
+            for set in sets {
+                batch.push_str(&format!(
+                    "add rule inet {table} {chain} {family} saddr @{set} drop\n"
+                ));
+            }
+        }
+    }
+
+    fn build_setup_batch(&self, prerouting: PreroutingState) -> String {
         let table = &self.table_name;
         let mut batch = format!("add table inet {table}\n");
         for set in [
@@ -161,29 +240,26 @@ impl NftablesEnforcer {
         // This chain is owned by HiveGuard. Replacing its rules in the same nft
         // transaction removes duplicates without flushing bans or opening a gap.
         batch.push_str(&format!("flush chain inet {table} input\n"));
-        for (family, sets) in [
-            (
-                "ip",
-                [
-                    &self.set_name_v4,
-                    &self.sync_set_name_v4,
-                    &self.sync_next_set_name_v4,
-                ],
-            ),
-            (
-                "ip6",
-                [
-                    &self.set_name_v6,
-                    &self.sync_set_name_v6,
-                    &self.sync_next_set_name_v6,
-                ],
-            ),
-        ] {
-            for set in sets {
-                batch.push_str(&format!(
-                    "add rule inet {table} input {family} saddr @{set} drop\n"
-                ));
-            }
+        self.drop_rules("input", &mut batch);
+
+        // Optional prerouting chain, managed in the same atomic transaction:
+        // packets see either the old or the new complete layout.
+        let chain = PREROUTING_CHAIN;
+        let remove_existing = match prerouting {
+            PreroutingState::Absent => false,
+            PreroutingState::Matching => !self.prerouting_hook,
+            PreroutingState::Mismatched => true,
+        };
+        if remove_existing {
+            batch.push_str(&format!("flush chain inet {table} {chain}\n"));
+            batch.push_str(&format!("delete chain inet {table} {chain}\n"));
+        }
+        if self.prerouting_hook {
+            batch.push_str(&format!(
+                "add chain inet {table} {chain} {{ type filter hook prerouting priority {PREROUTING_PRIORITY}; policy accept; }}\n"
+            ));
+            batch.push_str(&format!("flush chain inet {table} {chain}\n"));
+            self.drop_rules(chain, &mut batch);
         }
         batch
     }
@@ -275,14 +351,31 @@ impl Enforcer for NftablesEnforcer {
                 ));
             }
         }
-        self.execute(&["-f", "-"], Some(&self.build_setup_batch()))
+        let prerouting = match self.prerouting_state().await {
+            Ok(state) => state,
+            Err(e) => {
+                // Enabled: `add chain` is idempotent for an identical chain and
+                // a differing one fails the transaction loudly. Disabled: a
+                // stale chain (still a correct drop chain) may remain.
+                warn!(error = %e, "nftables: could not list chains; assuming no prerouting chain");
+                PreroutingState::Absent
+            }
+        };
+        self.execute(&["-f", "-"], Some(&self.build_setup_batch(prerouting)))
             .await?;
+        if prerouting != PreroutingState::Absent && !self.prerouting_hook {
+            info!(table = %self.table_name, "nftables: removed prerouting chain (prerouting_hook disabled)");
+        }
         if !self.initialized {
             // Preserve existing kernel bans until startup's authoritative sync.
             self.desired_bans = self.get_current_bans().await?.into_iter().collect();
         }
         self.initialized = true;
-        info!(table = %self.table_name, "nftables setup complete");
+        info!(
+            table = %self.table_name,
+            prerouting_hook = self.prerouting_hook,
+            "nftables setup complete"
+        );
         Ok(())
     }
 
@@ -446,6 +539,38 @@ async fn run_nft(args: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helper: parse nft JSON set elements
 // ---------------------------------------------------------------------------
+
+/// Classify the `prerouting` chain of `table` in `nft -j list chains` output.
+fn parse_prerouting_state(json_str: &str, table: &str) -> PreroutingState {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        warn!("failed to parse nft JSON chain list");
+        return PreroutingState::Absent;
+    };
+    let Some(items) = json.get("nftables").and_then(|v| v.as_array()) else {
+        return PreroutingState::Absent;
+    };
+    for item in items {
+        let Some(chain) = item.get("chain") else {
+            continue;
+        };
+        if chain.get("family").and_then(|v| v.as_str()) != Some("inet")
+            || chain.get("table").and_then(|v| v.as_str()) != Some(table)
+            || chain.get("name").and_then(|v| v.as_str()) != Some(PREROUTING_CHAIN)
+        {
+            continue;
+        }
+        let matching = chain.get("type").and_then(|v| v.as_str()) == Some("filter")
+            && chain.get("hook").and_then(|v| v.as_str()) == Some("prerouting")
+            && chain.get("prio").and_then(|v| v.as_i64()) == Some(PREROUTING_PRIORITY as i64)
+            && chain.get("policy").and_then(|v| v.as_str()) == Some("accept");
+        return if matching {
+            PreroutingState::Matching
+        } else {
+            PreroutingState::Mismatched
+        };
+    }
+    PreroutingState::Absent
+}
 
 /// Parse nft JSON output to extract set elements as IpNet.
 fn parse_nft_set_elements(json_str: &str, out: &mut Vec<IpNet>) {
@@ -780,6 +905,161 @@ mod tests {
             dedup_overlapping(&nets),
             vec!["11.22.33.0/24".parse::<IpNet>().unwrap()]
         );
+    }
+
+    fn rule_lines<'a>(batch: &'a str, chain: &str) -> Vec<&'a str> {
+        let prefix = format!("add rule inet hiveguard {chain} ");
+        batch.lines().filter(|l| l.starts_with(&prefix)).collect()
+    }
+
+    #[test]
+    fn setup_batch_default_has_only_input_chain() {
+        let e = NftablesEnforcer::with_defaults();
+        assert!(!e.prerouting_hook());
+        let batch = e.build_setup_batch(PreroutingState::Absent);
+        assert!(batch.contains(
+            "add chain inet hiveguard input { type filter hook input priority -10; policy accept; }\n"
+        ));
+        assert_eq!(rule_lines(&batch, "input").len(), 6);
+        assert!(!batch.contains("prerouting"));
+    }
+
+    #[test]
+    fn setup_batch_with_prerouting_hook_mirrors_the_six_drop_rules() {
+        let e = NftablesEnforcer::with_defaults().with_prerouting_hook(true);
+        for state in [PreroutingState::Absent, PreroutingState::Matching] {
+            let batch = e.build_setup_batch(state);
+            assert!(batch.contains(
+                "add chain inet hiveguard prerouting { type filter hook prerouting priority -300; policy accept; }\n"
+            ));
+            assert!(batch.contains("flush chain inet hiveguard prerouting\n"));
+            assert!(!batch.contains("delete chain"));
+            let input: Vec<_> = rule_lines(&batch, "input")
+                .iter()
+                .map(|l| l.replacen(" input ", " X ", 1))
+                .collect();
+            let pre: Vec<_> = rule_lines(&batch, "prerouting")
+                .iter()
+                .map(|l| l.replacen(" prerouting ", " X ", 1))
+                .collect();
+            assert_eq!(input.len(), 6);
+            assert_eq!(input, pre);
+            // Input chain is set up first; prerouting flush precedes its rules.
+            let flush = batch.find("flush chain inet hiveguard prerouting").unwrap();
+            let first_rule = batch.find("add rule inet hiveguard prerouting").unwrap();
+            assert!(batch.find("add chain inet hiveguard input").unwrap() < flush);
+            assert!(flush < first_rule);
+        }
+    }
+
+    #[test]
+    fn setup_batch_replaces_mismatched_prerouting_chain_atomically() {
+        let e = NftablesEnforcer::with_defaults().with_prerouting_hook(true);
+        let batch = e.build_setup_batch(PreroutingState::Mismatched);
+        let delete = batch
+            .find("delete chain inet hiveguard prerouting\n")
+            .unwrap();
+        let add = batch.find("add chain inet hiveguard prerouting").unwrap();
+        assert!(delete < add);
+        assert_eq!(rule_lines(&batch, "prerouting").len(), 6);
+    }
+
+    #[test]
+    fn setup_batch_disabled_removes_a_leftover_prerouting_chain() {
+        let e = NftablesEnforcer::with_defaults();
+        for state in [PreroutingState::Matching, PreroutingState::Mismatched] {
+            let batch = e.build_setup_batch(state);
+            let flush = batch.find("flush chain inet hiveguard prerouting\n").unwrap();
+            let delete = batch.find("delete chain inet hiveguard prerouting\n").unwrap();
+            assert!(flush < delete);
+            assert!(!batch.contains("add chain inet hiveguard prerouting"));
+            assert!(rule_lines(&batch, "prerouting").is_empty());
+            assert_eq!(rule_lines(&batch, "input").len(), 6);
+        }
+    }
+
+    #[test]
+    fn prerouting_state_is_parsed_from_chain_list() {
+        let chains = |name: &str, table: &str, prio: i64| {
+            format!(
+                r#"{{"nftables": [{{"metainfo": {{}}}}, {{"chain": {{"family": "inet", "table": "{table}", "name": "input", "type": "filter", "hook": "input", "prio": -10, "policy": "accept"}}}}, {{"chain": {{"family": "inet", "table": "{table}", "name": "{name}", "type": "filter", "hook": "prerouting", "prio": {prio}, "policy": "accept"}}}}]}}"#
+            )
+        };
+        assert_eq!(
+            parse_prerouting_state(&chains("prerouting", "hiveguard", -300), "hiveguard"),
+            PreroutingState::Matching
+        );
+        assert_eq!(
+            parse_prerouting_state(&chains("prerouting", "hiveguard", -150), "hiveguard"),
+            PreroutingState::Mismatched
+        );
+        assert_eq!(
+            parse_prerouting_state(&chains("prerouting", "other", -300), "hiveguard"),
+            PreroutingState::Absent
+        );
+        assert_eq!(
+            parse_prerouting_state(&chains("raw_pre", "hiveguard", -300), "hiveguard"),
+            PreroutingState::Absent
+        );
+        assert_eq!(
+            parse_prerouting_state(r#"{"nftables": [{"metainfo": {}}]}"#, "hiveguard"),
+            PreroutingState::Absent
+        );
+    }
+
+    // Run ONLY inside an isolated network namespace (see plugin README).
+    #[tokio::test]
+    #[ignore]
+    async fn integration_prerouting_hook_toggle_and_replacement() {
+        async fn chain_rules(e: &NftablesEnforcer, chain: &str) -> Option<(i64, usize)> {
+            let out = e.execute(&["-j", "list", "table", "inet", "hiveguard"], None).await.ok()?;
+            let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let items = doc["nftables"].as_array().unwrap();
+            let prio = items
+                .iter()
+                .filter_map(|v| v.get("chain"))
+                .find(|c| c["name"] == chain)?["prio"]
+                .as_i64()
+                .unwrap();
+            let rules = items
+                .iter()
+                .filter_map(|v| v.get("rule"))
+                .filter(|r| r["chain"] == chain)
+                .count();
+            Some((prio, rules))
+        }
+
+        let _ = run_nft("delete table inet hiveguard").await;
+        let host: IpNet = "11.22.33.5/32".parse().unwrap();
+        let mut enforcer = NftablesEnforcer::with_defaults().with_prerouting_hook(true);
+        enforcer.setup().await.unwrap();
+        enforcer.sync_full(&[host]).await.unwrap();
+        assert_eq!(chain_rules(&enforcer, "input").await, Some((-10, 6)));
+        assert_eq!(chain_rules(&enforcer, "prerouting").await, Some((-300, 6)));
+
+        // Restart with the hook still enabled: idempotent, bans kept.
+        let mut again = NftablesEnforcer::with_defaults().with_prerouting_hook(true);
+        again.setup().await.unwrap();
+        assert_eq!(chain_rules(&again, "prerouting").await, Some((-300, 6)));
+        assert_eq!(again.get_current_bans().await.unwrap(), vec![host]);
+
+        // Restart with the hook disabled: chain removed, input + sets intact.
+        let mut off = NftablesEnforcer::with_defaults();
+        off.setup().await.unwrap();
+        assert_eq!(chain_rules(&off, "prerouting").await, None);
+        assert_eq!(chain_rules(&off, "input").await, Some((-10, 6)));
+        assert_eq!(off.get_current_bans().await.unwrap(), vec![host]);
+        off.setup().await.unwrap(); // absent + disabled is a no-op
+
+        // A differently defined chain (e.g. other priority) is replaced.
+        run_nft("add chain inet hiveguard prerouting { type filter hook prerouting priority -150; policy accept; }")
+            .await
+            .unwrap();
+        let mut on = NftablesEnforcer::with_defaults().with_prerouting_hook(true);
+        on.setup().await.unwrap();
+        assert_eq!(chain_rules(&on, "prerouting").await, Some((-300, 6)));
+        assert_eq!(on.get_current_bans().await.unwrap(), vec![host]);
+        run_nft("delete table inet hiveguard").await.unwrap();
     }
 
     // Run ONLY inside an isolated network namespace (see plugin README).

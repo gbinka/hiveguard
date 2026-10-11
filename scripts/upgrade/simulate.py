@@ -33,6 +33,9 @@ SETS = {
     **{BASE + suffix: 4 for suffix in ("", "_sync", "_sync_next")},
     **{BASE + "_v6" + suffix: 6 for suffix in ("", "_sync", "_sync_next")},
 }
+# (type, hook, priority, policy); "prerouting" exists only with prerouting_hook.
+CHAINS = {"input": ("filter", "input", -10, "accept"),
+          "prerouting": ("filter", "prerouting", -300, "accept")}
 
 
 class CheckFailed(Exception):
@@ -121,11 +124,16 @@ def merge_intervals(intervals):
     return merged
 
 
-def nft_state(document):
+def nft_state(document, prerouting=False):
+    """Validate the managed layout and return merged set coverage.
+
+    prerouting: whether the optional "prerouting" chain (enforcer.nftables
+    prerouting_hook) must exist; it must hold the same six drop rules as "input".
+    """
     intervals = {4: [], 6: []}
     seen_sets = set()
-    rules = []
-    input_chain = None
+    chains = {}
+    rules = {name: [] for name in CHAINS}
     for item in document.get("nftables", []):
         value = item.get("set")
         if value and value.get("family") == "inet" and value.get("table") == TABLE:
@@ -137,34 +145,39 @@ def nft_state(document):
                 require(value.get("type") == f"ipv{version}_addr", "unexpected nft managed set type")
                 intervals[version].extend(element_interval(e, version) for e in value.get("elem", []))
         chain = item.get("chain")
-        if chain and chain.get("family") == "inet" and chain.get("table") == TABLE and chain.get("name") == "input":
-            input_chain = chain
+        if chain and chain.get("family") == "inet" and chain.get("table") == TABLE:
+            require(chain.get("name") in CHAINS, "unexpected chain in nft managed table")
+            chains[chain["name"]] = chain
         rule = item.get("rule")
-        if rule and rule.get("family") == "inet" and rule.get("table") == TABLE and rule.get("chain") == "input":
-            rules.append(rule)
+        if rule and rule.get("family") == "inet" and rule.get("table") == TABLE:
+            require(rule.get("chain") in CHAINS, "nft rule outside the managed chains")
+            rules[rule["chain"]].append(rule)
     require(seen_sets == set(SETS), "nft is missing one or more managed sets")
-    require(input_chain and input_chain.get("hook") == "input" and input_chain.get("type") == "filter"
-            and input_chain.get("prio") == -10 and input_chain.get("policy") == "accept",
-            "nft managed chain has unexpected hook, priority, type, or policy")
-    require(len(rules) == 6, "nft managed input chain must contain exactly six drop rules")
-    matched_sets = []
-    for rule in rules:
-        expressions = rule.get("expr", [])
-        matches = [e["match"] for e in expressions if "match" in e]
-        drops = [e for e in expressions if "drop" in e]
-        require(len(expressions) == 2 and len(matches) == 1 and len(drops) == 1,
-                "unexpected expression in nft managed drop rule")
-        match = matches[0]
-        right = match.get("right")
-        require(isinstance(right, str) and right.startswith("@") and right[1:] in SETS,
-                "nft drop rule references an unexpected set")
-        name = right[1:]
-        protocol = "ip" if SETS[name] == 4 else "ip6"
-        require(match.get("op") in ("==", "in")
-                and match.get("left") == {"payload": {"protocol": protocol, "field": "saddr"}},
-                "nft drop rule does not match source addresses")
-        matched_sets.append(name)
-    require(set(matched_sets) == set(SETS), "nft drop rules are duplicated or missing")
+    require(("prerouting" in chains) == bool(prerouting),
+            "nft prerouting chain presence does not match enforcer.nftables prerouting_hook")
+    for name in ("input", "prerouting") if prerouting else ("input",):
+        chain = chains.get(name)
+        require(chain and (chain.get("type"), chain.get("hook"), chain.get("prio"), chain.get("policy")) == CHAINS[name],
+                "nft managed chain has unexpected hook, priority, type, or policy")
+        require(len(rules[name]) == 6, f"nft managed {name} chain must contain exactly six drop rules")
+        matched_sets = []
+        for rule in rules[name]:
+            expressions = rule.get("expr", [])
+            matches = [e["match"] for e in expressions if "match" in e]
+            drops = [e for e in expressions if "drop" in e]
+            require(len(expressions) == 2 and len(matches) == 1 and len(drops) == 1,
+                    "unexpected expression in nft managed drop rule")
+            match = matches[0]
+            right = match.get("right")
+            require(isinstance(right, str) and right.startswith("@") and right[1:] in SETS,
+                    "nft drop rule references an unexpected set")
+            set_name = right[1:]
+            protocol = "ip" if SETS[set_name] == 4 else "ip6"
+            require(match.get("op") in ("==", "in")
+                    and match.get("left") == {"payload": {"protocol": protocol, "field": "saddr"}},
+                    "nft drop rule does not match source addresses")
+            matched_sets.append(set_name)
+        require(set(matched_sets) == set(SETS), "nft drop rules are duplicated or missing")
     return {version: merge_intervals(values) for version, values in intervals.items()}
 
 
@@ -211,6 +224,8 @@ def execute(args):
     report = json.loads(Path(args.report).read_text())
     require(report.get("ok") is True, "input checker report did not pass")
     expected = records(report)
+    # Mirror the host's enforcer.nftables layout (reported by the checker).
+    prerouting = (report.get("config") or {}).get("nftables_prerouting_hook") is True
     source_before = tree_hashes(source)
     require(source_before, "source state is empty")
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -221,7 +236,8 @@ def execute(args):
     config = {
         "node": {"name": "upgrade-test", "data_dir": str(clone), "listen_gossip": "", "seeds": []},
         "plugins": [
-            {"id": "enforcer.nftables", "config": {"table": TABLE, "set_name": BASE, "batch_interval_secs": 1}},
+            {"id": "enforcer.nftables", "config": {"table": TABLE, "set_name": BASE, "batch_interval_secs": 1,
+                                                   **({"prerouting_hook": True} if prerouting else {})}},
             {"id": "scoring.default", "config": {}},
         ],
     }
@@ -257,7 +273,7 @@ def execute(args):
                     if result.returncode == 0:
                         try:
                             document = json.loads(result.stdout)
-                            coverage = nft_state(document)
+                            coverage = nft_state(document, prerouting)
                             missing = missing_coverage(expected, coverage, dt.datetime.now(dt.timezone.utc))
                             require(missing == 0, f"nft does not cover {missing} active ban records")
                             (output / "nft-running.json").write_text(json.dumps(document, indent=2) + "\n")
@@ -290,7 +306,7 @@ def execute(args):
             "expected_active_at_finish": sum(active(record, now) for record in expected.values()),
             "active_after": after["active_count"], "total_after": after["total_count"],
             "covered_active": sum(active(record, now) for record in expected.values()),
-            "managed_drop_rules": 6, "source_files_unchanged": True, "records_retained": True,
+            "managed_drop_rules": 12 if prerouting else 6, "prerouting_hook": prerouting, "source_files_unchanged": True, "records_retained": True,
             "daemon_exit": exit_code, "daemon_reaped": True,
             "readiness_seconds": round(readiness_seconds, 3), "shutdown_seconds": round(shutdown_seconds, 3),
             "elapsed_seconds": round(time.monotonic() - started, 3),

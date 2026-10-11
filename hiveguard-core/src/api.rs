@@ -97,9 +97,48 @@ pub struct ThreatInfo {
     pub last_seen: String,
 }
 
+/// Narrowest IPv4 prefix length an operator mutation (ban / whitelist add)
+/// may target through the REST API, the Agent API or the socket CLI. Anything
+/// wider than a /16 (e.g. `0.0.0.0/0`, `10.0.0.0/8`) is refused: one typo or
+/// one prompt-injected agent call must not black-hole or allow-list the
+/// Internet. Wider ranges belong in `config.yaml`.
+pub const MIN_MUTATION_PREFIX_V4: u8 = 16;
+/// IPv6 counterpart of [`MIN_MUTATION_PREFIX_V4`].
+pub const MIN_MUTATION_PREFIX_V6: u8 = 32;
+
+/// Refuse runtime ban/whitelist additions wider than /16 (IPv4) or /32
+/// (IPv6). `what` names the operation in the error (`ban`, `whitelist`).
+pub fn check_mutation_prefix(net: &ipnet::IpNet, what: &str) -> Result<(), String> {
+    let (min, family) = match net {
+        ipnet::IpNet::V4(_) => (MIN_MUTATION_PREFIX_V4, "IPv4"),
+        ipnet::IpNet::V6(_) => (MIN_MUTATION_PREFIX_V6, "IPv6"),
+    };
+    if net.prefix_len() < min {
+        return Err(format!(
+            "refusing to {what} {net}: {family} prefix /{} is wider than the allowed minimum /{min} \
+             (narrower prefixes are fine; put wider ranges in config.yaml)",
+            net.prefix_len()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_prefix_limits() {
+        let ok = ["100.64.1.2/32", "100.64.0.0/16", "100.64.1.0/24", "2001:db8::/32", "2001:db8::1/128"];
+        for n in ok {
+            assert!(check_mutation_prefix(&n.parse().unwrap(), "ban").is_ok(), "{n}");
+        }
+        let wide = ["0.0.0.0/0", "10.0.0.0/8", "100.64.0.0/15", "::/0", "2001:db8::/31"];
+        for n in wide {
+            let e = check_mutation_prefix(&n.parse().unwrap(), "whitelist").unwrap_err();
+            assert!(e.contains("wider than the allowed minimum"), "{e}");
+        }
+    }
 
     #[test]
     fn serialize_deserialize_api_request_status() {

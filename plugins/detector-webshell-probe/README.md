@@ -65,4 +65,9 @@ plugins:
       shared_path_min_ips: 3    # default, 0 = off
       max_tracked_ips: 50000
       max_tracked_paths: 20000
+      ipv6_prefix: 64           # default; IPv6 counted/banned per /64 (0/128 = per address)
 ```
+
+`ipv6_prefix` (default 64, allowed `0` or `48..128`): IPv6 probes are counted
+per /64 and the ban covers the /64, so a prober rotating addresses inside its
+/64 accumulates one score. IPv4 stays per address.

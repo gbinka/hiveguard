@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use hiveguard_plugin_api::prelude::*;
 use ipnet::IpNet;
 use tokio::sync::{broadcast, Mutex};
-use tokio_util::sync::CancellationToken;
 
 use hiveguard_plugin_ui_rest::{build_router, AppState};
 
@@ -58,6 +57,9 @@ impl MockUiApi {
         // Emulate the daemon's error mapping so the REST layer can be tested.
         if params.get("source").and_then(|v| v.as_str()) == Some("missing") {
             return Err(PluginError::NotFound("unknown log source `missing`".into()));
+        }
+        if params.get("source").and_then(|v| v.as_str()) == Some("busy") {
+            return Err(PluginError::Busy("2 log scan(s) already running".into()));
         }
         if params.get("since").and_then(|v| v.as_str()) == Some("garbage") {
             return Err(PluginError::ConfigValidation("`since`: cannot parse".into()));
@@ -140,6 +142,9 @@ impl UiApiHandle for MockUiApi {
             return Err(PluginError::ConfigValidation("YAML parse error".into()));
         }
         Ok(())
+    }
+    async fn get_config(&self) -> PluginResult<String> {
+        Ok("node:\n  name: test-node\nplugins:\n- id: ui.rest\n  config:\n    auth_token: \"<redacted>\"\n".to_string())
     }
     async fn render_metrics(&self) -> Option<String> {
         Some("# HELP hiveguard_up 1\nhiveguard_up 1\n".to_string())
@@ -234,14 +239,15 @@ pub fn test_router(token: &str) -> axum::Router {
 /// Build a test `Router` around a caller-provided mock (so the test keeps a
 /// handle to it, e.g. to push agent events).
 pub fn test_router_with(token: &str, mock: Arc<MockUiApi>) -> axum::Router {
+    test_router_full(token, None, 4, mock)
+}
+
+/// Router with an optional read-only agent token and a stream cap.
+pub fn test_router_full(token: &str, read_token: Option<&str>, max_streams: usize, mock: Arc<MockUiApi>) -> axum::Router {
     let api: Arc<dyn UiApiHandle> = mock;
-    let state = Arc::new(AppState {
-        api,
-        auth_token: token.to_string(),
-        started_at: Instant::now(),
-        tick_interval: Duration::from_secs(30),
-        shutdown: CancellationToken::new(),
-        ingest: Default::default(),
-    });
+    let mut state = AppState::new(api, token);
+    state.read_token = read_token.map(str::to_string);
+    state.max_streams = max_streams;
+    let state = Arc::new(state);
     build_router(state, None, &[])
 }

@@ -4,6 +4,8 @@
   "additionalProperties": false,
   "properties": {
     "scanners": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
-    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+    "extra_scanners": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Case-insensitive UA substrings appended to scanners (or to the built-in defaults when scanners is not set)." },
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "ipv6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "IPv6 ban prefix: the whole /64 of a scanner is banned by default. 0 or 128 = per address; otherwise 48..128. Default 64." }
   }
 }

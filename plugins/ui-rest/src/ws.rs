@@ -1,34 +1,35 @@
 //! WebSocket endpoint for live UI updates.
 //!
 //! Authentication accepts the bearer token via the
-//! `Sec-WebSocket-Protocol: bearer.<token>` subprotocol header (preferred —
-//! browsers can set it natively) or, as a fallback, via a `?token=...`
-//! query parameter.
+//! `Sec-WebSocket-Protocol: bearer.<token>` subprotocol header (browsers can
+//! set it natively) or an `Authorization: Bearer` header. A `?token=` query
+//! parameter is **not** accepted (URLs end up in access/proxy logs; the React
+//! panel does not use the WebSocket). The read-only agent token is accepted
+//! (the stream is read-only).
 //!
 //! On upgrade the handler emits an initial snapshot burst
 //! (`Connected`, `BansSnapshot`, `ThreatsSnapshot`, `PluginsSnapshot`), then
 //! forwards every `UiEvent` published by `UiApiHandle::subscribe()` until
 //! the client disconnects or the daemon shuts down.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
-use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use hiveguard_plugin_api::prelude::UiEvent;
 
+use crate::auth::{bearer, classify_token};
 use crate::state::AppState;
 
 /// Sec-WebSocket-Protocol value prefix used to carry the bearer token.
@@ -39,26 +40,18 @@ const BEARER_PROTOCOL_PREFIX: &str = "bearer.";
 /// Axum handler for `GET /api/stream`.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Prefer the `Sec-WebSocket-Protocol: bearer.<token>` header — it's
-    // marginally safer than a query parameter because it doesn't get logged
-    // by access logs / proxies the way a URL does.
     let (token, via_protocol) = match extract_protocol_token(&headers) {
         Some(t) => (t, true),
-        None => match params.get("token").cloned() {
-            Some(t) => (t, false),
+        None => match bearer(&headers) {
+            Some(t) => (t.to_string(), false),
             None => return (StatusCode::UNAUTHORIZED, "missing token").into_response(),
         },
     };
 
-    let expected = state.auth_token.as_bytes();
-    let token_bytes = token.as_bytes();
-    let length_ok = token_bytes.len() == expected.len();
-    let content_ok: bool = token_bytes.ct_eq(expected).into();
-    if !(length_ok && content_ok) {
+    if classify_token(&state, token.as_bytes()).is_none() {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
 

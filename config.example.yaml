@@ -372,11 +372,29 @@ plugins:
       ban_duration_secs: 86400
   - id: detector.path_probe
     config:
-      paths: ["/wp-login.php", "/xmlrpc.php", "/.env", "/phpmyadmin"]
+      paths: ["/wp-login.php", "/xmlrpc.php", "/.env", "/phpmyadmin"]   # prefix match
       ban_duration_secs: 259200
+      # Omitted lists use the built-in defaults (see plugin README); [] disables:
+      # segment_paths: ["/.git", "/.svn", "/.env", "/.aws", "/.DS_Store", "/vendor/phpunit"]
+      # query_patterns: ["pearcmd", "peclcmd", "allow_url_include", "/etc/passwd", "jndi:"]
+      # exact_paths: ["/mcp", "/api/mcp", "/v1/models"]   # [] if this host serves them
+      # ipv6_prefix: 128
   - id: detector.scanner_fingerprint
     config:
       ban_duration_secs: 259200
+      extra_scanners: []              # appended to the built-in UA list (or to `scanners:`)
+      ipv6_prefix: 64                 # ban the scanner's whole /64
+  # WordPress login brute force; subnet aggregation catches UA-rotating
+  # botnets spread over one /24 (off unless subnet_v4_prefix/v6 > 0).
+  # - id: detector.http_login_bruteforce
+  #   config:
+  #     threshold: 5
+  #     window_secs: 600
+  #     ban_duration_secs: 86400
+  #     subnet_v4_prefix: 24
+  #     subnet_v6_prefix: 64
+  #     subnet_threshold: 20
+  #     subnet_min_distinct_ips: 5
   # Cross-IP login campaign (distributed credential stuffing): one UA hitting
   # POST /wp-login.php|/xmlrpc.php from many IPs → ban every participant.
   # All keys optional; see plugins/detector-campaign/README.md.
@@ -408,6 +426,21 @@ plugins:
       long_window_secs: 21600         # slow-scan tier (detector name port_scan_slow)
       long_threshold: 25              # 0 disables the tier
       long_ban_duration_secs: 604800
+      ipv6_prefix: 64                 # IPv6 counted/banned per /64 (0 = per address)
+      long_subnet_v4_prefix: 0        # e.g. 24: slow scans spread over a /24 (0 = off)
+      long_subnet_threshold: 40       # distinct ports from the subnet in long_window_secs
+      long_subnet_min_ips: 3
+  # Distributed crawl from residential proxies (≈1 request per IP): never bans,
+  # raises an "under attack" flag file for nginx (challenge) + gauge
+  # hiveguard_under_attack. See plugins/detector-distributed-crawl/README.md.
+  # - id: detector.distributed_crawl
+  #   config:
+  #     path_prefixes: ["/cgi-bin/koha/opac-search.pl", "/catalogsearch/"]
+  #     window_secs: 300
+  #     fresh_ip_threshold: 30
+  #     off_threshold: 10
+  #     cooldown_secs: 900
+  #     flag_file: /run/hiveguard/under_attack
 
   # ── UI server plugins ───────────────────────────────────────────────────
   # `ui.rest` is the single REST + WebSocket API for HiveGuard (REFACTOR 2.5).

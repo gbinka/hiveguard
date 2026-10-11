@@ -1,5 +1,6 @@
 //! Shared application state passed to all Axum handlers.
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,31 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// HTTP-push log ingest settings (`POST /api/ingest/logs`).
     pub ingest: IngestState,
+    /// Read-only agent token (`agent.read_token_file` on the host). Grants
+    /// GET routes, the read-only agent POSTs and the streams; mutations → 403.
+    pub read_token: Option<String>,
+    /// Cap on simultaneous `/api/agent/stream` connections (`agent.max_streams`).
+    pub max_streams: usize,
+    /// Currently open agent SSE streams.
+    pub active_streams: Arc<AtomicUsize>,
+}
+
+impl AppState {
+    /// State with the given API and admin token and defaults elsewhere
+    /// (no ingest, no read-only token, 4 streams). Tests and embedders.
+    pub fn new(api: Arc<dyn UiApiHandle>, auth_token: impl Into<String>) -> Self {
+        Self {
+            api,
+            auth_token: auth_token.into(),
+            started_at: Instant::now(),
+            tick_interval: Duration::from_secs(30),
+            shutdown: CancellationToken::new(),
+            ingest: IngestState::default(),
+            read_token: None,
+            max_streams: 4,
+            active_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 /// Resolved ingest configuration + runtime rate-limiter state.

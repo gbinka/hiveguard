@@ -30,19 +30,27 @@ def ban(subject="192.0.2.1/32", expiry="2026-10-05T00:00:00Z"):
             "severity": 100, "reason": "test ban", "source": "ManualAdmin"}
 
 
-def nft_fixture(nets=()):
+def nft_fixture(nets=(), prerouting=False):
     items = [{"table": {"family": "inet", "name": "hiveguard"}},
              {"chain": {"family": "inet", "table": "hiveguard", "name": "input", "type": "filter",
                         "hook": "input", "prio": -10, "policy": "accept"}}]
+    if prerouting:
+        items.append({"chain": {"family": "inet", "table": "hiveguard", "name": "prerouting", "type": "filter",
+                                "hook": "prerouting", "prio": -300, "policy": "accept"}})
     for name in sorted(upgrade.SETS):
         version = 6 if "_v6" in name else 4
         elements = [str(n) for n in nets if n.version == version] if name in (upgrade.BASE_SET, upgrade.BASE_SET + "_v6") else []
         items.append({"set": {"family": "inet", "table": "hiveguard", "name": name,
                               "type": f"ipv{version}_addr", "flags": ["interval"], "elem": elements}})
-        items.append({"rule": {"family": "inet", "table": "hiveguard", "chain": "input", "expr": [
-            {"match": {"op": "==", "left": {"payload": {"protocol": "ip6" if version == 6 else "ip", "field": "saddr"}},
-                       "right": "@" + name}}, {"drop": None}]}})
+        for chain in ("input", "prerouting") if prerouting else ("input",):
+            items.append({"rule": {"family": "inet", "table": "hiveguard", "chain": chain, "expr": [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "ip6" if version == 6 else "ip", "field": "saddr"}},
+                           "right": "@" + name}}, {"drop": None}]}})
     return {"nftables": items}
+
+
+def prerouting_rules(document):
+    return [i for i, item in enumerate(document["nftables"]) if item.get("rule", {}).get("chain") == "prerouting"]
 
 
 class BanPreservationTests(unittest.TestCase):
@@ -157,6 +165,83 @@ class FirewallGuardTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
         sleep.assert_not_called()
 
+    def test_prerouting_layout_is_accepted_with_six_rules_per_chain(self):
+        nets = [ipaddress.ip_network("192.0.2.0/24")]
+        document = nft_fixture(nets, prerouting=True)
+        self.assertEqual(upgrade.inspect_nft(document, exactly_six=True), nets)
+        self.assertEqual(upgrade.inspect_nft(document, exactly_six=True, prerouting=True), nets)
+        self.assertTrue(upgrade.has_prerouting_chain(document))
+        self.assertFalse(upgrade.has_prerouting_chain(nft_fixture()))
+        duplicated = copy.deepcopy(document)
+        duplicated["nftables"].append(copy.deepcopy(duplicated["nftables"][prerouting_rules(duplicated)[0]]))
+        upgrade.inspect_nft(duplicated)  # tolerated before an upgrade, like input duplicates
+        with self.assertRaisesRegex(RuntimeError, "exactly six"):
+            upgrade.inspect_nft(duplicated, exactly_six=True)
+        missing = copy.deepcopy(document)
+        del missing["nftables"][prerouting_rules(missing)[-1]]
+        with self.assertRaisesRegex(RuntimeError, "Incomplete HiveGuard table"):
+            upgrade.inspect_nft(missing)
+        upgrade.inspect_nft(missing, allow_incomplete=True)  # rollback may repair it
+
+    def test_prerouting_chain_must_match_definition_and_config(self):
+        for field, value in (("prio", -150), ("hook", "forward"), ("policy", "drop"), ("type", "nat")):
+            document = nft_fixture(prerouting=True)
+            next(i["chain"] for i in document["nftables"] if i.get("chain", {}).get("name") == "prerouting")[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "Unexpected chain"):
+                upgrade.inspect_nft(document, allow_incomplete=True)
+        with self.assertRaisesRegex(RuntimeError, "prerouting chain missing"):
+            upgrade.inspect_nft(nft_fixture(), prerouting=True)
+        with self.assertRaisesRegex(RuntimeError, "present although"):
+            upgrade.inspect_nft(nft_fixture(prerouting=True), prerouting=False)
+        upgrade.inspect_nft(nft_fixture(), prerouting=False)
+        # Rules in the prerouting chain without the chain itself are foreign.
+        orphan = nft_fixture(prerouting=True)
+        orphan["nftables"] = [i for i in orphan["nftables"] if i.get("chain", {}).get("name") != "prerouting"]
+        with self.assertRaisesRegex(RuntimeError, "Rule outside"):
+            upgrade.inspect_nft(orphan, allow_incomplete=True)
+
+    def test_live_coverage_follows_config_prerouting_expectation(self):
+        record = [ban("192.0.2.1/32", None)]
+        covered = [ipaddress.ip_network("192.0.2.0/24")]
+        with patch.object(upgrade, "nft_document", return_value=nft_fixture(covered, prerouting=True)):
+            upgrade.check_live_coverage(record, exactly_six=True, prerouting=True)
+            upgrade.check_live_coverage(record, exactly_six=True)
+        with patch.object(upgrade, "nft_document", return_value=nft_fixture(covered)), \
+                patch.object(upgrade.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "prerouting chain missing"):
+                upgrade.check_live_coverage(record, exactly_six=True, prerouting=True)
+        self.assertIs(upgrade.config_prerouting({"config": {"nftables_prerouting_hook": True}}), True)
+        self.assertIs(upgrade.config_prerouting({"config": {"nftables_prerouting_hook": False}}), False)
+        self.assertIsNone(upgrade.config_prerouting({"config": {"nftables": []}}))  # older checker
+        self.assertIsNone(upgrade.config_prerouting({"config": None}))
+
+    def test_restore_transaction_never_recreates_prerouting(self):
+        transaction = upgrade.firewall_restore([ban("192.0.2.1/32", None)], [], table_exists=True)
+        self.assertTrue(transaction.startswith("delete table inet hiveguard\n"))
+        self.assertNotIn("prerouting", transaction)
+
+    @unittest.skipUnless(os.environ.get("HIVEGUARD_TEST_NETNS") == "1", "set HIVEGUARD_TEST_NETNS=1 for isolated kernel test")
+    def test_restore_removes_prerouting_chain_in_real_nft(self):
+        transaction = upgrade.firewall_restore([ban("192.0.2.1/32", None)], [], table_exists=True)
+        child = '''import os, subprocess, sys
+assert os.readlink('/proc/self/ns/net') != sys.argv[1], 'host namespace must never run nft mutation'
+setup = """add table inet hiveguard
+add set inet hiveguard hiveguard_blocklist { type ipv4_addr; flags interval; }
+add chain inet hiveguard prerouting { type filter hook prerouting priority -300; policy accept; }
+add rule inet hiveguard prerouting ip saddr @hiveguard_blocklist drop
+"""
+subprocess.run(['nft','-f','-'],input=setup,text=True,check=True)
+subprocess.run(['nft','-f','-'],input=sys.stdin.read(),text=True,check=True)
+subprocess.run(['nft','-j','list','table','inet','hiveguard'],check=True)
+'''
+        result = subprocess.run(["unshare", "--user", "--map-root-user", "--net", sys.executable,
+                                 "-c", child, os.readlink("/proc/self/ns/net")], input=transaction,
+                                capture_output=True, text=True, timeout=10, check=True)
+        document = json.loads(result.stdout)
+        self.assertFalse(upgrade.has_prerouting_chain(document))
+        self.assertEqual(upgrade.inspect_nft(document, exactly_six=True, prerouting=False),
+                         [ipaddress.ip_network("192.0.2.1/32")])
+
     @unittest.skipUnless(os.environ.get("HIVEGUARD_TEST_NETNS") == "1", "set HIVEGUARD_TEST_NETNS=1 for isolated kernel test")
     def test_restore_transaction_with_ipv4_ipv6_overlaps_in_real_nft(self):
         records = [ban("192.0.2.0/24", None), ban("192.0.2.1/32", None),
@@ -177,6 +262,44 @@ subprocess.run(['nft','-j','list','table','inet','hiveguard'],check=True)
         pool = upgrade.inspect_nft(json.loads(result.stdout), exactly_six=True)
         self.assertEqual(pool, [ipaddress.ip_network(n) for n in
                               ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/64", "2001:db8:1::/64"]])
+
+
+class RollbackConfigGuardTests(unittest.TestCase):
+    def test_config_key_detection_ignores_comments(self):
+        for text in ("plugins:\n- id: enforcer.nftables\n  config:\n    prerouting_hook: true\n",
+                     '{"plugins": [{"id": "enforcer.nftables", "config": {"prerouting_hook": false}}]}',
+                     "      'prerouting_hook' : true\n"):
+            self.assertTrue(upgrade.config_mentions("prerouting_hook", text), text)
+        for text in ("# prerouting_hook: true\n", "    #prerouting_hook: true\n", "my_prerouting_hooks: 1\n", ""):
+            self.assertFalse(upgrade.config_mentions("prerouting_hook", text), text)
+
+    def test_binary_token_search_spans_chunk_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bin"
+            path.write_bytes(b"x" * (1024 * 1024 - 5) + b"prerouting_hook" + b"y" * 10)
+            self.assertTrue(upgrade.binary_knows(path, "prerouting_hook"))
+            path.write_bytes(b"x" * (3 * 1024 * 1024))
+            self.assertFalse(upgrade.binary_knows(path, "prerouting_hook"))
+
+    def test_rollback_refuses_before_stopping_when_old_binary_rejects_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "backup"
+            backup.mkdir()
+            (backup / "rollback-ready").write_text("ready")
+            (backup / "hiveguard.old").write_bytes(b"old executable without the key")
+            config = root / "config.yaml"
+            config.write_text("plugins:\n- id: enforcer.nftables\n  config:\n    prerouting_hook: true\n")
+            with patch.object(upgrade, "CONFIG", config), patch.object(upgrade, "stop_service") as stop:
+                with self.assertRaisesRegex(RuntimeError, "remove that key"):
+                    upgrade.rollback(backup)
+                stop.assert_not_called()
+                # An old executable that knows the key, or a config without it, passes the guard.
+                (backup / "hiveguard.old").write_bytes(b"...prerouting_hook...")
+                upgrade.assert_old_binary_accepts_config(backup)
+                (backup / "hiveguard.old").write_bytes(b"old")
+                config.write_text("# prerouting_hook: true\n")
+                upgrade.assert_old_binary_accepts_config(backup)
 
 
 class AtomicReplaceTests(unittest.TestCase):

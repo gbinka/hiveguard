@@ -33,6 +33,11 @@ pub enum PluginError {
 
     #[error("{0}")]
     Other(String),
+
+    /// A concurrency limit was hit (e.g. too many agent log scans at once).
+    /// The REST layer answers `429 Too Many Requests` with `Retry-After`.
+    #[error("busy: {0}")]
+    Busy(String),
 }
 
 impl From<hiveguard_core::errors::HiveGuardError> for PluginError {

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use hiveguard_plugin_api::prelude::*;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub mod agent;
 pub mod auth;
@@ -203,6 +203,15 @@ impl UiServerPlugin for RestPlugin {
             _ => state::IngestState::default(),
         };
 
+        let access = api.agent_access();
+        let read_token = access.read_token.filter(|t| !t.trim().is_empty());
+        if let Some(rt) = &read_token {
+            if auth::ct_eq(rt.as_bytes(), cfg.auth_token.as_bytes()) {
+                warn!("ui.rest: the read-only agent token equals auth_token — it grants FULL admin access; use a different value");
+            } else {
+                info!("ui.rest: read-only agent token enabled");
+            }
+        }
         let state = Arc::new(AppState {
             api,
             auth_token: cfg.auth_token.clone(),
@@ -210,6 +219,9 @@ impl UiServerPlugin for RestPlugin {
             tick_interval: Duration::from_secs(cfg.tick_interval_secs),
             shutdown: shutdown.clone(),
             ingest,
+            read_token,
+            max_streams: access.max_streams.max(1),
+            active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
         let router = build_router(state, cfg.static_dir.clone(), &cfg.cors_origins);

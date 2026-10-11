@@ -150,7 +150,9 @@ impl GossipEngine {
             return None;
         }
 
-        info!(peer = sender_id, "Digest mismatch — requesting diff");
+        // Every 5 s per peer while digests differ; the daemon reports a
+        // rate-limited summary at INFO (cluster.rs `note_digest_mismatch`).
+        debug!(peer = sender_id, "Digest mismatch — requesting diff");
 
         // Bound the inventory too: an omitted key only causes a safe redundant
         // response. The daemon rotates bounded response batches over the tail.

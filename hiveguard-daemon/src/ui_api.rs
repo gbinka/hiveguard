@@ -20,12 +20,12 @@ use tracing::{debug, info, warn};
 
 use hiveguard_core::ban_store::BanStore;
 use hiveguard_core::bot_registry::{BotPolicy, BotRegistry};
-use hiveguard_core::config::{HiveGuardConfig, KafkaTopicParser};
+use hiveguard_core::config::KafkaTopicParser;
 use hiveguard_core::models::{BanRecord, BanSource, DetectionSignal, NormalizedEvent};
 use hiveguard_core::persistence::StateManager;
 use hiveguard_enforce::Enforcer;
 use hiveguard_plugin_api::{
-    AgentEvent, BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo, PluginError,
+    AgentAccess, AgentEvent, BanInfo, BanRequest, Fail2banBanInfo, Fail2banImportInfo, NodeInfo, PluginError,
     PluginInfo, PluginResult, SigmaLogSource, SigmaRuleDetail, SigmaRuleSummary, SigmaStatsInfo,
     StatsInfo, ThreatInfo, UiApiHandle, UiEvent,
 };
@@ -282,6 +282,8 @@ impl UiApiHandle for DaemonUiApi {
 
     async fn add_ban(&self, mut req: BanRequest) -> PluginResult<()> {
         req.subject = req.subject.trunc();
+        hiveguard_core::api::check_mutation_prefix(&req.subject, "ban")
+            .map_err(PluginError::ConfigValidation)?;
         let now = Utc::now();
         let duration = chrono::Duration::from_std(req.duration)
             .map_err(|_| PluginError::ConfigValidation("ban duration out of range".into()))?;
@@ -372,6 +374,9 @@ impl UiApiHandle for DaemonUiApi {
     }
 
     async fn add_whitelist(&self, cidr: IpNet) -> PluginResult<()> {
+        let cidr = cidr.trunc();
+        hiveguard_core::api::check_mutation_prefix(&cidr, "whitelist")
+            .map_err(PluginError::ConfigValidation)?;
         let mut st = self.state.lock().await;
         let revoked = {
             st.add_whitelist(cidr)
@@ -433,21 +438,31 @@ impl UiApiHandle for DaemonUiApi {
         let Some(ref path) = self.config_path else {
             return Err(PluginError::Runtime("Config path not available".to_string()));
         };
-        std::fs::read_to_string(path).map_err(|e| PluginError::Runtime(e.to_string()))
+        // Secrets (auth_token, passwords, *_key …) are replaced by
+        // `<redacted>` line by line; comments and layout stay intact.
+        std::fs::read_to_string(path)
+            .map(|c| agent_api::redact_config_text(&c))
+            .map_err(|e| PluginError::Runtime(e.to_string()))
     }
 
     async fn put_config(&self, content: String) -> PluginResult<()> {
         let Some(ref path) = self.config_path else {
             return Err(PluginError::Runtime("Config path not available".to_string()));
         };
-        let cfg: HiveGuardConfig = serde_yaml::from_str(&content)
+        if content.contains(agent_api::REDACTED) {
+            return Err(PluginError::ConfigValidation(agent_api::redacted_marker_error()));
+        }
+        // Must parse as YAML first so the error names the syntax problem.
+        serde_yaml::from_str::<serde_yaml::Value>(&content)
             .map_err(|e| PluginError::ConfigValidation(format!("YAML parse error: {e}")))?;
-        cfg.validate().map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
-        let loader = hiveguard_host::Loader::resolve_only(Arc::new(
-            hiveguard_plugin_api::secrets::SecretResolver::new()
-        ));
-        loader.resolve(&crate::plugin_bridge::to_loader_config(&cfg))
-            .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        // Validation never expands `${file:…}` / `${env:…}`: resolving them
+        // here would turn schema errors into a file-read oracle.
+        let (_cfg, found) = agent_api::check_config_document(&content)
+            .map_err(|errs| PluginError::ConfigValidation(errs.join("; ")))?;
+        let policy = agent_api::placeholder_policy(&found);
+        if !policy.put_errors.is_empty() {
+            return Err(PluginError::ConfigValidation(policy.put_errors.join("; ")));
+        }
         atomic_config_write(path, &content)?;
         Ok(())
     }
@@ -694,7 +709,7 @@ impl UiApiHandle for DaemonUiApi {
             .as_ref()
             .map(|e| e.source_names())
             .unwrap_or_default();
-        Ok(serde_json::json!({
+        Ok(agent_api::finalize_untrusted(serde_json::json!({
             "node": {
                 "name": self.node_name,
                 "version": self.daemon_version,
@@ -707,7 +722,7 @@ impl UiApiHandle for DaemonUiApi {
             "plugins": plugins,
             "unhealthy_sources": unhealthy,
             "log_sources": log_sources,
-        }))
+        })))
     }
 
     async fn agent_bans(&self, params: Value) -> PluginResult<Value> {
@@ -716,12 +731,14 @@ impl UiApiHandle for DaemonUiApi {
             st.ban_store().get_all_bans().into_iter().cloned().collect()
         };
         agent_api::filter_bans(records, &params, Utc::now(), self.agent_max_results, ban_record_to_info)
+            .map(agent_api::finalize_untrusted)
             .map_err(agent_api::to_plugin_error)
     }
 
     async fn agent_threats(&self, params: Value) -> PluginResult<Value> {
         let threats = self.list_threats().await;
         agent_api::filter_threats(&threats, &params, Utc::now(), self.agent_max_results)
+            .map(agent_api::finalize_untrusted)
             .map_err(agent_api::to_plugin_error)
     }
 
@@ -732,7 +749,11 @@ impl UiApiHandle for DaemonUiApi {
 
     async fn agent_log_query(&self, params: Value) -> PluginResult<Value> {
         let engine = self.log_engine()?;
-        engine.query(params).await.map_err(agent_api::to_plugin_error)
+        engine
+            .query(params)
+            .await
+            .map(agent_api::finalize_untrusted)
+            .map_err(agent_api::to_plugin_error)
     }
 
     async fn agent_log_stats(&self, params: Value) -> PluginResult<Value> {
@@ -777,7 +798,7 @@ impl UiApiHandle for DaemonUiApi {
                 }
             }
         }
-        Ok(result)
+        Ok(agent_api::finalize_untrusted(result))
     }
 
     async fn agent_ip_profile(&self, params: Value) -> PluginResult<Value> {
@@ -810,7 +831,7 @@ impl UiApiHandle for DaemonUiApi {
                 .map_err(agent_api::to_plugin_error)?,
             None => Value::Null,
         };
-        Ok(serde_json::json!({
+        Ok(agent_api::finalize_untrusted(serde_json::json!({
             "ip": ip_str,
             "ban": { "banned": ban.is_some(), "record": ban },
             "whitelisted": whitelisted,
@@ -821,12 +842,16 @@ impl UiApiHandle for DaemonUiApi {
             },
             "logs": logs,
             "geo": Value::Null,
-        }))
+        })))
     }
 
     async fn agent_journal(&self, params: Value) -> PluginResult<Value> {
         let engine = self.log_engine()?;
-        engine.journal(params).await.map_err(agent_api::to_plugin_error)
+        engine
+            .journal(params)
+            .await
+            .map(agent_api::finalize_untrusted)
+            .map_err(agent_api::to_plugin_error)
     }
 
     async fn agent_detectors(&self) -> PluginResult<Value> {
@@ -849,6 +874,10 @@ impl UiApiHandle for DaemonUiApi {
 
     fn subscribe_agent(&self) -> Option<broadcast::Receiver<AgentEvent>> {
         Some(self.agent.events.subscribe())
+    }
+
+    fn agent_access(&self) -> AgentAccess {
+        self.agent.log_engine.as_ref().map(|e| e.access()).unwrap_or_default()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
@@ -1125,6 +1154,46 @@ mod tests {
             geo_info: None,
         };
         assert_eq!(ban_record_to_info(admin).source, "admin");
+    }
+
+    fn test_api(dir: &std::path::Path, config: Option<PathBuf>) -> DaemonUiApi {
+        use hiveguard_core::persistence::wal::WalSyncMode;
+        let state = Arc::new(Mutex::new(StateManager::new(dir, WalSyncMode::None).unwrap()));
+        let enforcer: Arc<Mutex<Box<dyn Enforcer>>> =
+            Arc::new(Mutex::new(Box::new(hiveguard_enforce::ObserveOnlyEnforcer::new())));
+        DaemonUiApi::new("node-a".into(), "0".into(), state, enforcer, vec![], config, None, None, None, None, None)
+    }
+
+    #[tokio::test]
+    async fn rest_mutations_refuse_too_wide_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path(), None);
+        for wide in ["0.0.0.0/0", "100.0.0.0/15", "::/0", "2001:db8::/31"] {
+            let net: IpNet = wide.parse().unwrap();
+            let req = BanRequest { subject: net, duration: Duration::from_secs(60), reason: "t".into() };
+            assert!(matches!(api.add_ban(req).await, Err(PluginError::ConfigValidation(_))), "{wide}");
+            assert!(matches!(api.add_whitelist(net).await, Err(PluginError::ConfigValidation(_))), "{wide}");
+        }
+        let ok = BanRequest { subject: "100.64.0.0/16".parse().unwrap(), duration: Duration::from_secs(60), reason: "t".into() };
+        api.add_ban(ok).await.unwrap();
+        api.add_whitelist("100.65.0.0/24".parse().unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_get_is_redacted_and_put_refuses_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        let original = "node:\n  name: node-a\nplugins:\n- id: ui.rest\n  config:\n    auth_token: admin-SECRET-123  # keep\n";
+        std::fs::write(&cfg_path, original).unwrap();
+        let api = test_api(dir.path(), Some(cfg_path.clone()));
+        let shown = api.get_config().await.unwrap();
+        assert!(!shown.contains("admin-SECRET-123"), "{shown}");
+        assert!(shown.contains("auth_token: \"<redacted>\"  # keep"), "{shown}");
+        match api.put_config(shown).await {
+            Err(PluginError::ConfigValidation(m)) => assert!(m.contains("<redacted>"), "{m}"),
+            other => panic!("expected 400, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), original, "file untouched");
     }
 
     #[test]

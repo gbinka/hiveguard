@@ -10,8 +10,8 @@ use hiveguard_plugin_api::context::parking_lot_compat::RegistryHandle;
 use hiveguard_plugin_api::context::{PluginContext, PluginMetrics};
 use hiveguard_plugin_api::manifest::PluginKind;
 use hiveguard_plugin_api::registry::{find_descriptor, PluginDescriptor, PluginFactory, API_VERSION};
-use hiveguard_plugin_api::schema::validate_against_schema;
-use hiveguard_plugin_api::secrets::SecretResolver;
+use hiveguard_plugin_api::schema::{format_violations, schema_violations, validate_against_schema};
+use hiveguard_plugin_api::secrets::{parse_placeholders, Placeholder, SecretResolver};
 
 #[derive(Debug, Error)]
 pub enum LoaderError {
@@ -209,6 +209,65 @@ impl Loader {
         }))
     }
 
+    /// Dry-run validation that **never resolves secrets**: every entry is
+    /// matched to a descriptor (optional + unlinked → skipped), api versions
+    /// are checked, `${env:…}` / `${file:…}` placeholders are checked for
+    /// syntax only (no env read, no file read) and the *unresolved* config is
+    /// validated against the plugin schema, ignoring violations located
+    /// exactly at a placeholder-bearing string (its real value is unknown
+    /// until startup). Used by `POST /api/agent/config/validate` and
+    /// `PUT /api/config`, which must not become a file-read oracle.
+    ///
+    /// Returns every placeholder found, as `(plugin id, JSON pointer,
+    /// placeholder)`, so callers can apply their own policy (e.g. allowed
+    /// directories for `${file:…}`).
+    pub fn check_unresolved(
+        &self,
+        cfg: &HiveGuardConfig,
+    ) -> Result<Vec<(String, String, Placeholder)>, LoaderError> {
+        let mut found = Vec::new();
+        for entry in &cfg.plugins {
+            let descriptor = match find_descriptor(&entry.id) {
+                Some(d) => d,
+                None if entry.optional => continue,
+                None => return Err(LoaderError::UnknownPlugin(entry.id.clone())),
+            };
+            if descriptor.api_version != API_VERSION {
+                return Err(LoaderError::ApiVersionMismatch {
+                    id: entry.id.clone(),
+                    required: descriptor.api_version,
+                    host: API_VERSION,
+                });
+            }
+            let mut placeholder_paths: Vec<String> = Vec::new();
+            collect_placeholders(&entry.config, String::new(), &mut |path, s| {
+                let list = parse_placeholders(s)?;
+                if !list.is_empty() {
+                    placeholder_paths.push(path.clone());
+                }
+                for p in list {
+                    found.push((entry.id.clone(), path.clone(), p));
+                }
+                Ok(())
+            })
+            .map_err(|msg| LoaderError::InvalidConfig { id: entry.id.clone(), msg })?;
+
+            let violations = schema_violations(descriptor.config_schema, &entry.config)
+                .map_err(|e| LoaderError::InvalidConfig { id: entry.id.clone(), msg: e.to_string() })?;
+            let remaining: Vec<_> = violations
+                .into_iter()
+                .filter(|v| !placeholder_paths.iter().any(|p| p == &v.instance_path))
+                .collect();
+            if !remaining.is_empty() {
+                return Err(LoaderError::InvalidConfig {
+                    id: entry.id.clone(),
+                    msg: format_violations(&remaining),
+                });
+            }
+        }
+        Ok(found)
+    }
+
     /// Resolve + instantiate every plugin in `cfg`, categorised by kind.
     ///
     /// This is the one-shot entry point most callers want. Returns
@@ -333,6 +392,32 @@ impl Loader {
     }
 }
 
+/// Visit every string leaf of `value` that contains a `${` placeholder,
+/// passing its JSON pointer (RFC 6901 escaping) and text.
+fn collect_placeholders(
+    value: &serde_json::Value,
+    path: String,
+    visit: &mut dyn FnMut(&String, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(s) if s.contains("${") => visit(&path, s),
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                collect_placeholders(v, format!("{path}/{i}"), visit)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let esc = k.replace('~', "~0").replace('/', "~1");
+                collect_placeholders(v, format!("{path}/{esc}"), visit)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Successfully resolved (but not yet instantiated) plugin entry.
 pub struct ResolvedPlugin<'a> {
     pub entry: &'a PluginEntry,
@@ -395,6 +480,39 @@ mod tests {
         });
         let resolved = loader.resolve(&cfg).unwrap();
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn placeholder_paths_collected_with_pointer_escaping() {
+        let v = serde_json::json!({"a": {"b/c": "${env:X}", "n": 1}, "list": ["x", "${file:/etc/hiveguard/t}"]});
+        let mut seen = Vec::new();
+        collect_placeholders(&v, String::new(), &mut |p, s| {
+            seen.push((p.clone(), s.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("/a/b~1c".to_string(), "${env:X}".to_string()),
+                ("/list/1".to_string(), "${file:/etc/hiveguard/t}".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_unresolved_on_empty_config() {
+        let loader = Loader::resolve_only(Arc::new(SecretResolver::new()));
+        assert!(loader.check_unresolved(&empty_cfg()).unwrap().is_empty());
+        let mut cfg = empty_cfg();
+        cfg.plugins.push(PluginEntry {
+            id: "notifier.nonexistent".into(),
+            name: None,
+            config: serde_json::json!({}),
+            optional: false,
+        });
+        assert!(matches!(loader.check_unresolved(&cfg), Err(LoaderError::UnknownPlugin(_))));
     }
 
     #[tokio::test]

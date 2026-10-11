@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 
 use crate::detector::Detector;
+use crate::detectors::netkey::{source_key, DEFAULT_IPV6_PREFIX};
 use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 
 /// SSH brute-force and user-enumeration detector.
@@ -14,6 +15,9 @@ use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 /// Tracks failed authentication attempts per IP in a sliding window.
 /// When `invalid_user` metadata is present, uses separate (stricter)
 /// thresholds for user-enumeration detection.
+///
+/// IPv6 sources are counted per `/ipv6_prefix` (default /64) and banned as
+/// that prefix, so a client rotating addresses inside its /64 is one source.
 pub struct SshBruteforceDetector {
     /// Normal brute-force settings
     threshold: u32,
@@ -29,6 +33,8 @@ pub struct SshBruteforceDetector {
     failures: DashMap<IpAddr, VecDeque<DateTime<Utc>>>,
     /// Sliding window of invalid-user failure timestamps per IP
     enum_failures: DashMap<IpAddr, VecDeque<DateTime<Utc>>>,
+    /// IPv6 aggregation prefix (0/128 = per address).
+    ipv6_prefix: u8,
 }
 
 impl SshBruteforceDetector {
@@ -42,6 +48,7 @@ impl SshBruteforceDetector {
             enum_ban_duration: Duration::from_secs(172800), // 48h
             failures: DashMap::new(),
             enum_failures: DashMap::new(),
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
         }
     }
 
@@ -63,14 +70,14 @@ impl SshBruteforceDetector {
             enum_ban_duration,
             failures: DashMap::new(),
             enum_failures: DashMap::new(),
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
         }
     }
 
-    fn ip_to_net(ip: IpAddr) -> IpNet {
-        match ip {
-            IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-            IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
-        }
+    /// Count (and ban) IPv6 sources per this prefix; 0 or 128 = per address.
+    pub fn with_ipv6_prefix(mut self, prefix: u8) -> Self {
+        self.ipv6_prefix = prefix;
+        self
     }
 
     fn compute_evidence_hash(ip: &IpAddr, reason: &str) -> [u8; 32] {
@@ -107,7 +114,8 @@ impl Detector for SshBruteforceDetector {
             return None;
         }
 
-        let ip = event.source_ip;
+        let key: IpNet = source_key(event.source_ip, self.ipv6_prefix);
+        let ip = key.addr();
         let now = event.timestamp;
         let is_invalid_user = event
             .metadata
@@ -125,13 +133,13 @@ impl Detector for SshBruteforceDetector {
                 let reason = format!(
                     "SSH brute-force: {} failed logins from {} in window",
                     deque.len(),
-                    ip
+                    key
                 );
                 let evidence_hash = Self::compute_evidence_hash(&ip, &reason);
                 // Clear to avoid re-triggering on every subsequent event
                 deque.clear();
                 return Some(DetectionSignal {
-                    source_ip: Self::ip_to_net(ip),
+                    source_ip: key,
                     severity: 150,
                     confidence: 0.9,
                     reason,
@@ -153,12 +161,12 @@ impl Detector for SshBruteforceDetector {
                 let reason = format!(
                     "SSH user enumeration: {} invalid-user attempts from {} in window",
                     deque.len(),
-                    ip
+                    key
                 );
                 let evidence_hash = Self::compute_evidence_hash(&ip, &reason);
                 deque.clear();
                 return Some(DetectionSignal {
-                    source_ip: Self::ip_to_net(ip),
+                    source_ip: key,
                     severity: 180,
                     confidence: 0.9,
                     reason,
@@ -494,5 +502,36 @@ mod tests {
         assert_eq!(det.window, Duration::from_secs(300));
         assert_eq!(det.enum_threshold, 3);
         assert_eq!(det.enum_window, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn ipv6_rotation_within_slash64_is_aggregated() {
+        let det = SshBruteforceDetector::new(); // threshold 5, ipv6_prefix 64
+        let now = Utc::now();
+        let mut last = None;
+        for i in 1..=5 {
+            let ip = format!("2001:db8:8000:2::{i:x}");
+            last = det.process(&make_auth_failure(&ip, now, false));
+        }
+        let s = last.expect("aggregated per /64");
+        assert_eq!(s.source_ip.to_string(), "2001:db8:8000:2::/64");
+        assert!(s.reason.contains("2001:db8:8000:2::/64"));
+    }
+
+    #[test]
+    fn ipv6_prefix_128_is_per_address_and_v4_unchanged() {
+        let det = SshBruteforceDetector::new().with_ipv6_prefix(128);
+        let now = Utc::now();
+        for i in 1..=5 {
+            let ip = format!("2001:db8:8000:2::{i:x}");
+            assert!(det.process(&make_auth_failure(&ip, now, false)).is_none());
+        }
+        let det = SshBruteforceDetector::new();
+        let mut last = None;
+        for i in 1..=5 {
+            // Five different IPv4 hosts in one /24: still per host.
+            last = det.process(&make_auth_failure(&format!("100.64.0.{i}"), now, false));
+        }
+        assert!(last.is_none());
     }
 }

@@ -19,6 +19,16 @@ impl DistributedSlowDetector {
     pub fn with_config(_window: Duration, _ip_threshold: usize, _ban_duration: Duration) -> Self {
         Self
     }
+
+    /// Startup warning for configs that still list this detector: it is a
+    /// deliberate no-op and only costs a pipeline slot.
+    pub fn warn_noop_configured() {
+        tracing::warn!(
+            "detector.distributed_slow is a no-op (it never emits signals); remove it from \
+             `plugins:` — for distributed / residential-proxy crawls use detector.distributed_crawl, \
+             for subnet floods detector.http_flood (subnet_threshold)"
+        );
+    }
 }
 
 impl Default for DistributedSlowDetector {

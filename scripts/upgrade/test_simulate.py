@@ -17,16 +17,20 @@ def record(subject, expiry=None):
     return {"subject": subject, "expires_at": expiry, "reason": "test", "severity": 100}
 
 
-def nft_document():
+def nft_document(prerouting=False):
     items = [{"chain": {"family": "inet", "table": "hiveguard", "name": "input", "type": "filter",
                         "hook": "input", "prio": -10, "policy": "accept"}}]
+    if prerouting:
+        items.append({"chain": {"family": "inet", "table": "hiveguard", "name": "prerouting", "type": "filter",
+                                "hook": "prerouting", "prio": -300, "policy": "accept"}})
     for name, version in simulate.SETS.items():
         items.append({"set": {"family": "inet", "table": "hiveguard", "name": name,
                               "type": f"ipv{version}_addr", "elem": []}})
-        items.append({"rule": {"family": "inet", "table": "hiveguard", "chain": "input", "expr": [
-            {"match": {"op": "==", "left": {"payload": {"protocol": "ip" if version == 4 else "ip6", "field": "saddr"}}, "right": "@" + name}},
-            {"drop": None},
-        ]}})
+        for chain in ("input", "prerouting") if prerouting else ("input",):
+            items.append({"rule": {"family": "inet", "table": "hiveguard", "chain": chain, "expr": [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "ip" if version == 4 else "ip6", "field": "saddr"}}, "right": "@" + name}},
+                {"drop": None},
+            ]}})
     return {"nftables": items}
 
 
@@ -42,6 +46,26 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(simulate.nft_state(document), {4: [], 6: []})
         document["nftables"][-1] = document["nftables"][-3]
         with self.assertRaisesRegex(simulate.CheckFailed, "duplicated or missing"):
+            simulate.nft_state(document)
+
+    def test_prerouting_chain_must_match_configured_layout(self):
+        self.assertEqual(simulate.nft_state(nft_document(prerouting=True), True), {4: [], 6: []})
+        with self.assertRaisesRegex(simulate.CheckFailed, "prerouting chain presence"):
+            simulate.nft_state(nft_document(prerouting=True))
+        with self.assertRaisesRegex(simulate.CheckFailed, "prerouting chain presence"):
+            simulate.nft_state(nft_document(), True)
+        document = nft_document(prerouting=True)
+        rules = [i for i, item in enumerate(document["nftables"]) if item.get("rule", {}).get("chain") == "prerouting"]
+        del document["nftables"][rules[0]]
+        with self.assertRaisesRegex(simulate.CheckFailed, "prerouting chain must contain exactly six"):
+            simulate.nft_state(document, True)
+        document = nft_document(prerouting=True)
+        document["nftables"][1]["chain"]["prio"] = -150
+        with self.assertRaisesRegex(simulate.CheckFailed, "unexpected hook, priority"):
+            simulate.nft_state(document, True)
+        document = nft_document()
+        document["nftables"].append({"chain": {"family": "inet", "table": "hiveguard", "name": "admin"}})
+        with self.assertRaisesRegex(simulate.CheckFailed, "unexpected chain"):
             simulate.nft_state(document)
 
     def test_ipv4_and_ipv6_prefix_range_and_wrapped_elements(self):

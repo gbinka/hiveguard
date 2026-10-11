@@ -44,6 +44,12 @@ TABLE = "hiveguard"
 BASE_SET = "hiveguard_blocklist"
 SETS = {BASE_SET, BASE_SET + "_v6", BASE_SET + "_sync", BASE_SET + "_v6_sync",
         BASE_SET + "_sync_next", BASE_SET + "_v6_sync_next"}
+# Managed base chains: (type, hook, priority, policy). "input" always exists;
+# "prerouting" only with enforcer.nftables `prerouting_hook: true` (it covers
+# DNAT-ed/Docker-published ports). Both carry the same six drop rules.
+CHAINS = {"input": ("filter", "input", -10, "accept"),
+          "prerouting": ("filter", "prerouting", -300, "accept")}
+PREROUTING_KEY = "prerouting_hook"
 
 
 def load_target_profile():
@@ -204,9 +210,16 @@ def covered(net, pool):
     return any(net.version == sup.version and net.subnet_of(sup) for sup in pool)
 
 
-def inspect_nft(document, exactly_six=False, allow_incomplete=False):
-    """Only the known exclusive HiveGuard table/chain/set layout may be replaced."""
-    seen_sets, seen_chains, rules, nets = set(), [], [], []
+def inspect_nft(document, exactly_six=False, allow_incomplete=False, prerouting=None):
+    """Only the known exclusive HiveGuard table/chain/set layout may be replaced.
+
+    Two layouts are accepted: chain "input" alone, or "input" plus the optional
+    "prerouting" chain; every present chain holds one drop rule per managed set.
+    exactly_six: exactly six rules in each present chain (no duplicates).
+    prerouting: None = either layout; True/False = the chain must (not) exist.
+    """
+    seen_sets, seen_chains, nets = set(), [], []
+    rules = {name: [] for name in CHAINS}
     for item in document["nftables"]:
         if "metainfo" in item:
             continue
@@ -216,10 +229,11 @@ def inspect_nft(document, exactly_six=False, allow_incomplete=False):
         if kind == "table":
             continue
         if kind == "chain":
-            if (obj.get("name"), obj.get("type"), obj.get("hook"), obj.get("prio"), obj.get("policy")) != (
-                    "input", "filter", "input", -10, "accept"):
+            name = obj.get("name")
+            if name not in CHAINS or name in seen_chains or (
+                    obj.get("type"), obj.get("hook"), obj.get("prio"), obj.get("policy")) != CHAINS[name]:
                 raise RuntimeError("Unexpected chain in HiveGuard table; automatic replacement refused")
-            seen_chains.append(obj["name"])
+            seen_chains.append(name)
         elif kind == "set":
             name = obj["name"]
             family = "ipv6_addr" if "_v6" in name else "ipv4_addr"
@@ -230,7 +244,7 @@ def inspect_nft(document, exactly_six=False, allow_incomplete=False):
                 nets.extend(element_nets(element))
         elif kind == "rule":
             expr = obj.get("expr", [])
-            if obj.get("chain") != "input" or len(expr) != 2 or expr[1] != {"drop": None}:
+            if obj.get("chain") not in CHAINS or len(expr) != 2 or expr[1] != {"drop": None}:
                 raise RuntimeError("Foreign rule in managed chain; refusing to erase it")
             match = expr[0].get("match", {})
             right = match.get("right", "")
@@ -238,14 +252,31 @@ def inspect_nft(document, exactly_six=False, allow_incomplete=False):
             if (match.get("op") not in ("==", "in") or right not in {"@" + s for s in SETS}
                     or match.get("left") != {"payload": {"protocol": family, "field": "saddr"}}):
                 raise RuntimeError("Foreign match in managed chain; automatic replacement refused")
-            rules.append(right[1:])
+            rules[obj["chain"]].append(right[1:])
         else:
             raise RuntimeError(f"Unrecognized managed table object: {kind}")
-    if not allow_incomplete and (seen_sets != SETS or seen_chains != ["input"] or set(rules) != SETS):
+    if any(rules[name] and name not in seen_chains for name in CHAINS):
+        raise RuntimeError("Rule outside a known managed chain; manual review required")
+    has_prerouting = "prerouting" in seen_chains
+    if not allow_incomplete and (seen_sets != SETS or "input" not in seen_chains
+                                 or any(set(rules[name]) != SETS for name in seen_chains)):
         raise RuntimeError("Incomplete HiveGuard table; manual review required")
-    if exactly_six and len(rules) != 6:
-        raise RuntimeError("Expected exactly six drop rules after upgrade")
+    if exactly_six and any(len(rules[name]) != 6 for name in seen_chains):
+        raise RuntimeError("Expected exactly six drop rules per managed chain after upgrade")
+    if prerouting is not None and has_prerouting != prerouting:
+        state = "missing" if prerouting else "present although prerouting_hook is off"
+        raise RuntimeError(f"HiveGuard prerouting chain {state}; Docker/DNAT coverage differs from config")
     return collapsed(nets)
+
+
+def has_prerouting_chain(document):
+    return any(item.get("chain", {}).get("name") == "prerouting" for item in document["nftables"])
+
+
+def config_prerouting(report):
+    """Expected prerouting layout from the checker's config report (None if unknown)."""
+    value = (report.get("config") or {}).get("nftables_prerouting_hook")
+    return value if isinstance(value, bool) else None
 
 
 def nft_document():
@@ -259,11 +290,12 @@ def assert_coverage(records, pool):
         raise RuntimeError(f"Firewall misses {len(missing)} active bans: {missing[:5]}")
 
 
-def check_live_coverage(records, exactly_six=False):
+def check_live_coverage(records, exactly_six=False, prerouting=None):
     # State insertion precedes the enforcer's asynchronous queue. Retry a fixed
     # view briefly rather than confusing an in-flight ban with lost enforcement.
+    # Both chains reference the same sets, so set coverage covers both hooks.
     for attempt in range(6):
-        pool = inspect_nft(nft_document(), exactly_six=exactly_six)
+        pool = inspect_nft(nft_document(), exactly_six=exactly_six, prerouting=prerouting)
         try:
             assert_coverage(records, pool)
             return
@@ -280,7 +312,12 @@ def assert_no_orphans(report, pool):
 
 
 def firewall_restore(records, extra_pool, table_exists=True):
-    """Build one atomic transaction with canonical, non-overlapping intervals."""
+    """Build one atomic transaction with canonical, non-overlapping intervals.
+
+    Recreates only the "input" layout. An optional "prerouting" chain is
+    deliberately dropped: builds without `prerouting_hook` would never manage
+    or remove it, and builds with it recreate it from config at startup.
+    """
     nets = collapsed(extra_pool + [ipaddress.ip_network(r["subject"], strict=False)
                                   for r in records if expiry(r) > now()])
     lines = ["delete table inet hiveguard"] if table_exists else []
@@ -394,7 +431,9 @@ def preflight(work, ssh_ip):
             "--restore-nft", work / "nft.txt"]
     result = run(args, timeout=75)
     (work / "simulation-result.txt").write_text(result)
-    print(f"Preflight OK: {report['total_count']} records; {report['active_count']} active. Source unchanged.", flush=True)
+    layout = "input+prerouting" if has_prerouting_chain(document) else "input"
+    print(f"Preflight OK: {report['total_count']} records; {report['active_count']} active. "
+          f"nft chains: {layout}; config prerouting_hook: {config_prerouting(report)}. Source unchanged.", flush=True)
     return report
 
 
@@ -425,6 +464,33 @@ def stop_service():
         raise RuntimeError("Old process is still alive; no data/binary replacement performed")
 
 
+def binary_knows(path, token):
+    """True if the executable embeds `token` (plugin schemas are compiled in)."""
+    needle, tail = token.encode(), b""
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            if needle in tail + chunk:
+                return True
+            tail = chunk[-len(needle):]
+    return False
+
+
+def config_mentions(key, text):
+    """A non-comment YAML/JSON occurrence of `key:` anywhere in the config."""
+    return re.search(r'^[^#\n]*["\']?\b' + re.escape(key) + r'\b["\']?\s*:', text, re.M) is not None
+
+
+def assert_old_binary_accepts_config(backup):
+    """Plugin schemas reject unknown keys: an old executable would not start."""
+    try:
+        text = CONFIG.read_text()
+    except OSError:
+        return  # nothing to check; the service start reports a missing config
+    if config_mentions(PREROUTING_KEY, text) and not binary_knows(backup / "hiveguard.old", PREROUTING_KEY):
+        raise RuntimeError(f"Config uses enforcer.nftables {PREROUTING_KEY}, which the old executable rejects; "
+                           f"remove that key from {CONFIG} (Docker ports lose ban coverage) and retry the rollback")
+
+
 def rollback(backup, automatic=False):
     if (backup / "rolled-back").exists() or (automatic and (backup / "committed").exists()):
         return
@@ -435,6 +501,7 @@ def rollback(backup, automatic=False):
         run(["systemctl", "start", "hiveguard"], timeout=100)
         print("Old service resumed; upgrade stopped before any replacement.", flush=True)
         return
+    assert_old_binary_accepts_config(backup)
     stop_service()
     saved = backup / ("post-upgrade-state-" + str(time.time_ns()))
     copy_preserving(DATA, saved)
@@ -523,7 +590,7 @@ def install(ssh_ip):
                 raise RuntimeError("Service restarted during observation")
             current = socket_bans()
             assert_preserved(baseline["bans"], current)
-            check_live_coverage(current, exactly_six=True)
+            check_live_coverage(current, exactly_six=True, prerouting=config_prerouting(baseline))
         journal = run(["journalctl", "-u", "hiveguard", "_PID=" + pid, "--no-pager", "-o", "cat"])
         (backup / "startup.log").write_text(journal)
         for marker in ("log source exited; restarting", "Firewall reconciliation failed", "Failed to apply ban", "panicked"):

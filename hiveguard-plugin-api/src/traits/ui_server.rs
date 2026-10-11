@@ -116,6 +116,23 @@ impl AgentEvent {
     }
 }
 
+/// Access settings of the agent surface the REST layer enforces, supplied by
+/// the host from the top-level `agent:` config section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAccess {
+    /// Read-only bearer token (from `agent.read_token_file`). `None` →
+    /// only the admin `auth_token` is accepted.
+    pub read_token: Option<String>,
+    /// Maximum simultaneous `/api/agent/stream` connections (`agent.max_streams`).
+    pub max_streams: usize,
+}
+
+impl Default for AgentAccess {
+    fn default() -> Self {
+        Self { read_token: None, max_streams: 4 }
+    }
+}
+
 /// Ban request from the UI (operator clicks "Ban" in the form).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BanRequest {
@@ -374,8 +391,8 @@ pub trait UiApiHandle: Send + Sync + 'static {
     // Payloads are `serde_json::Value` on purpose: the shapes are documented in
     // AGENT_API.md and evolve with the daemon, and keeping them untyped here
     // means new fields never require a plugin-API bump. Error mapping in the
-    // REST layer: `ConfigValidation` → 400, `NotFound` → 404, anything else →
-    // 503 (defaults below → "not supported by this UiApiHandle").
+    // REST layer: `ConfigValidation` → 400, `NotFound` → 404, `Busy` → 429,
+    // anything else → 503 (defaults below → "not supported by this UiApiHandle").
     // -----------------------------------------------------------------------
 
     /// One-call situation report (§3.1).
@@ -440,6 +457,12 @@ pub trait UiApiHandle: Send + Sync + 'static {
     /// not produce them (REST layer answers 503).
     fn subscribe_agent(&self) -> Option<broadcast::Receiver<AgentEvent>> {
         None
+    }
+
+    /// Read-only agent token + stream limit (`agent:` config section).
+    /// Default: no read-only token, 4 streams.
+    fn agent_access(&self) -> AgentAccess {
+        AgentAccess::default()
     }
 
     // --- Live updates ---

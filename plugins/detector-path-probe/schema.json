@@ -8,6 +8,10 @@
       "items": { "type": "string", "minLength": 1 },
       "minItems": 1
     },
-    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "segment_paths": { "type": "array", "items": { "type": "string", "minLength": 2 }, "description": "Patterns matched case-insensitively anywhere in the path (query excluded, also after one percent-decode) on a segment boundary: must start a segment and be followed by end, '/', '.', '-', '_' or '~'. Default: /.git /.svn /.hg /.env /.aws /.ssh /.DS_Store /.htpasswd /vendor/phpunit. [] = off." },
+    "query_patterns": { "type": "array", "items": { "type": "string", "minLength": 3 }, "description": "Case-insensitive substrings of the query string, checked raw and after one and two percent-decodes. Default: pearcmd peclcmd allow_url_include auto_prepend_file /etc/passwd /proc/self/environ win.ini ..%2f php://filter php://input jndi:. [] = off." },
+    "exact_paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Exact paths (query and trailing '/' ignored, case-insensitive). Default: /mcp /api/mcp /v1/models (MCP / LLM API reconnaissance). Override with [] on hosts that serve these endpoints." },
+    "ipv6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "IPv6 ban prefix. 0 or 128 = per address (default); otherwise 48..128 (e.g. 64)." }
   }
 }

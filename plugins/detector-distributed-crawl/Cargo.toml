@@ -1,0 +1,18 @@
+[package]
+name = "hiveguard-plugin-detector-distributed-crawl"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed (residential-proxy) crawl detector plugin for HiveGuard: under-attack flag, never bans"
+
+[dependencies]
+hiveguard-plugin-api = { path = "../../hiveguard-plugin-api" }
+hiveguard-core = { path = "../../hiveguard-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+tempfile = "3"

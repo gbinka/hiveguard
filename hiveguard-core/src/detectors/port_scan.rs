@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 
 use crate::detector::Detector;
+use crate::detectors::netkey::{source_key, subnet_of, DEFAULT_IPV6_PREFIX};
 use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 
 /// Sweep expired per-IP state every this many port events.
@@ -27,6 +28,15 @@ const SWEEP_EVERY: u64 = 4096;
 /// `port_scan_slow`). Each IP keeps at most `long_threshold` entries (it
 /// fires and resets on reaching it) and at most `max_tracked_ips` IPs are
 /// tracked per tier, so memory stays bounded under heavy scanning.
+///
+/// IPv6 sources are counted per `/ipv6_prefix` (default /64) in both tiers
+/// and banned as that prefix: scanners rotate addresses inside their /64.
+///
+/// Optional **distributed slow tier** (`long_subnet_v4_prefix`, off by
+/// default): distinct ports probed by all addresses of one IPv4 subnet within
+/// `long_window`; fires (subnet ban, `port_scan_slow`) at
+/// `long_subnet_threshold` ports seen from at least `long_subnet_min_ips`
+/// addresses — several hosts of one /24 each staying under the per-IP limit.
 pub struct PortScanDetector {
     /// Window for tracking port access.
     window: Duration,
@@ -43,6 +53,14 @@ pub struct PortScanDetector {
     long_access: DashMap<IpAddr, Vec<(u16, DateTime<Utc>)>>,
     /// Cap of IPs tracked per tier.
     max_tracked_ips: usize,
+    /// IPv6 aggregation prefix (0/128 = per address).
+    ipv6_prefix: u8,
+    /// Distributed slow tier over IPv4 subnets (prefix 0 = off).
+    long_subnet_v4_prefix: u8,
+    long_subnet_threshold: usize,
+    long_subnet_min_ips: usize,
+    /// Per subnet: (port, source, last seen), one entry per (port, source).
+    long_subnet_access: DashMap<IpNet, Vec<(u16, IpAddr, DateTime<Utc>)>>,
     events: AtomicU64,
 }
 
@@ -50,6 +68,8 @@ pub const DEFAULT_LONG_WINDOW_SECS: u64 = 6 * 3600;
 pub const DEFAULT_LONG_THRESHOLD: usize = 25;
 pub const DEFAULT_LONG_BAN_SECS: u64 = 7 * 24 * 3600;
 pub const DEFAULT_MAX_TRACKED_IPS: usize = 50_000;
+pub const DEFAULT_LONG_SUBNET_THRESHOLD: usize = 40;
+pub const DEFAULT_LONG_SUBNET_MIN_IPS: usize = 3;
 
 impl PortScanDetector {
     pub fn new() -> Self {
@@ -67,8 +87,28 @@ impl PortScanDetector {
             long_ban_duration: Duration::from_secs(DEFAULT_LONG_BAN_SECS),
             long_access: DashMap::new(),
             max_tracked_ips: DEFAULT_MAX_TRACKED_IPS,
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
+            long_subnet_v4_prefix: 0,
+            long_subnet_threshold: DEFAULT_LONG_SUBNET_THRESHOLD,
+            long_subnet_min_ips: DEFAULT_LONG_SUBNET_MIN_IPS,
+            long_subnet_access: DashMap::new(),
             events: AtomicU64::new(0),
         }
+    }
+
+    /// Count (and ban) IPv6 sources per this prefix; 0 or 128 = per address.
+    pub fn with_ipv6_prefix(mut self, prefix: u8) -> Self {
+        self.ipv6_prefix = prefix;
+        self
+    }
+
+    /// Enable the distributed slow tier over IPv4 `/v4_prefix` subnets
+    /// (0 = off). Uses the long tier's window and ban duration.
+    pub fn with_long_subnet_tier(mut self, v4_prefix: u8, threshold: usize, min_ips: usize) -> Self {
+        self.long_subnet_v4_prefix = v4_prefix.min(32);
+        self.long_subnet_threshold = threshold;
+        self.long_subnet_min_ips = min_ips.max(1);
+        self
     }
 
     /// Configure the long-window tier; `threshold == 0` disables it.
@@ -85,11 +125,9 @@ impl PortScanDetector {
         self
     }
 
-    fn ip_to_net(ip: IpAddr) -> IpNet {
-        match ip {
-            IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-            IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
-        }
+    /// Counting key (= ban subject) of a source address.
+    fn key(&self, ip: IpAddr) -> IpNet {
+        source_key(ip, self.ipv6_prefix)
     }
 
     fn cutoff(now: DateTime<Utc>, window: Duration) -> DateTime<Utc> {
@@ -119,6 +157,64 @@ impl PortScanDetector {
         self.port_access.retain(|_, v| v.iter().any(|(_, t)| *t > short));
         let long = Self::cutoff(now, self.long_window);
         self.long_access.retain(|_, v| v.iter().any(|(_, t)| *t > long));
+        self.long_subnet_access
+            .retain(|_, v| v.iter().any(|(_, _, t)| *t > long));
+    }
+
+    /// Distributed slow tier: record `(port, ip)` for the IPv4 subnet and
+    /// fire once the subnet reached the distinct-port and distinct-IP minima.
+    fn long_subnet_tier(&self, ip: IpAddr, port: u16, now: DateTime<Utc>) -> Option<DetectionSignal> {
+        if self.long_subnet_threshold == 0 || !ip.is_ipv4() {
+            return None;
+        }
+        let subnet = subnet_of(ip, self.long_subnet_v4_prefix, 0)?;
+        if self.long_subnet_access.len() >= self.max_tracked_ips
+            && !self.long_subnet_access.contains_key(&subnet)
+        {
+            self.sweep(now);
+            if self.long_subnet_access.len() >= self.max_tracked_ips {
+                return None;
+            }
+        }
+        let cutoff = Self::cutoff(now, self.long_window);
+        let cap = self.long_subnet_threshold * 4 + 64;
+        let mut entries = self.long_subnet_access.entry(subnet).or_default();
+        entries.retain(|(p, a, t)| *t > cutoff && !(*p == port && *a == ip));
+        entries.push((port, ip, now));
+        if entries.len() > cap {
+            let excess = entries.len() - cap;
+            entries.drain(..excess);
+        }
+        let mut ports: Vec<u16> = entries.iter().map(|(p, _, _)| *p).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        if ports.len() < self.long_subnet_threshold {
+            return None;
+        }
+        let mut ips: Vec<IpAddr> = entries.iter().map(|(_, a, _)| *a).collect();
+        ips.sort_unstable();
+        ips.dedup();
+        if ips.len() < self.long_subnet_min_ips {
+            return None;
+        }
+        let (n_ports, n_ips) = (ports.len(), ips.len());
+        entries.clear();
+        drop(entries);
+        self.long_subnet_access.remove(&subnet);
+        let evidence = format!("{subnet}:port_scan_slow:subnet:{n_ports}_ports:{}", now.timestamp() / 60);
+        Some(DetectionSignal {
+            source_ip: subnet,
+            severity: 200,
+            confidence: 0.9,
+            reason: format!(
+                "Distributed slow port scan: {n_ports} unique ports from {n_ips} addresses in {subnet} in {}s",
+                self.long_window.as_secs()
+            ),
+            evidence_hash: *blake3::hash(evidence.as_bytes()).as_bytes(),
+            suggested_action: Action::Ban(self.long_ban_duration),
+            detector_name: "port_scan_slow".into(),
+            timestamp: now,
+        })
     }
 
     /// May a new IP be added to `map`? Sweeps once when full; fails open
@@ -131,7 +227,8 @@ impl PortScanDetector {
         map.len() < self.max_tracked_ips
     }
 
-    fn long_tier(&self, ip: IpAddr, port: u16, now: DateTime<Utc>) -> Option<DetectionSignal> {
+    fn long_tier(&self, key: IpNet, port: u16, now: DateTime<Utc>) -> Option<DetectionSignal> {
+        let ip = key.addr();
         if self.long_threshold == 0 || !self.admit(&self.long_access, &ip, now) {
             return None;
         }
@@ -146,9 +243,9 @@ impl PortScanDetector {
         entries.clear();
         drop(entries);
         self.long_access.remove(&ip);
-        let evidence = format!("{}:port_scan_slow:{}_ports:{}", ip, unique, now.timestamp() / 60);
+        let evidence = format!("{}:port_scan_slow:{}_ports:{}", key, unique, now.timestamp() / 60);
         Some(DetectionSignal {
-            source_ip: Self::ip_to_net(ip),
+            source_ip: key,
             severity: 200,
             confidence: 0.9,
             reason: format!(
@@ -181,13 +278,19 @@ impl Detector for PortScanDetector {
         }
 
         let port: u16 = event.metadata.get("port")?.parse().ok()?;
-        let ip = event.source_ip;
+        // IPv6: one key per /ipv6_prefix, so address rotation inside the
+        // prefix keeps adding to the same counters.
+        let key = self.key(event.source_ip);
+        let ip = key.addr();
 
         self.maybe_sweep(event.timestamp);
         self.cleanup_old_entries(&ip, event.timestamp);
 
+        // The subnet tier sees every event; its (wider) ban wins.
+        let subnet_signal = self.long_subnet_tier(event.source_ip, port, event.timestamp);
+
         if !self.admit(&self.port_access, &ip, event.timestamp) {
-            return self.long_tier(ip, port, event.timestamp);
+            return subnet_signal.or_else(|| self.long_tier(key, port, event.timestamp));
         }
         let mut entries = self.port_access.entry(ip).or_default();
         // Keep one entry per port so repeated hits on the same port cannot
@@ -197,15 +300,15 @@ impl Detector for PortScanDetector {
         let unique_ports = entries.len();
 
         if unique_ports >= self.threshold {
-            let evidence = format!("{}:port_scan:{}_ports", ip, unique_ports);
+            let evidence = format!("{}:port_scan:{}_ports", key, unique_ports);
             // Clear the entries to avoid repeated firing
             entries.clear();
             drop(entries);
             // The short-tier ban covers the slow tier too.
             self.long_access.remove(&ip);
 
-            Some(DetectionSignal {
-                source_ip: Self::ip_to_net(ip),
+            subnet_signal.or(Some(DetectionSignal {
+                source_ip: key,
                 severity: 200,
                 confidence: 0.9,
                 reason: format!("Port scan detected: {} unique ports in {}s", unique_ports, self.window.as_secs()),
@@ -213,10 +316,10 @@ impl Detector for PortScanDetector {
                 suggested_action: Action::Ban(self.ban_duration),
                 detector_name: "port_scan".into(),
                 timestamp: event.timestamp,
-            })
+            }))
         } else {
             drop(entries);
-            self.long_tier(ip, port, event.timestamp)
+            subnet_signal.or_else(|| self.long_tier(key, port, event.timestamp))
         }
     }
 }
@@ -533,5 +636,95 @@ mod tests {
         }
         let s = last.unwrap();
         assert!(s.reason.contains("3 unique ports"));
+    }
+
+    #[test]
+    fn ipv6_rotation_inside_a_slash64_is_one_scanner() {
+        let d = PortScanDetector::new(); // threshold 6, ipv6_prefix 64
+        let base = Utc::now();
+        let mut fired = None;
+        for i in 1..=6u16 {
+            // A new address of the same /64 for every port.
+            let ip = format!("2001:db8:8000:1::{i:x}");
+            fired = d.process(&make_port_event(&ip, 1000 + i, base));
+        }
+        let s = fired.expect("aggregated over the /64");
+        assert_eq!(s.source_ip.to_string(), "2001:db8:8000:1::/64");
+        assert_eq!(s.detector_name, "port_scan");
+    }
+
+    #[test]
+    fn ipv6_prefix_128_keeps_per_address_counting() {
+        let d = PortScanDetector::new().with_ipv6_prefix(128);
+        let base = Utc::now();
+        for i in 1..=6u16 {
+            let ip = format!("2001:db8:8000:1::{i:x}");
+            assert!(d.process(&make_port_event(&ip, 1000 + i, base)).is_none());
+        }
+    }
+
+    #[test]
+    fn ipv6_long_tier_aggregates_prefix() {
+        let d = PortScanDetector::with_config(Duration::from_secs(60), 1000, Duration::from_secs(3600))
+            .with_long_tier(Duration::from_secs(6 * 3600), 25, Duration::from_secs(7 * 86400));
+        let base = Utc::now();
+        let mut fired = None;
+        for i in 0..25u16 {
+            let ip = format!("2001:db8:8000:1::{:x}", 100 + i);
+            let ts = base + chrono::Duration::seconds(i as i64 * 600);
+            fired = d.process(&make_port_event(&ip, 2000 + i, ts));
+        }
+        let s = fired.expect("slow tier over the /64");
+        assert_eq!(s.detector_name, "port_scan_slow");
+        assert_eq!(s.source_ip.to_string(), "2001:db8:8000:1::/64");
+    }
+
+    #[test]
+    fn distributed_slow_scan_from_one_slash24_bans_subnet() {
+        // 7 hosts of one /24, ~20 ports each over 6 h: per-IP slow tier (25)
+        // never fires; the subnet tier (40 ports, >= 3 IPs) does.
+        let d = PortScanDetector::new().with_long_subnet_tier(24, 40, 3);
+        let base = Utc::now();
+        let mut fired = None;
+        // Each host probes one port every 15 min (never 6 in the 10-min
+        // short window); the 7 hosts interleave over 5 h.
+        'outer: for k in 0..20u16 {
+            for host in 1..=7u16 {
+                let ip = format!("100.64.49.{host}");
+                let port = 1000 + host * 100 + k;
+                let ts = base + chrono::Duration::seconds(k as i64 * 900 + host as i64 * 60);
+                if let Some(s) = d.process(&make_port_event(&ip, port, ts)) {
+                    fired = Some(s);
+                    break 'outer;
+                }
+            }
+        }
+        let s = fired.expect("subnet slow tier");
+        assert_eq!(s.detector_name, "port_scan_slow");
+        assert_eq!(s.source_ip.to_string(), "100.64.49.0/24");
+        assert!(s.reason.contains("addresses"));
+    }
+
+    #[test]
+    fn subnet_tier_off_by_default_and_needs_min_ips() {
+        let base = Utc::now();
+        let d = PortScanDetector::new();
+        for k in 0..20u16 {
+            for host in 1..=7u16 {
+                let ts = base + chrono::Duration::seconds(k as i64 * 900 + host as i64 * 60);
+                assert!(d
+                    .process(&make_port_event(&format!("100.64.49.{host}"), 1000 + host * 100 + k, ts))
+                    .is_none());
+            }
+        }
+        // Enabled, but all ports come from 2 addresses only.
+        let d = PortScanDetector::new()
+            .with_long_tier(Duration::from_secs(6 * 3600), 0, Duration::from_secs(3600))
+            .with_long_subnet_tier(24, 10, 3);
+        for k in 0..30u16 {
+            let ts = base + chrono::Duration::seconds(k as i64 * 600);
+            let ip = format!("100.64.49.{}", 1 + (k % 2));
+            assert!(d.process(&make_port_event(&ip, 3000 + k, ts)).is_none());
+        }
     }
 }

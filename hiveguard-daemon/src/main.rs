@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use hiveguard_core::api::{ApiRequest, ExportFormat};
 use hiveguard_core::ban_store::BanStore;
-use hiveguard_core::bot_registry::{BotPolicy, BotRegistry, BotRule};
+use hiveguard_core::bot_registry::BotRegistry;
 use hiveguard_core::config::HiveGuardConfig;
 use hiveguard_core::detectors::create_detectors as create_detectors_from_config;
 use hiveguard_core::persistence::state_manager::StateManager;
@@ -219,9 +219,23 @@ enum WhitelistAction {
     List,
 }
 
+/// ANSI colours only for an interactive terminal: never under systemd
+/// (`JOURNAL_STREAM` is set when stdout/stderr go to the journal), pipes or files,
+/// where escape sequences end up verbatim in `journalctl` output.
+fn log_ansi_enabled(stdout_is_tty: bool, journal_stream: Option<&std::ffi::OsStr>) -> bool {
+    stdout_is_tty && journal_stream.is_none()
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    {
+        use std::io::IsTerminal;
+        let ansi = log_ansi_enabled(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("JOURNAL_STREAM").as_deref(),
+        );
+        tracing_subscriber::fmt().with_ansi(ansi).init();
+    }
 
     let cli = Cli::parse();
 
@@ -437,22 +451,8 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
     }
 
     // --- Step 4b: Initialize bot registry from config ---
-    let bot_rules: Vec<BotRule> = config.bots.iter().map(|rc| {
-        let policy = match rc.policy.to_lowercase().as_str() {
-            "block" => BotPolicy::Block,
-            "monitor" => BotPolicy::Monitor,
-            "allow" => BotPolicy::Allow,
-            _ => BotPolicy::Monitor,
-        };
-        BotRule {
-            name: rc.name.clone(),
-            ua_contains: rc.ua_contains.clone(),
-            org: rc.org.clone(),
-            policy,
-        }
-    }).collect();
-    let bot_registry = Arc::new(Mutex::new(BotRegistry::new(bot_rules.clone())));
-    tracing::info!(rules = bot_rules.len(), "Bot registry initialized");
+    let bot_registry = Arc::new(Mutex::new(BotRegistry::from_rule_configs(&config.bots)));
+    tracing::info!(rules = config.bots.len(), "Bot registry initialized");
 
     // Create event channel
     let (event_tx, event_rx) = mpsc::channel::<hiveguard_core::models::NormalizedEvent>(4096);
@@ -574,9 +574,8 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
         watchdog_task(watchdog_shutdown).await;
     });
 
-    // --- Step 8: Notify systemd that we are ready ---
-    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
-    tracing::info!("HiveGuard daemon started (sd-notify: ready)");
+    // --- Step 8: READY is sent later (just before the pipeline starts), once
+    // the cluster runtime, control socket and UI plugins have been started. ---
 
     // --- Step 9: Handle Ctrl+C / SIGTERM ---
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -805,6 +804,14 @@ async fn run_daemon(config_path: Option<PathBuf>, socket_path: PathBuf) {
             });
         }
     }
+
+    // --- Notify systemd that we are ready ---
+    // After the enforcer setup + startup sync, cluster runtime (QUIC bound),
+    // control socket and UI plugins are spawned, so `systemctl start` / an
+    // upgrade script no longer observe "ready" before those exist. The
+    // watchdog task pings since earlier, which systemd accepts pre-READY.
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+    tracing::info!("HiveGuard daemon started (sd-notify: ready)");
 
     let pipeline_shutdown = shutdown_rx.clone();
     let pipeline_event_tx = event_tx.clone();
@@ -1175,3 +1182,17 @@ async fn run_sigma_command(action: SigmaAction) {
     }
 }
 
+
+#[cfg(test)]
+mod log_format_tests {
+    use super::log_ansi_enabled;
+
+    #[test]
+    fn ansi_only_on_a_terminal_outside_systemd() {
+        let journal = std::ffi::OsStr::new("8:12345");
+        assert!(log_ansi_enabled(true, None));
+        assert!(!log_ansi_enabled(true, Some(journal)));
+        assert!(!log_ansi_enabled(false, None));
+        assert!(!log_ansi_enabled(false, Some(journal)));
+    }
+}

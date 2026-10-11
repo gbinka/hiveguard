@@ -16,3 +16,8 @@ plugins:
       enum_window_secs: 120
       enum_ban_duration_secs: 172800
 ```
+
+- `ipv6_prefix` (default `64`): IPv6 failures are counted per /64 and the ban
+  covers that /64, so rotating addresses inside one /64 does not reset the
+  counter. `0` or `128` = per address; otherwise `48..128`. IPv4 is unchanged
+  (per address).

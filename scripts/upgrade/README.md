@@ -47,6 +47,17 @@ the `hiveguard.service` unit and exclusive `inet hiveguard` table with the
 `hiveguard_blocklist` set family. Other layouts require review and adaptation;
 changing the profile alone does not make an arbitrary installation supported.
 
+Two chain layouts of that table are accepted: `input` alone (filter, priority
+-10) or `input` plus `prerouting` (filter, priority -300), the latter created by
+`enforcer.nftables` with `prerouting_hook: true`. Each present chain must hold
+exactly one `saddr @set drop` rule per managed set (six) after installation, and
+the presence of `prerouting` must match the configuration reported by
+`hiveguard-upgrade-check` (`config.nftables_prerouting_hook`). The isolated
+simulation runs the new daemon with the same setting. A rollback restores only
+the `input` layout; it refuses to start when the configuration contains
+`prerouting_hook` but the old executable does not know that key (remove the key
+first: such builds reject unknown plugin keys at startup).
+
 The operator runs, from an SSH shell on the intended host:
 
 ```sh

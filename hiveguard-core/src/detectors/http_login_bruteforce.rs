@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -7,7 +8,11 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 
 use crate::detector::Detector;
+use crate::detectors::netkey::subnet_of;
 use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
+
+/// Sweep idle per-IP / per-subnet state every this many counted POSTs.
+const SWEEP_EVERY: u64 = 4096;
 
 /// HTTP login brute-force detector.
 ///
@@ -30,7 +35,24 @@ pub struct HttpLoginBruteforceDetector {
     ban_duration: Duration,
     /// Sliding window of POST timestamps per IP.
     hits: DashMap<IpAddr, VecDeque<DateTime<Utc>>>,
+    /// Optional subnet aggregation (UA-rotating botnets spreading the
+    /// attempts over many addresses of one /24): prefix 0 = off per family.
+    subnet_v4_prefix: u8,
+    subnet_v6_prefix: u8,
+    /// POSTs from the whole subnet within `window` to fire (0 = off).
+    subnet_threshold: u32,
+    /// Distinct source IPs required in the subnet before it fires, so one
+    /// noisy host (handled per IP anyway) never bans its neighbours.
+    subnet_min_distinct_ips: usize,
+    /// Sliding window of (timestamp, source IP) per subnet.
+    subnet_hits: DashMap<IpNet, VecDeque<(DateTime<Utc>, IpAddr)>>,
+    events: AtomicU64,
 }
+
+/// Defaults applied when subnet aggregation is enabled without explicit
+/// thresholds (plugin keys `subnet_threshold` / `subnet_min_distinct_ips`).
+pub const DEFAULT_SUBNET_THRESHOLD: u32 = 20;
+pub const DEFAULT_SUBNET_MIN_DISTINCT_IPS: usize = 5;
 
 impl HttpLoginBruteforceDetector {
     pub fn new() -> Self {
@@ -40,6 +62,12 @@ impl HttpLoginBruteforceDetector {
             window: Duration::from_secs(600), // 10 min
             ban_duration: Duration::from_secs(86400), // 24h
             hits: DashMap::new(),
+            subnet_v4_prefix: 0,
+            subnet_v6_prefix: 0,
+            subnet_threshold: DEFAULT_SUBNET_THRESHOLD,
+            subnet_min_distinct_ips: DEFAULT_SUBNET_MIN_DISTINCT_IPS,
+            subnet_hits: DashMap::new(),
+            events: AtomicU64::new(0),
         }
     }
 
@@ -55,7 +83,84 @@ impl HttpLoginBruteforceDetector {
             window,
             ban_duration,
             hits: DashMap::new(),
+            subnet_v4_prefix: 0,
+            subnet_v6_prefix: 0,
+            subnet_threshold: DEFAULT_SUBNET_THRESHOLD,
+            subnet_min_distinct_ips: DEFAULT_SUBNET_MIN_DISTINCT_IPS,
+            subnet_hits: DashMap::new(),
+            events: AtomicU64::new(0),
         }
+    }
+
+    /// Enable subnet aggregation: POSTs from all addresses of one IPv4
+    /// `/v4_prefix` (IPv6 `/v6_prefix`) are counted together; when the subnet
+    /// reaches `threshold` POSTs in the window from at least
+    /// `min_distinct_ips` different addresses, the signal targets the whole
+    /// (truncated) subnet. A prefix of 0 disables that family; `threshold`
+    /// 0 disables both.
+    pub fn with_subnet_aggregation(
+        mut self,
+        v4_prefix: u8,
+        v6_prefix: u8,
+        threshold: u32,
+        min_distinct_ips: usize,
+    ) -> Self {
+        self.subnet_v4_prefix = v4_prefix.min(32);
+        self.subnet_v6_prefix = v6_prefix.min(128);
+        self.subnet_threshold = threshold;
+        self.subnet_min_distinct_ips = min_distinct_ips.max(1);
+        self
+    }
+
+    fn maybe_sweep(&self, now: DateTime<Utc>) {
+        if self.events.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY != SWEEP_EVERY - 1 {
+            return;
+        }
+        let cutoff = now - chrono::Duration::from_std(self.window).unwrap_or(chrono::Duration::zero());
+        self.hits.retain(|_, d| d.back().is_some_and(|t| *t >= cutoff));
+        self.subnet_hits
+            .retain(|_, d| d.back().is_some_and(|(t, _)| *t >= cutoff));
+    }
+
+    /// Record a POST in the subnet window; returns the subnet signal when
+    /// the subnet threshold and the distinct-IP minimum are both reached.
+    fn subnet_check(&self, ip: IpAddr, now: DateTime<Utc>, path: &str) -> Option<DetectionSignal> {
+        if self.subnet_threshold == 0 {
+            return None;
+        }
+        let subnet = subnet_of(ip, self.subnet_v4_prefix, self.subnet_v6_prefix)?;
+        let cutoff = now - chrono::Duration::from_std(self.window).unwrap_or(chrono::Duration::zero());
+        let cap = self.subnet_threshold as usize * 4 + 64;
+        let mut deque = self.subnet_hits.entry(subnet).or_default();
+        deque.push_back((now, ip));
+        while deque.front().is_some_and(|(t, _)| *t < cutoff) || deque.len() > cap {
+            deque.pop_front();
+        }
+        let count = deque.len();
+        if count < self.subnet_threshold as usize {
+            return None;
+        }
+        let distinct = deque.iter().map(|(_, a)| *a).collect::<HashSet<_>>().len();
+        if distinct < self.subnet_min_distinct_ips {
+            return None;
+        }
+        deque.clear();
+        drop(deque);
+        let reason = format!(
+            "HTTP login brute-force (subnet): {count} POST requests to '{path}' from {distinct} addresses in {subnet} in {:?}",
+            self.window,
+        );
+        let evidence = format!("{subnet}:http_login_bruteforce:subnet:{count}:{}", now.timestamp() / 60);
+        Some(DetectionSignal {
+            source_ip: subnet,
+            severity: 180,
+            confidence: 0.90,
+            reason,
+            evidence_hash: *blake3::hash(evidence.as_bytes()).as_bytes(),
+            suggested_action: Action::Ban(self.ban_duration),
+            detector_name: self.name().to_string(),
+            timestamp: now,
+        })
     }
 
     fn ip_to_net(ip: IpAddr) -> IpNet {
@@ -124,6 +229,12 @@ impl Detector for HttpLoginBruteforceDetector {
 
         let ip = event.source_ip;
         let now = event.timestamp;
+        self.maybe_sweep(now);
+
+        // Subnet first: a subnet ban covers the member IP as well.
+        if let Some(signal) = self.subnet_check(ip, now, request_path) {
+            return Some(signal);
+        }
 
         let mut deque = self.hits.entry(ip).or_default();
         deque.push_back(now);
@@ -133,6 +244,7 @@ impl Detector for HttpLoginBruteforceDetector {
         if count < self.threshold {
             return None;
         }
+        drop(deque);
 
         let reason = format!(
             "HTTP login brute-force: {} POST requests to '{}' from {} in {:?}",
@@ -338,5 +450,95 @@ mod tests {
             metadata,
         };
         assert!(det.process(&ev2).is_some());
+    }
+
+    fn rotating_subnet_detector() -> HttpLoginBruteforceDetector {
+        HttpLoginBruteforceDetector::with_config(
+            vec!["/wp-login.php".into()],
+            5,
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+        )
+        .with_subnet_aggregation(24, 64, 20, 5)
+    }
+
+    #[test]
+    fn subnet_aggregation_off_by_default() {
+        let det = HttpLoginBruteforceDetector::new();
+        let now = Utc::now();
+        // 50 IPs × 1 POST each: never reaches the per-IP threshold.
+        for i in 1..=50 {
+            let ev = make_post_event(&format!("100.64.53.{i}"), "/wp-login.php", now);
+            assert!(det.process(&ev).is_none());
+        }
+    }
+
+    #[test]
+    fn ua_rotating_botnet_in_one_slash24_bans_the_subnet() {
+        let det = rotating_subnet_detector();
+        let now = Utc::now();
+        let mut fired = None;
+        for i in 1..=50u32 {
+            let ev = make_post_event(
+                &format!("100.64.53.{i}"),
+                "/wp-login.php",
+                now + chrono::Duration::seconds(i as i64),
+            );
+            if let Some(s) = det.process(&ev) {
+                fired = Some((i, s));
+                break;
+            }
+        }
+        let (at, signal) = fired.expect("subnet signal");
+        assert_eq!(at, 20);
+        // Truncated network, so the scoring bucket key is stable and the
+        // ban covers the whole /24 (no /24 → /32 collapse).
+        assert_eq!(signal.source_ip.to_string(), "100.64.53.0/24");
+        assert_eq!(signal.source_ip.addr().to_string(), "100.64.53.0");
+        assert!(signal.severity as f32 * signal.confidence >= 100.0);
+        assert!(signal.reason.contains("20 addresses"));
+    }
+
+    #[test]
+    fn single_noisy_host_does_not_ban_its_subnet() {
+        let det = HttpLoginBruteforceDetector::with_config(
+            vec!["/wp-login.php".into()],
+            1000, // per-IP rule effectively off for this test
+            Duration::from_secs(600),
+            Duration::from_secs(86400),
+        )
+        .with_subnet_aggregation(24, 64, 20, 5);
+        let now = Utc::now();
+        for i in 0..40 {
+            let ip = format!("100.64.53.{}", 1 + (i % 4)); // only 4 distinct IPs
+            let ev = make_post_event(&ip, "/wp-login.php", now + chrono::Duration::seconds(i));
+            assert!(det.process(&ev).is_none(), "below min_distinct_ips");
+        }
+    }
+
+    #[test]
+    fn subnet_window_expires() {
+        let det = rotating_subnet_detector();
+        let now = Utc::now();
+        for i in 1..=19u32 {
+            let ev = make_post_event(&format!("100.64.53.{i}"), "/wp-login.php", now);
+            assert!(det.process(&ev).is_none());
+        }
+        // 11 minutes later the first 19 are out of the 10-minute window.
+        let later = now + chrono::Duration::seconds(660);
+        let ev = make_post_event("100.64.53.100", "/wp-login.php", later);
+        assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn ipv6_subnet_aggregation() {
+        let det = rotating_subnet_detector();
+        let now = Utc::now();
+        let mut last = None;
+        for i in 1..=20u32 {
+            let ev = make_post_event(&format!("2001:db8:7:7::{i:x}"), "/wp-login.php", now);
+            last = det.process(&ev);
+        }
+        assert_eq!(last.expect("v6 subnet").source_ip.to_string(), "2001:db8:7:7::/64");
     }
 }

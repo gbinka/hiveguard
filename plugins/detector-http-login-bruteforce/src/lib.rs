@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use hiveguard_core::Detector;
-use hiveguard_core::detectors::http_login_bruteforce::HttpLoginBruteforceDetector;
+use hiveguard_core::detectors::http_login_bruteforce::{
+    HttpLoginBruteforceDetector, DEFAULT_SUBNET_MIN_DISTINCT_IPS, DEFAULT_SUBNET_THRESHOLD,
+};
+use hiveguard_core::detectors::netkey::{validate_ipv6_prefix, validate_v4_subnet_prefix};
 use hiveguard_core::models::{EventType, NormalizedEvent};
 use hiveguard_plugin_api::prelude::*;
 use serde::Deserialize;
@@ -17,6 +20,11 @@ struct Config {
     threshold: Option<u32>,
     window_secs: Option<u64>,
     ban_duration_secs: Option<u64>,
+    /// Subnet aggregation (0 = off per family).
+    subnet_v4_prefix: Option<u8>,
+    subnet_v6_prefix: Option<u8>,
+    subnet_threshold: Option<u32>,
+    subnet_min_distinct_ips: Option<usize>,
 }
 
 pub struct HttpLoginBruteforcePlugin {
@@ -57,6 +65,12 @@ impl HttpLoginBruteforcePlugin {
         let window = Duration::from_secs(cfg.window_secs.unwrap_or(600));
         let ban_duration = Duration::from_secs(cfg.ban_duration_secs.unwrap_or(86_400));
         HttpLoginBruteforceDetector::with_config(paths, threshold, window, ban_duration)
+            .with_subnet_aggregation(
+                cfg.subnet_v4_prefix.unwrap_or(0),
+                cfg.subnet_v6_prefix.unwrap_or(0),
+                cfg.subnet_threshold.unwrap_or(DEFAULT_SUBNET_THRESHOLD),
+                cfg.subnet_min_distinct_ips.unwrap_or(DEFAULT_SUBNET_MIN_DISTINCT_IPS),
+            )
     }
 }
 
@@ -69,6 +83,10 @@ impl Plugin for HttpLoginBruteforcePlugin {
     async fn init(&mut self, cfg: serde_json::Value) -> PluginResult<()> {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        validate_v4_subnet_prefix("subnet_v4_prefix", cfg.subnet_v4_prefix.unwrap_or(0))
+            .map_err(PluginError::ConfigValidation)?;
+        validate_ipv6_prefix("subnet_v6_prefix", cfg.subnet_v6_prefix.unwrap_or(0))
+            .map_err(PluginError::ConfigValidation)?;
         self.detector = Self::from_config(cfg);
         Ok(())
     }
@@ -160,5 +178,55 @@ mod tests {
             .await
             .unwrap();
         assert!(p.process(&unrelated_event()).is_none());
+    }
+
+    fn wp_post(ip: &str) -> NormalizedEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert("path".to_string(), "/wp-login.php".to_string());
+        metadata.insert("method".to_string(), "POST".to_string());
+        metadata.insert("status_code".to_string(), "200".to_string());
+        NormalizedEvent {
+            timestamp: Utc::now(),
+            source_ip: ip.parse().unwrap(),
+            event_type: EventType::HttpRequest,
+            source_name: "nginx".into(),
+            raw_line: String::new(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn subnet_keys_enable_subnet_ban() {
+        let p = HttpLoginBruteforcePlugin::create(
+            test_ctx(),
+            serde_json::json!({
+                "subnet_v4_prefix": 24,
+                "subnet_v6_prefix": 64,
+                "subnet_threshold": 10,
+                "subnet_min_distinct_ips": 5
+            }),
+        )
+        .await
+        .unwrap();
+        let mut last = None;
+        for i in 1..=10 {
+            last = p.process(&wp_post(&format!("100.64.53.{i}")));
+        }
+        assert_eq!(last.expect("subnet signal").source_ip.to_string(), "100.64.53.0/24");
+    }
+
+    #[tokio::test]
+    async fn defaults_keep_per_ip_behaviour() {
+        let p = HttpLoginBruteforcePlugin::create(test_ctx(), serde_json::json!({})).await.unwrap();
+        for i in 1..=50 {
+            assert!(p.process(&wp_post(&format!("100.64.53.{i}"))).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_too_wide_subnet() {
+        for cfg in [serde_json::json!({"subnet_v4_prefix": 8}), serde_json::json!({"subnet_v6_prefix": 32})] {
+            assert!(HttpLoginBruteforcePlugin::create(test_ctx(), cfg).await.is_err());
+        }
     }
 }

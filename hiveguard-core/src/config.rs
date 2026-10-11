@@ -222,10 +222,27 @@ pub struct AgentConfig {
     /// Timeout for a single `journalctl` invocation, seconds. Default 20.
     #[serde(default = "default_agent_journal_timeout_secs")]
     pub journal_timeout_secs: u64,
-    /// Also scan the most recent rotated copy (`<path>.1`) when the time
-    /// window starts before the live file does. Default true.
+    /// Also scan rotated copies (`<path>.1`, then `<path>.2.gz`, `<path>.3.gz`
+    /// …, plain or gzip) when the time window starts before the live file
+    /// does. Default true.
     #[serde(default = "default_true")]
     pub include_rotated: bool,
+    /// File holding a **read-only** bearer token for agents (one line, trimmed),
+    /// e.g. `/etc/hiveguard/agent-token`. Read once at startup. The token may
+    /// call every read endpoint (GET, the read-only agent POSTs, the SSE
+    /// stream) but every mutation answers 403. Missing/unreadable/empty file →
+    /// warning, read-only token disabled. Default: none (only the admin
+    /// `auth_token` of `ui.rest` works).
+    #[serde(default)]
+    pub read_token_file: Option<PathBuf>,
+    /// Maximum number of log scans (`logs/query`, `logs/stats`, `ip`,
+    /// `journal`) running at once; further requests get 429. Default 2.
+    #[serde(default = "default_agent_max_concurrent_scans")]
+    pub max_concurrent_scans: usize,
+    /// Maximum number of simultaneous `/api/agent/stream` (SSE) connections;
+    /// further connections get 429. Default 4.
+    #[serde(default = "default_agent_max_streams")]
+    pub max_streams: usize,
 }
 
 impl Default for AgentConfig {
@@ -237,8 +254,19 @@ impl Default for AgentConfig {
             max_results: default_agent_max_results(),
             journal_timeout_secs: default_agent_journal_timeout_secs(),
             include_rotated: true,
+            read_token_file: None,
+            max_concurrent_scans: default_agent_max_concurrent_scans(),
+            max_streams: default_agent_max_streams(),
         }
     }
+}
+
+fn default_agent_max_concurrent_scans() -> usize {
+    2
+}
+
+fn default_agent_max_streams() -> usize {
+    4
 }
 
 /// One extra log file exposed to agents.
@@ -283,6 +311,10 @@ pub struct BotRuleConfig {
     pub org: String,
     #[serde(default = "default_bot_policy_monitor")]
     pub policy: String,
+    /// Ban duration for `policy: block` (seconds). Absent = 3600 (1 h).
+    /// Older binaries ignore this key (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban_duration_secs: Option<u64>,
 }
 
 fn default_bot_policy_monitor() -> String {
@@ -2330,6 +2362,14 @@ impl HiveGuardConfig {
             }
             if !matches!(bot.policy.to_lowercase().as_str(), "allow" | "monitor" | "block") {
                 return Err(HiveGuardError::Config(format!("unknown bot policy: {}", bot.policy)));
+            }
+            if let Some(secs) = bot.ban_duration_secs {
+                if !(60..=7 * 86_400).contains(&secs) {
+                    return Err(HiveGuardError::Config(format!(
+                        "bot {}: ban_duration_secs must be 60..=604800, got {secs}",
+                        bot.name
+                    )));
+                }
             }
         }
         if self.trust.remote_min_prefix_v4 > 32 || self.trust.remote_min_prefix_v6 > 128 {

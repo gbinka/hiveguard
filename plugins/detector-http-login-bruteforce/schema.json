@@ -6,6 +6,10 @@
     "paths": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
     "threshold": { "type": "integer", "minimum": 1, "maximum": 1000000 },
     "window_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
-    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+    "ban_duration_secs": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+    "subnet_v4_prefix": { "type": "integer", "minimum": 0, "maximum": 32, "description": "Aggregate POSTs per IPv4 subnet of this prefix (e.g. 24) and ban the whole subnet; 0 = off (default). Allowed: 0 or 16..32." },
+    "subnet_v6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "Same for IPv6 (e.g. 64); 0 = off (default). Allowed: 0 or 48..128." },
+    "subnet_threshold": { "type": "integer", "minimum": 0, "maximum": 1000000, "description": "POSTs from one subnet within window_secs that trigger a subnet ban; 0 disables subnet aggregation. Default 20." },
+    "subnet_min_distinct_ips": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Distinct source addresses required in the subnet before it fires. Default 5." }
   }
 }

@@ -24,7 +24,8 @@
 //! It fires when the IP has `>= min_distinct_paths` distinct paths **and**
 //! `>= score_threshold` points. Status codes only weight the score, so a
 //! scanner answered 200 by a catch-all vhost is still caught. Signals are
-//! host-scoped (`/32` / `/128`).
+//! host-scoped for IPv4 (`/32`); IPv6 sources are counted and banned per
+//! `ipv6_prefix` (default `/64`) because scanners rotate inside their /64.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -35,6 +36,7 @@ use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 
 use crate::detector::Detector;
+use crate::detectors::netkey::{source_key, DEFAULT_IPV6_PREFIX};
 use crate::models::{Action, DetectionSignal, EventType, NormalizedEvent};
 
 /// Sweep idle state every this many matching events.
@@ -61,6 +63,8 @@ pub struct WebshellProbeConfig {
     pub shared_path_min_ips: usize,
     pub max_tracked_ips: usize,
     pub max_tracked_paths: usize,
+    /// IPv6 counting/ban prefix (0 or 128 = per address).
+    pub ipv6_prefix: u8,
 }
 
 pub fn default_legit_php_paths() -> Vec<String> {
@@ -110,6 +114,7 @@ impl Default for WebshellProbeConfig {
             shared_path_min_ips: 3,
             max_tracked_ips: 50_000,
             max_tracked_paths: 20_000,
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
         }
     }
 }
@@ -355,7 +360,9 @@ impl Detector for WebshellProbeDetector {
             }
         }
 
-        let ip = event.source_ip;
+        // IPv6: all addresses of one /ipv6_prefix are one source.
+        let key: IpNet = source_key(event.source_ip, self.cfg.ipv6_prefix);
+        let ip = key.addr();
         let now = event.timestamp;
         let status: u16 = event
             .metadata
@@ -452,9 +459,9 @@ impl Detector for WebshellProbeDetector {
         state.paths.clear();
         drop(inner);
 
-        let evidence = format!("{ip}:webshell_probe:{distinct}:{}", now.timestamp() / 60);
+        let evidence = format!("{key}:webshell_probe:{distinct}:{}", now.timestamp() / 60);
         Some(DetectionSignal {
-            source_ip: IpNet::from(ip),
+            source_ip: key,
             severity: 200,
             confidence: 0.9,
             reason: format!(
@@ -773,5 +780,20 @@ mod tests {
         }
         assert!(d.tracked_ips() <= 100);
         assert!(d.tracked_paths() <= 100);
+    }
+
+    #[test]
+    fn ipv6_rotation_inside_slash64_is_one_prober() {
+        let d = WebshellProbeDetector::new();
+        let mut fired = None;
+        for (i, p) in PROBES.iter().enumerate() {
+            let ip = format!("2001:db8:aa:bb::{:x}", i + 1);
+            let ts = base() + chrono::Duration::seconds(i as i64 * 30);
+            if let Some(s) = d.process(&req(&ip, p, 404, "-", "a.pl", ts)) {
+                fired = Some(s);
+                break;
+            }
+        }
+        assert_eq!(fired.expect("aggregated").source_ip.to_string(), "2001:db8:aa:bb::/64");
     }
 }

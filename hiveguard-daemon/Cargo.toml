@@ -110,6 +110,7 @@ detectors-builtin = [
     "detector-http-flood",
     "detector-campaign",
     "detector-webshell-probe",
+    "detector-distributed-crawl",
 ]
 detector-ssh-bruteforce       = ["dep:hiveguard-plugin-detector-ssh-bruteforce"]
 detector-path-probe           = ["dep:hiveguard-plugin-detector-path-probe"]
@@ -125,6 +126,7 @@ detector-distributed-slow     = ["dep:hiveguard-plugin-detector-distributed-slow
 detector-http-flood           = ["dep:hiveguard-plugin-detector-http-flood"]
 detector-campaign             = ["dep:hiveguard-plugin-detector-campaign"]
 detector-webshell-probe       = ["dep:hiveguard-plugin-detector-webshell-probe"]
+detector-distributed-crawl    = ["dep:hiveguard-plugin-detector-distributed-crawl"]
 detector-sigma                = ["dep:hiveguard-plugin-detector-sigma"]
 
 # --- Scoring engine ------------------------------------------------------
@@ -206,6 +208,7 @@ hiveguard-plugin-detector-distributed-slow      = { path = "../plugins/detector-
 hiveguard-plugin-detector-http-flood            = { path = "../plugins/detector-http-flood", optional = true }
 hiveguard-plugin-detector-campaign              = { path = "../plugins/detector-campaign", optional = true }
 hiveguard-plugin-detector-webshell-probe        = { path = "../plugins/detector-webshell-probe", optional = true }
+hiveguard-plugin-detector-distributed-crawl     = { path = "../plugins/detector-distributed-crawl", optional = true }
 hiveguard-plugin-detector-sigma                 = { path = "../plugins/detector-sigma", optional = true }
 
 hiveguard-plugin-scoring-default = { path = "../plugins/scoring-default", optional = true }
@@ -238,6 +241,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 hyper = { version = "1", features = ["full"] }
 prometheus-client = "0.23"
 regex = "1"
+# Agent API: read rotated `<log>.N.gz` files (already in the lock via hiveguard-core).
+flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]

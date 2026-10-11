@@ -11,17 +11,26 @@
 //!   hour of a 2 GiB access log" only reads the tail. A scan stops when 200
 //!   consecutive lines (with their own timestamp) are older than `since`, or
 //!   when `agent.max_scan_bytes` has been read (`truncated: true`). When the
-//!   live file is exhausted first, `<path>.1` (plain text only) is continued
-//!   under the same byte budget (`agent.include_rotated`).
+//!   live file is exhausted first, rotated copies are continued under the same
+//!   byte budget (`agent.include_rotated`): `<path>.1`, `<path>.2.gz`,
+//!   `<path>.3.gz` … (plain or gzip, detected by magic). Plain files are read
+//!   backwards; a gzip file is decompressed forwards, skipping its oldest part
+//!   when the rest of the budget is smaller than the file (gzip ISIZE). A
+//!   rotated file whose mtime is before `since` ends the walk.
+//! - Every response says how far back the data actually reaches
+//!   (`coverage_start`, `coverage_complete`); time-series buckets before that
+//!   point are `count: null, covered: false` instead of a misleading 0.
+//! - At most `agent.max_concurrent_scans` scans (query, stats, ip profile,
+//!   journal) run at once; more → `AgentError::Busy` (HTTP 429).
 //! - Timestamps without a zone (traditional syslog `Oct  9 06:12:01`, ISO
 //!   `2026-10-09 06:12:01`) are taken as UTC; traditional syslog gets the
 //!   current year, or the previous one if that would land in the future.
 //! - All file/journal work runs on the blocking thread pool; regexes are
 //!   compiled per request with a 1 MiB compiled-size cap.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,9 +43,11 @@ use hiveguard_ingest::nginx_parser::{parse_nginx_line, NginxPattern};
 use hiveguard_ingest::postfix_parser::{parse_postfix_line, PostfixPatterns};
 use hiveguard_ingest::ssh_parser::{parse_ssh_line, SshPatterns};
 use ipnet::IpNet;
+use hiveguard_plugin_api::AgentAccess;
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Map, Value};
-use tracing::{debug, warn};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, info, warn};
 
 type Dt = DateTime<Utc>;
 
@@ -61,6 +72,13 @@ const MAX_GROUPS: usize = 100_000;
 const MAX_SERIES_BUCKETS: i64 = 10_000;
 /// Max journal entries fetched per request.
 const JOURNAL_FETCH_CAP: usize = 20_000;
+/// Highest rotation index probed (`<path>.N` / `<path>.N.gz`).
+const MAX_ROTATED: usize = 30;
+/// A gzip file is not touched when more than this many times the remaining
+/// byte budget would have to be decompressed and thrown away to reach its tail.
+const GZ_SKIP_FACTOR: u64 = 16;
+/// `Retry-After` hint for a refused scan (seconds), also used by ui.rest.
+pub const BUSY_RETRY_AFTER_SECS: u64 = 5;
 
 const DEFAULT_LIMIT: usize = 200;
 const DEFAULT_TOP: usize = 25;
@@ -76,6 +94,8 @@ pub enum AgentError {
     NotFound(String),
     Unavailable(String),
     Internal(String),
+    /// Concurrency limit reached (`agent.max_concurrent_scans`) → HTTP 429.
+    Busy(String),
 }
 
 impl std::fmt::Display for AgentError {
@@ -85,6 +105,7 @@ impl std::fmt::Display for AgentError {
             AgentError::NotFound(m) => write!(f, "not found: {m}"),
             AgentError::Unavailable(m) => write!(f, "unavailable: {m}"),
             AgentError::Internal(m) => write!(f, "internal error: {m}"),
+            AgentError::Busy(m) => write!(f, "busy: {m}"),
         }
     }
 }
@@ -172,6 +193,11 @@ struct Inner {
     max_results: usize,
     journal_timeout_secs: u64,
     include_rotated: bool,
+    /// Concurrency cap for scans (`agent.max_concurrent_scans`).
+    scan_slots: Arc<Semaphore>,
+    max_concurrent_scans: usize,
+    /// Read-only token + stream cap handed to ui.rest.
+    access: AgentAccess,
 }
 
 impl Inner {
@@ -273,6 +299,8 @@ impl LogEngine {
 
         debug!(files = files.len(), journal_units = units.len(), "agent log sources discovered");
 
+        let max_concurrent_scans = cfg.agent.max_concurrent_scans.max(1);
+        let read_token = cfg.agent.read_token_file.as_deref().and_then(load_read_token);
         LogEngine {
             inner: Arc::new(Inner {
                 files,
@@ -281,8 +309,26 @@ impl LogEngine {
                 max_results: cfg.agent.max_results.max(1),
                 journal_timeout_secs: cfg.agent.journal_timeout_secs.max(1),
                 include_rotated: cfg.agent.include_rotated,
+                scan_slots: Arc::new(Semaphore::new(max_concurrent_scans)),
+                max_concurrent_scans,
+                access: AgentAccess { read_token, max_streams: cfg.agent.max_streams.max(1) },
             }),
         }
+    }
+
+    /// Read-only token + stream limit for the REST layer (`UiApiHandle::agent_access`).
+    pub fn access(&self) -> AgentAccess {
+        self.inner.access.clone()
+    }
+
+    /// Take one scan slot or fail fast with `Busy` (→ 429).
+    fn scan_permit(&self) -> Result<OwnedSemaphorePermit, AgentError> {
+        self.inner.scan_slots.clone().try_acquire_owned().map_err(|_| {
+            AgentError::Busy(format!(
+                "{} log scan(s) already running (agent.max_concurrent_scans); retry in {BUSY_RETRY_AFTER_SECS}s",
+                self.inner.max_concurrent_scans
+            ))
+        })
     }
 
     /// Names of all sources (files as their name, journals as "journal:<unit>").
@@ -315,7 +361,12 @@ impl LogEngine {
                     }
                 }
             }
-            o.insert("rotated_available".into(), json!(rotated_readable(&f.path)));
+            let rotated = rotated_files(&f.path);
+            o.insert("rotated_available".into(), json!(!rotated.is_empty()));
+            o.insert(
+                "rotated_files".into(),
+                json!(rotated.iter().map(|(p, gz)| json!({"path": p.display().to_string(), "gzip": gz})).collect::<Vec<_>>()),
+            );
             out.push(Value::Object(o));
         }
         for u in &self.inner.journal_units {
@@ -329,7 +380,12 @@ impl LogEngine {
         let inner = self.inner.clone();
         let now = Utc::now();
         let req = QueryRequest::from_params(&inner, &params, now)?;
-        run_blocking(move || run_query(&inner, req, now)).await
+        let permit = self.scan_permit()?;
+        run_blocking(move || {
+            let _permit = permit;
+            run_query(&inner, req, now)
+        })
+        .await
     }
 
     /// §3.6 `POST /api/agent/logs/stats` (without the `banned`/`whitelisted`
@@ -338,7 +394,12 @@ impl LogEngine {
         let inner = self.inner.clone();
         let now = Utc::now();
         let req = StatsRequest::from_params(&inner, &params, now)?;
-        run_blocking(move || run_stats(&inner, req, now)).await
+        let permit = self.scan_permit()?;
+        run_blocking(move || {
+            let _permit = permit;
+            run_stats(&inner, req, now)
+        })
+        .await
     }
 
     /// §3.7 `"logs"` sub-object: per file source, what the lines of `ip` say.
@@ -346,13 +407,20 @@ impl LogEngine {
         let inner = self.inner.clone();
         let now = Utc::now();
         let since = parse_time_spec(since.unwrap_or("24h"), now).map_err(bad)?;
-        run_blocking(move || run_ip_profile(&inner, ip, since, now)).await
+        let permit = self.scan_permit()?;
+        run_blocking(move || {
+            let _permit = permit;
+            run_ip_profile(&inner, ip, since, now)
+        })
+        .await
     }
 
     /// §3.8 `GET /api/agent/journal`.
     pub async fn journal(&self, params: Value) -> Result<Value, AgentError> {
         let now = Utc::now();
         let req = JournalRequest::from_params(&self.inner, &params, now)?;
+        // Held until the response is built (journalctl + JSON mapping).
+        let _permit = self.scan_permit()?;
         let args = journal_args(&req);
         debug!(?args, "agent: running journalctl");
         let mut cmd = tokio::process::Command::new("journalctl");
@@ -387,6 +455,38 @@ impl LogEngine {
         }
         let stdout = output.stdout;
         run_blocking(move || Ok(build_journal_response(&req, &stdout))).await
+    }
+}
+
+/// Read the read-only agent token (`agent.read_token_file`): one line,
+/// trimmed. Problems are logged and disable the token; the daemon still starts.
+fn load_read_token(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let token = raw.trim().to_string();
+            if token.is_empty() {
+                warn!(path = %path.display(), "agent.read_token_file is empty — read-only agent token disabled");
+                return None;
+            }
+            if token.len() < 16 {
+                warn!(path = %path.display(), "agent read-only token is shorter than 16 characters — use a long random value");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.permissions().mode() & 0o004 != 0 {
+                        warn!(path = %path.display(), "agent.read_token_file is world-readable — chmod 0640");
+                    }
+                }
+            }
+            info!(path = %path.display(), "read-only agent token loaded");
+            Some(token)
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "cannot read agent.read_token_file — read-only agent token disabled");
+            None
+        }
     }
 }
 
@@ -966,33 +1066,70 @@ struct WalkState {
     older_streak: u32,
 }
 
-fn rotated_path(path: &Path) -> PathBuf {
+/// What the scanner hands to a visitor.
+enum Visit<'a> {
+    /// One line inside the window with its own or inherited timestamp.
+    /// Plain files are walked newest-first.
+    Line(&'a str, Option<Dt>),
+    /// The following lines come from a gzip file, **oldest-first** (gzip
+    /// cannot be read backwards). All of them are older than every line
+    /// visited before.
+    ForwardStart,
+    /// End of a forward (gzip) segment.
+    ForwardEnd,
+}
+
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
-    s.push(".1");
+    s.push(suffix);
     PathBuf::from(s)
 }
 
-/// `<path>.1` exists, is a regular file and is not gzip-compressed.
-fn rotated_readable(path: &Path) -> bool {
-    let rot = rotated_path(path);
-    let Ok(meta) = std::fs::metadata(&rot) else { return false };
+#[cfg(test)]
+fn rotated_path(path: &Path) -> PathBuf {
+    suffixed(path, ".1")
+}
+
+/// `Some(true)` = gzip, `Some(false)` = plain, `None` = not a readable file.
+fn file_kind(path: &Path) -> Option<bool> {
+    let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
-        return false;
+        return None;
     }
     let mut magic = [0u8; 2];
-    match File::open(&rot).and_then(|mut f| f.read(&mut magic)) {
-        Ok(2) => magic != [0x1f, 0x8b],
-        Ok(_) => true,
-        Err(_) => false,
+    match File::open(path).and_then(|mut f| f.read(&mut magic)) {
+        Ok(2) => Some(magic == [0x1f, 0x8b]),
+        Ok(_) => Some(false),
+        Err(_) => None,
     }
 }
 
-/// Visit every line of `path` (then `<path>.1`) whose (own or inherited)
-/// timestamp lies within the window, **newest first**.
+/// Rotated copies of `path`, newest first: for N = 1.. `<path>.N` or
+/// `<path>.N.gz` (whichever exists; gzip detected by magic). Stops at the
+/// first missing index.
+fn rotated_files(path: &Path) -> Vec<(PathBuf, bool)> {
+    let mut out = Vec::new();
+    for n in 1..=MAX_ROTATED {
+        let plain = suffixed(path, &format!(".{n}"));
+        let gz = suffixed(path, &format!(".{n}.gz"));
+        if let Some(kind) = file_kind(&plain) {
+            out.push((plain, kind));
+        } else if let Some(kind) = file_kind(&gz) {
+            out.push((gz, kind));
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Visit every line of `path` (then its rotated copies) whose (own or
+/// inherited) timestamp lies within the window: plain files newest-first,
+/// gzip files as forward segments (see [`Visit`]).
 fn scan_source(
     path: &Path,
     w: &ScanWindow,
-    mut visit: impl FnMut(&str, Option<Dt>),
+    mut visit: impl FnMut(Visit<'_>),
 ) -> Result<ScanOutcome, AgentError> {
     let mut out = ScanOutcome::default();
     let mut state = WalkState::default();
@@ -1002,19 +1139,154 @@ fn scan_source(
     out.files.push(path.display().to_string());
     scan_file(file, w, &mut out, &mut state, &mut visit)
         .map_err(|e| AgentError::Unavailable(format!("error reading {}: {e}", path.display())))?;
-    if !out.reached_since && !out.budget_hit && w.include_rotated && rotated_readable(path) {
-        let rot = rotated_path(path);
-        match File::open(&rot) {
-            Ok(f) => {
-                out.files.push(rot.display().to_string());
-                if let Err(e) = scan_file(f, w, &mut out, &mut state, &mut visit) {
-                    warn!(path = %rot.display(), error = %e, "agent: error reading rotated log");
-                }
-            }
-            Err(e) => debug!(path = %rot.display(), error = %e, "agent: rotated log not readable"),
+    if !w.include_rotated {
+        return Ok(out);
+    }
+    for (rot, gz) in rotated_files(path) {
+        if out.reached_since || out.budget_hit {
+            break;
         }
+        // A rotated file last written before the window starts holds nothing
+        // in the window, and neither does anything older: the window start
+        // is covered.
+        if let Some(mtime) = std::fs::metadata(&rot).ok().and_then(|m| m.modified().ok()) {
+            if DateTime::<Utc>::from(mtime) < w.since {
+                out.reached_since = true;
+                break;
+            }
+        }
+        let res = if gz {
+            scan_gz(&rot, w, &mut out, &mut visit)
+        } else {
+            File::open(&rot).and_then(|f| {
+                out.files.push(rot.display().to_string());
+                scan_file(f, w, &mut out, &mut state, &mut visit)
+            })
+        };
+        if let Err(e) = res {
+            warn!(path = %rot.display(), error = %e, "agent: error reading rotated log");
+            break;
+        }
+        // Lines of an older file do not inherit timestamps from a newer one.
+        state = WalkState::default();
     }
     Ok(out)
+}
+
+/// Uncompressed size modulo 2^32 from the gzip trailer (ISIZE). Exact for
+/// the single-member files logrotate writes.
+fn gz_isize(path: &Path) -> std::io::Result<u64> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::End(-4))?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b) as u64)
+}
+
+/// Decompress a rotated gzip file forwards and visit its in-window lines
+/// (oldest-first, framed by `ForwardStart`/`ForwardEnd`). Only the newest
+/// `remaining budget` bytes are processed; the older head is skipped.
+fn scan_gz(
+    path: &Path,
+    w: &ScanWindow,
+    out: &mut ScanOutcome,
+    visit: &mut impl FnMut(Visit<'_>),
+) -> std::io::Result<()> {
+    let remaining = w.budget.saturating_sub(out.bytes);
+    if remaining == 0 {
+        out.budget_hit = true;
+        return Ok(());
+    }
+    let total = gz_isize(path)?;
+    let skip = total.saturating_sub(remaining);
+    if skip > remaining.saturating_mul(GZ_SKIP_FACTOR) {
+        debug!(path = %path.display(), total, remaining, "agent: gzip too large for the remaining budget, not read");
+        out.budget_hit = true;
+        return Ok(());
+    }
+    let mut dec = BufReader::with_capacity(CHUNK as usize, flate2::read::MultiGzDecoder::new(File::open(path)?));
+    out.files.push(path.display().to_string());
+    if skip > 0 {
+        std::io::copy(&mut (&mut dec).take(skip), &mut std::io::sink())?;
+        // Drop the partial line we landed in.
+        let mut partial = Vec::new();
+        (&mut dec).take(MAX_CARRY as u64).read_until(b'\n', &mut partial)?;
+    }
+
+    visit(Visit::ForwardStart);
+    let mut line: Vec<u8> = Vec::new();
+    let mut inherited: Option<Dt> = None;
+    let mut newer_streak = 0u32;
+    let mut saw_older = false;
+    loop {
+        line.clear();
+        let n = (&mut dec).take(MAX_CARRY as u64).read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        if out.bytes + n as u64 > w.budget {
+            out.budget_hit = true;
+            break;
+        }
+        out.bytes += n as u64;
+        if !line.ends_with(b"\n") && n >= MAX_CARRY {
+            // Overlong line: skip the rest of it.
+            let mut rest = Vec::new();
+            loop {
+                rest.clear();
+                let m = (&mut dec).take(MAX_CARRY as u64).read_until(b'\n', &mut rest)?;
+                out.bytes += m as u64;
+                if m == 0 || rest.ends_with(b"\n") {
+                    break;
+                }
+            }
+            continue;
+        }
+        let bytes = line.strip_suffix(b"\n").unwrap_or(&line);
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        if bytes.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        out.lines += 1;
+        let own = detect_ts(&text, w.now);
+        if let Some(t) = own {
+            inherited = Some(t);
+            if out.oldest.is_none_or(|o| t < o) {
+                out.oldest = Some(t);
+            }
+            if out.newest.is_none_or(|nw| t > nw) {
+                out.newest = Some(t);
+            }
+        }
+        let Some(t) = own.or(inherited) else {
+            visit(Visit::Line(&text, None));
+            continue;
+        };
+        if t < w.since {
+            saw_older = true;
+            continue;
+        }
+        if t > w.until {
+            if own.is_some() {
+                newer_streak += 1;
+                if newer_streak >= OLDER_STREAK_STOP {
+                    break;
+                }
+            }
+            continue;
+        }
+        newer_streak = 0;
+        visit(Visit::Line(&text, Some(t)));
+    }
+    visit(Visit::ForwardEnd);
+    if saw_older {
+        out.reached_since = true;
+    } else if skip > 0 {
+        // The skipped head may have held in-window lines.
+        out.budget_hit = true;
+    }
+    Ok(())
 }
 
 /// Returns `false` when the scan should stop (window start reached).
@@ -1023,7 +1295,7 @@ fn handle_line(
     w: &ScanWindow,
     out: &mut ScanOutcome,
     state: &mut WalkState,
-    visit: &mut impl FnMut(&str, Option<Dt>),
+    visit: &mut impl FnMut(Visit<'_>),
 ) -> bool {
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if bytes.is_empty() {
@@ -1060,7 +1332,7 @@ fn handle_line(
             state.older_streak = 0;
         }
     }
-    visit(&line, eff);
+    visit(Visit::Line(&line, eff));
     true
 }
 
@@ -1069,7 +1341,7 @@ fn scan_file(
     w: &ScanWindow,
     out: &mut ScanOutcome,
     state: &mut WalkState,
-    visit: &mut impl FnMut(&str, Option<Dt>),
+    visit: &mut impl FnMut(Visit<'_>),
 ) -> std::io::Result<()> {
     let mut pos = file.metadata()?.len();
     let mut carry: Vec<u8> = Vec::new();
@@ -1117,6 +1389,28 @@ fn window_json(w: &ScanWindow, o: &ScanOutcome) -> Value {
         "last_line_ts": o.newest.map(fmt_ts),
         "files": o.files,
     })
+}
+
+/// `true` when the data read reaches back to the window start: the scan
+/// met lines older than `since` (or a rotated file older than `since`).
+fn coverage_complete(o: &ScanOutcome) -> bool {
+    o.reached_since
+}
+
+/// Coverage of one time bucket `[start, start + len)`:
+/// `Some(true)` fully covered, `Some(false)` partially, `None` not covered.
+fn bucket_coverage(start: i64, len: i64, o: &ScanOutcome) -> Option<bool> {
+    if coverage_complete(o) {
+        return Some(true);
+    }
+    let oldest = o.oldest?.timestamp();
+    if start >= oldest {
+        Some(true)
+    } else if start + len > oldest {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn truncate_raw(s: &str) -> String {
@@ -1180,7 +1474,25 @@ fn run_query(inner: &Inner, req: QueryRequest, now: Dt) -> Result<Value, AgentEr
     let parsers = Parsers::new(req.src.format);
     let mut matched: u64 = 0;
     let mut items: Vec<Value> = Vec::new();
-    let outcome = scan_source(&req.src.path, &w, |line, ts| {
+    // Forward (gzip) segment: keep its newest matches, at most the free slots.
+    let mut forward: Option<VecDeque<(String, Option<Dt>)>> = None;
+    let outcome = scan_source(&req.src.path, &w, |v| {
+        let (line, ts) = match v {
+            Visit::Line(line, ts) => (line, ts),
+            Visit::ForwardStart => {
+                forward = Some(VecDeque::new());
+                return;
+            }
+            Visit::ForwardEnd => {
+                if let Some(seg) = forward.take() {
+                    for (line, ts) in seg.into_iter().rev() {
+                        let parsed = req.parse.then(|| parsers.parse(&line));
+                        items.push(item_json(&line, ts, parsed.as_ref()));
+                    }
+                }
+                return;
+            }
+        };
         if !req.filter.grep_ok(line) {
             return;
         }
@@ -1193,6 +1505,16 @@ fn run_query(inner: &Inner, req: QueryRequest, now: Dt) -> Result<Value, AgentEr
             parsed = Some(p);
         }
         matched += 1;
+        if let Some(seg) = forward.as_mut() {
+            let free = req.limit.saturating_sub(items.len());
+            if free > 0 {
+                seg.push_back((line.to_string(), ts));
+                if seg.len() > free {
+                    seg.pop_front();
+                }
+            }
+            return;
+        }
         if items.len() < req.limit {
             if req.parse && parsed.is_none() {
                 parsed = Some(parsers.parse(line));
@@ -1211,6 +1533,8 @@ fn run_query(inner: &Inner, req: QueryRequest, now: Dt) -> Result<Value, AgentEr
         "returned": items.len(),
         "truncated": outcome.budget_hit || matched > items.len() as u64,
         "scan_capped": outcome.budget_hit,
+        "coverage_start": outcome.oldest.map(fmt_ts),
+        "coverage_complete": coverage_complete(&outcome),
         "window": window_json(&w, &outcome),
         "items": items,
     }))
@@ -1401,7 +1725,8 @@ fn run_stats(inner: &Inner, req: StatsRequest, now: Dt) -> Result<Value, AgentEr
     let mut series: BTreeMap<i64, u64> = BTreeMap::new();
     let mut budget = GLOBAL_DISTINCT_BUDGET;
 
-    let outcome = scan_source(&req.src.path, &w, |line, ts| {
+    let outcome = scan_source(&req.src.path, &w, |v| {
+        let Visit::Line(line, ts) = v else { return };
         if !req.filter.grep_ok(line) {
             return;
         }
@@ -1516,7 +1841,13 @@ fn run_stats(inner: &Inner, req: StatsRequest, now: Dt) -> Result<Value, AgentEr
         while t <= end {
             let count = series.get(&t).copied().unwrap_or(0);
             if let Some(dt) = Utc.timestamp_opt(t, 0).single() {
-                v.push(json!({"bucket": fmt_ts(dt), "count": count}));
+                // Before the oldest line actually read there is no data at
+                // all: say so instead of reporting a misleading 0.
+                v.push(match bucket_coverage(t, b, &outcome) {
+                    Some(true) => json!({"bucket": fmt_ts(dt), "count": count, "covered": true}),
+                    Some(false) => json!({"bucket": fmt_ts(dt), "count": count, "covered": true, "partial": true}),
+                    None => json!({"bucket": fmt_ts(dt), "count": Value::Null, "covered": false}),
+                });
             }
             t += b;
         }
@@ -1534,6 +1865,8 @@ fn run_stats(inner: &Inner, req: StatsRequest, now: Dt) -> Result<Value, AgentEr
         "no_key": no_key,
         "groups": groups_json,
         "truncated": outcome.budget_hit,
+        "coverage_start": outcome.oldest.map(fmt_ts),
+        "coverage_complete": coverage_complete(&outcome),
         "window": window_json(&w, &outcome),
     });
     if other > 0 {
@@ -1586,7 +1919,8 @@ fn profile_one(src: &FileSource, ip: IpAddr, w: &ScanWindow) -> Value {
     let ip_text = ip.to_string();
     let mut acc = ProfileAcc::default();
     let mut budget = GLOBAL_DISTINCT_BUDGET;
-    let res = scan_source(&src.path, w, |line, ts| {
+    let res = scan_source(&src.path, w, |v| {
+        let Visit::Line(line, ts) = v else { return };
         // Cheap textual pre-filter (IPv6 may be written differently, so only for v4).
         if ip.is_ipv4() && !line.contains(&ip_text) {
             return;
@@ -1963,8 +2297,10 @@ agent:
         let e = engine_for(&path, "nginx", 1 << 30, true);
 
         let r = e.query(json!({"source": "src", "since": "1h", "limit": 50})).await.unwrap();
-        // boundary line may fall just outside (sub-second `now`)
-        assert!((3600..=3601).contains(&r["matched"].as_u64().unwrap()));
+        // Boundary lines may fall either side: log timestamps are whole
+        // seconds and the query's `now` is taken a little after `end`.
+        let m = r["matched"].as_u64().unwrap();
+        assert!((3599..=3601).contains(&m), "{m}");
         assert_eq!(r["returned"], 50);
         assert_eq!(r["truncated"], true);
         assert_eq!(r["scan_capped"], false);
@@ -2109,8 +2445,16 @@ agent:
         assert_eq!(g0["extras"]["sample_user_agent"], "python-requests/2.31");
         let series = r["series"].as_array().unwrap();
         assert!(series.len() >= 3 && series.len() <= 5);
-        let total: u64 = series.iter().map(|s| s["count"].as_u64().unwrap()).sum();
+        let total: u64 = series.iter().map(|s| s["count"].as_u64().unwrap_or(0)).sum();
         assert_eq!(total, 100);
+        // The file only reaches back 100 min of the 3 h window: the oldest
+        // bucket has no data at all → null / covered:false, not 0.
+        assert_eq!(r["coverage_complete"], false);
+        assert!(r["coverage_start"].is_string());
+        assert_eq!(series[0]["covered"], false, "{series:?}");
+        assert!(series[0]["count"].is_null());
+        assert_eq!(series.last().unwrap()["covered"], true);
+        assert!(series.iter().any(|b| b["partial"] == true), "{series:?}");
 
         let r = e
             .stats(json!({"source": "src", "since": "3h", "group_by": "ip24", "filter": {"fields": {"status": "4xx"}}}))
@@ -2139,6 +2483,131 @@ agent:
         assert_eq!(prof["src"]["top_paths"].as_array().unwrap().len(), 2);
         let prof = e.ip_profile_logs("45.0.0.1".parse().unwrap(), None).await.unwrap();
         assert_eq!(prof["src"], json!({"count": 0}));
+    }
+
+    fn write_gz(path: &Path, lines: &[String]) {
+        let f = File::create(path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        for l in lines {
+            writeln!(enc, "{l}").unwrap();
+        }
+        enc.finish().unwrap();
+    }
+
+    fn minutes_lines(end: Dt, from_min: i64, to_min: i64, path: &str) -> Vec<String> {
+        // one line per minute, `from_min` .. `to_min` minutes ago (oldest first)
+        (to_min..=from_min).rev().map(|m| nginx_line(end - TimeDelta::minutes(m), "45.1.1.1", path, 200, "a")).collect()
+    }
+
+    #[tokio::test]
+    async fn rotated_gzip_chain_is_read_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let end = Utc::now();
+        std::fs::write(&path, minutes_lines(end, 30, 1, "/new").join("\n") + "\n").unwrap();
+        std::fs::write(suffixed(&path, ".1"), minutes_lines(end, 60, 31, "/mid").join("\n") + "\n").unwrap();
+        write_gz(&suffixed(&path, ".2.gz"), &minutes_lines(end, 90, 61, "/old"));
+        write_gz(&suffixed(&path, ".3.gz"), &minutes_lines(end, 120, 91, "/older"));
+        let e = engine_for(&path, "nginx", 1 << 30, true);
+
+        let srcs = e.list_sources();
+        assert_eq!(srcs["sources"][0]["rotated_files"].as_array().unwrap().len(), 3);
+        assert_eq!(srcs["sources"][0]["rotated_files"][1]["gzip"], true);
+
+        let r = e.query(json!({"source": "src", "since": "100m", "limit": 1000})).await.unwrap();
+        assert!((99..=100).contains(&r["matched"].as_u64().unwrap()), "{}", r["matched"]);
+        assert_eq!(r["window"]["files"].as_array().unwrap().len(), 4);
+        let items = r["items"].as_array().unwrap();
+        let ts: Vec<&str> = items.iter().map(|i| i["ts"].as_str().unwrap()).collect();
+        let mut sorted = ts.clone();
+        sorted.sort();
+        assert_eq!(ts, sorted, "chronological across plain + gzip files");
+        assert_eq!(items[0]["fields"]["path"], "/older");
+        assert_eq!(items.last().unwrap()["fields"]["path"], "/new");
+        assert_eq!(r["coverage_complete"], true);
+
+        // Only the newest `limit` matches of a gzip segment are kept.
+        let r = e.query(json!({"source": "src", "since": "100m", "grep": "/old ", "limit": 15})).await.unwrap();
+        assert_eq!(r["matched"], 30);
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items.len(), 15);
+        assert_eq!(items.last().unwrap()["ts"], fmt_ts((end - TimeDelta::minutes(61)).with_nanosecond(0).unwrap()));
+        assert_eq!(items[0]["ts"], fmt_ts((end - TimeDelta::minutes(75)).with_nanosecond(0).unwrap()));
+
+        // Stats see every file too; coverage reaches 120 min back, not 3 h.
+        let r = e.stats(json!({"source": "src", "since": "3h", "group_by": "path", "buckets": "1h"})).await.unwrap();
+        assert_eq!(r["matched"], 120);
+        assert_eq!(r["coverage_complete"], false);
+        assert_eq!(r["series"][0]["covered"], false);
+
+        // A rotated file last modified before `since` ends the walk.
+        let old = std::fs::File::options().write(true).open(suffixed(&path, ".3.gz")).unwrap();
+        old.set_modified((end - TimeDelta::minutes(95)).into()).unwrap();
+        drop(old);
+        let r = e.query(json!({"source": "src", "since": "5430s", "limit": 1000})).await.unwrap();
+        assert_eq!(r["window"]["files"].as_array().unwrap().len(), 3, "{}", r["window"]);
+        assert_eq!(r["coverage_complete"], true);
+    }
+
+    #[tokio::test]
+    async fn gzip_tail_is_read_when_budget_is_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let end = Utc::now();
+        std::fs::write(&path, "").unwrap();
+        // ~1000 lines (≈ 100 KB) in `<path>.1.gz` (no delaycompress).
+        let lines = minutes_lines(end, 1000, 1, "/gz");
+        let total: usize = lines.iter().map(|l| l.len() + 1).sum();
+        write_gz(&suffixed(&path, ".1.gz"), &lines);
+        let budget = (total / 4) as u64;
+        let e = engine_for(&path, "nginx", budget, true);
+        let r = e.query(json!({"source": "src", "since": "2d", "limit": 5000})).await.unwrap();
+        assert_eq!(r["scan_capped"], true, "{r}");
+        assert_eq!(r["coverage_complete"], false);
+        assert!(r["scanned_bytes"].as_u64().unwrap() <= budget);
+        let matched = r["matched"].as_u64().unwrap();
+        assert!(matched > 150 && matched < 300, "{matched}");
+        // The newest lines were read (the head was skipped), in order.
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items.last().unwrap()["ts"], fmt_ts((end - TimeDelta::minutes(1)).with_nanosecond(0).unwrap()));
+        let first = parse_time_spec(items[0]["ts"].as_str().unwrap(), end).unwrap();
+        assert!(first > end - TimeDelta::minutes(400));
+    }
+
+    #[tokio::test]
+    async fn scans_are_limited_and_busy_maps_to_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        write_nginx(&path, Utc::now(), 10);
+        let cfg = cfg_from_yaml(&format!(
+            "agent:\n  max_concurrent_scans: 1\n  log_sources:\n    - name: src\n      path: {}\n      format: nginx\n",
+            path.display()
+        ));
+        let e = LogEngine::from_config(&cfg);
+        let held = e.scan_permit().unwrap();
+        assert!(matches!(e.query(json!({"source": "src"})).await, Err(AgentError::Busy(_))));
+        assert!(matches!(e.stats(json!({"source": "src"})).await, Err(AgentError::Busy(_))));
+        assert!(matches!(e.ip_profile_logs("45.0.0.1".parse().unwrap(), None).await, Err(AgentError::Busy(_))));
+        drop(held);
+        assert!(e.query(json!({"source": "src"})).await.is_ok());
+        assert!(e.query(json!({"source": "src"})).await.is_ok(), "permit released after a scan");
+    }
+
+    #[test]
+    fn read_token_file_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("agent-token");
+        std::fs::write(&tok, "  ro-token-0123456789abcdef \n").unwrap();
+        let cfg = |p: &Path| cfg_from_yaml(&format!("agent:\n  read_token_file: {}\n  max_streams: 2\n", p.display()));
+        let a = LogEngine::from_config(&cfg(&tok)).access();
+        assert_eq!(a.read_token.as_deref(), Some("ro-token-0123456789abcdef"));
+        assert_eq!(a.max_streams, 2);
+        std::fs::write(&tok, " \n").unwrap();
+        assert_eq!(LogEngine::from_config(&cfg(&tok)).access().read_token, None);
+        assert_eq!(LogEngine::from_config(&cfg(&dir.path().join("missing"))).access().read_token, None);
+        let d = LogEngine::from_config(&cfg_from_yaml("")).access();
+        assert_eq!(d.read_token, None);
+        assert_eq!(d.max_streams, 4);
     }
 
     #[test]

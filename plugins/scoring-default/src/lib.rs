@@ -119,10 +119,7 @@ impl ScoringEnginePlugin for DefaultScoringPlugin {
             return None;
         }
 
-        let total_severity: u32 = bucket
-            .iter()
-            .map(|s| (s.severity as f32 * s.confidence) as u32)
-            .sum();
+        let total_severity: u32 = bucket.iter().map(weighted_severity).sum();
 
         if total_severity < self.config.ban_severity_threshold {
             return None;
@@ -222,6 +219,13 @@ impl ScoringEnginePlugin for DefaultScoringPlugin {
 
         Ok(())
     }
+}
+
+/// `severity × confidence`, truncated — with a small epsilon so that f32
+/// representation error (e.g. `125 × 0.8 = 99.99999`) cannot push a signal
+/// that is meant to sit exactly on the threshold below it.
+fn weighted_severity(s: &DetectionSignal) -> u32 {
+    (s.severity as f32 * s.confidence.clamp(0.0, 1.0) + 1e-3) as u32
 }
 
 fn ip_to_net(ip: IpAddr) -> IpNet {
@@ -378,5 +382,47 @@ mod tests {
             first_decision.unwrap().severity,
             restored_decision.unwrap().severity
         );
+    }
+
+    fn signal_with(ip: &str, severity: u8, confidence: f32) -> DetectionSignal {
+        let mut s = make_signal(ip, severity);
+        s.confidence = confidence;
+        s
+    }
+
+    /// Every detector that is meant to ban on a single signal must reach the
+    /// default threshold (100) on its own. Values mirror the detectors in
+    /// hiveguard-core (keep in sync when a detector changes).
+    #[tokio::test]
+    async fn single_signal_detectors_reach_default_threshold() {
+        let cases: &[(&str, u8, f32)] = &[
+            ("http_4xx_flood", 120, 0.85),
+            ("http_flood", 200, 0.85),
+            ("http_login_bruteforce", 180, 0.90),
+            ("path_probe", 200, 0.95),
+            ("scanner_fingerprint", 200, 0.85),
+            ("webshell_probe", 200, 0.9),
+            ("campaign", 200, 0.9),
+            ("port_scan", 200, 0.9),
+            ("ssh_bruteforce", 150, 0.9),
+            ("ssh_enum", 180, 0.9),
+            ("smtp_bruteforce", 150, 0.9),
+            ("honeypot", 250, 1.0),
+            ("bot_policy", 150, 1.0),
+            ("sigma_critical", 120, 0.85),
+            ("edge_125x0.8", 125, 0.8),
+        ];
+        let plugin = DefaultScoringPlugin::create(test_ctx(), serde_json::json!({})).await.unwrap();
+        for (i, (name, sev, conf)) in cases.iter().enumerate() {
+            let ip = format!("100.64.99.{}", i + 1);
+            plugin.record(signal_with(&ip, *sev, *conf));
+            assert!(
+                plugin.evaluate(ip.parse().unwrap()).is_some(),
+                "{name}: {sev} x {conf} must ban alone"
+            );
+        }
+        // The old http_4xx_flood weighting (120 x 0.8 = 96) does not.
+        plugin.record(signal_with("100.64.99.200", 120, 0.8));
+        assert!(plugin.evaluate("100.64.99.200".parse().unwrap()).is_none());
     }
 }

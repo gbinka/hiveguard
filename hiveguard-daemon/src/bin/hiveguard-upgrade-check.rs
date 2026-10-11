@@ -321,13 +321,27 @@ fn inspect(args: &Args) -> Result<Value> {
                 "set_name": entry.resolved_config.get("set_name")})
             })
             .collect();
+        // Reported separately so the reviewed `nftables` identity stays
+        // comparable across releases; upgrade.py/simulate.py use it to expect
+        // the optional prerouting chain.
+        let prerouting_hook = resolved
+            .iter()
+            .filter(|entry| entry.entry.id == "enforcer.nftables")
+            .any(|entry| {
+                entry
+                    .resolved_config
+                    .get("prerouting_hook")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
         let configured_dir = fs::canonicalize(&config.node.data_dir)
             .or_else(|_| std::path::absolute(&config.node.data_dir))?;
         let actual_dir = fs::canonicalize(&args.data_dir)?;
         config_report = json!({"path": path, "sha256": digest(&config_bytes),
             "configured_data_dir": config.node.data_dir,
             "data_dir_matches": configured_dir == actual_dir,
-            "plugins": requested, "resolved_plugins": plugins, "nftables": nft});
+            "plugins": requested, "resolved_plugins": plugins, "nftables": nft,
+            "nftables_prerouting_hook": prerouting_hook});
     }
     let mut bans: Vec<_> = expected.bans.values().cloned().collect();
     bans.sort_by_key(|ban| ban.subject.to_string());
@@ -439,6 +453,31 @@ mod tests {
             ssh_ip: None,
             output: None,
             legacy_output_dir: None,
+        }
+    }
+
+    #[test]
+    fn config_report_exposes_nftables_prerouting_hook() {
+        let source = tempfile::tempdir().unwrap();
+        fixture(source.path());
+        for (extra, expected) in [("", false), ("      prerouting_hook: true\n", true)] {
+            let config = source.path().join("config.yaml");
+            fs::write(
+                &config,
+                format!(
+                    "node:\n  name: \"node-a\"\n  data_dir: \"{}\"\n  listen_gossip: \"\"\nplugins:\n  - id: enforcer.nftables\n    config:\n      table: hiveguard\n      set_name: hiveguard_blocklist\n{extra}  - id: scoring.default\n    config: {{}}\n",
+                    source.path().display()
+                ),
+            )
+            .unwrap();
+            let mut arguments = args(source.path());
+            arguments.config = Some(config);
+            let report = inspect(&arguments).unwrap();
+            assert_eq!(
+                report["config"]["nftables"],
+                json!([{"table": "hiveguard", "set_name": "hiveguard_blocklist"}])
+            );
+            assert_eq!(report["config"]["nftables_prerouting_hook"], expected);
         }
     }
 

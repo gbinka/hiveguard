@@ -2621,6 +2621,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
+ "flate2",
  "futures",
  "hiveguard-config",
  "hiveguard-core",
@@ -2636,6 +2637,7 @@ dependencies = [
  "hiveguard-plugin-cti-spamhaus",
  "hiveguard-plugin-cti-tor",
  "hiveguard-plugin-detector-campaign",
+ "hiveguard-plugin-detector-distributed-crawl",
  "hiveguard-plugin-detector-distributed-slow",
  "hiveguard-plugin-detector-entropy",
  "hiveguard-plugin-detector-honeypot",
@@ -2873,6 +2875,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "hiveguard-plugin-detector-distributed-crawl"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hiveguard-core",
+ "hiveguard-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

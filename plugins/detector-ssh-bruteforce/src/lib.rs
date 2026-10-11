@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use hiveguard_core::Detector;
+use hiveguard_core::detectors::netkey::{validate_ipv6_prefix, DEFAULT_IPV6_PREFIX};
 use hiveguard_core::detectors::SshBruteforceDetector;
 use hiveguard_core::models::EventType;
 use hiveguard_plugin_api::prelude::*;
@@ -18,6 +19,8 @@ struct Config {
     enum_threshold: Option<u32>,
     enum_window_secs: Option<u64>,
     enum_ban_duration_secs: Option<u64>,
+    /// IPv6 sources counted/banned per this prefix (0/128 = per address).
+    ipv6_prefix: Option<u8>,
 }
 
 pub struct SshBruteforcePlugin {
@@ -68,6 +71,7 @@ impl SshBruteforcePlugin {
             enum_window,
             enum_ban,
         )
+        .with_ipv6_prefix(cfg.ipv6_prefix.unwrap_or(DEFAULT_IPV6_PREFIX))
     }
 }
 
@@ -80,6 +84,8 @@ impl Plugin for SshBruteforcePlugin {
     async fn init(&mut self, cfg: serde_json::Value) -> PluginResult<()> {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
+        validate_ipv6_prefix("ipv6_prefix", cfg.ipv6_prefix.unwrap_or(DEFAULT_IPV6_PREFIX))
+            .map_err(PluginError::ConfigValidation)?;
         self.detector = Self::from_config(cfg);
         Ok(())
     }
@@ -201,5 +207,22 @@ mod tests {
         assert!(plugin.process(&auth_failure_event("1.2.3.4")).is_none());
         assert!(plugin.process(&auth_failure_event("1.2.3.4")).is_none());
         assert!(plugin.process(&auth_failure_event("1.2.3.4")).is_some());
+    }
+
+    #[tokio::test]
+    async fn ipv6_prefix_key_is_accepted_and_validated() {
+        let plugin = SshBruteforcePlugin::create(
+            test_ctx(),
+            serde_json::json!({ "threshold": 2, "ipv6_prefix": 64 }),
+        )
+        .await
+        .unwrap();
+        assert!(plugin.process(&auth_failure_event("2001:db8:1:1::1")).is_none());
+        let s = plugin.process(&auth_failure_event("2001:db8:1:1::2")).expect("same /64");
+        assert_eq!(s.source_ip.to_string(), "2001:db8:1:1::/64");
+
+        assert!(SshBruteforcePlugin::create(test_ctx(), serde_json::json!({ "ipv6_prefix": 16 }))
+            .await
+            .is_err());
     }
 }

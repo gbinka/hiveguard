@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path_prefixes"],
+  "properties": {
+    "path_prefixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Expensive endpoints watched for first-time visitors, matched with starts_with on the request path (query included), e.g. /cgi-bin/koha/opac-search.pl, /catalogsearch/." },
+    "window_secs": { "type": "integer", "minimum": 10, "maximum": 86400, "description": "Sliding window for counting fresh IPs. Default 300." },
+    "fresh_ip_memory_secs": { "type": "integer", "minimum": 60, "maximum": 2592000, "description": "An IP (IPv6: /ipv6_prefix) seen with any HTTP request within this period is not fresh. Default 86400." },
+    "fresh_ip_threshold": { "type": "integer", "minimum": 1, "maximum": 10000000, "description": "Under attack when MORE than this many fresh IPs hit path_prefixes in the window. Default 30." },
+    "off_threshold": { "type": "integer", "minimum": 0, "maximum": 10000000, "description": "Back to normal when fewer than this many fresh IPs per window for cooldown_secs; must be <= fresh_ip_threshold. Default fresh_ip_threshold / 3." },
+    "cooldown_secs": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "How long the count must stay below off_threshold before the state turns off. Default 900." },
+    "max_tracked_ips": { "type": "integer", "minimum": 100, "maximum": 10000000, "description": "Memory bound for remembered IPs and candidates. Default 500000." },
+    "exclude_static_fetchers": { "type": "boolean", "description": "An IP that fetches a static asset (static_extensions) within the window is treated as a browser and not counted. Default true." },
+    "static_extensions": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Static asset suffixes (case-insensitive). Default: the http_flood ignore list (.css .js .png .woff2 …)." },
+    "require_no_referer": { "type": "boolean", "description": "Count only requests without a Referer. Needs a parser that fills metadata 'referer' (the built-in nginx parser does not yet). Default false." },
+    "ipv6_prefix": { "type": "integer", "minimum": 0, "maximum": 128, "description": "IPv6 sources are counted per this prefix (0 = per address, else 48..128). Default 64." },
+    "flag_file": { "type": "string", "description": "File created (atomically, mode 0644) while under attack and removed afterwards; empty string = no file. Default /run/hiveguard/under_attack." },
+    "eval_interval_secs": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How often the state is evaluated and the gauge refreshed. Default 5." }
+  }
+}

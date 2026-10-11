@@ -177,7 +177,7 @@ async fn whitelist_add_list_remove() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::WhitelistAdd {
-            target: "11.0.0.0/8".to_string(),
+            target: "11.0.0.0/16".to_string(),
         },
     )
     .await;
@@ -191,7 +191,7 @@ async fn whitelist_add_list_remove() {
     match &resp {
         ApiResponse::WhitelistEntries { entries } => {
             assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0], "11.0.0.0/8");
+            assert_eq!(entries[0], "11.0.0.0/16");
         }
         other => panic!("Expected WhitelistEntries, got {:?}", other),
     }
@@ -200,7 +200,7 @@ async fn whitelist_add_list_remove() {
     let resp = raw_request(
         &socket_path,
         &ApiRequest::WhitelistRemove {
-            target: "11.0.0.0/8".to_string(),
+            target: "11.0.0.0/16".to_string(),
         },
     )
     .await;

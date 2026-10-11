@@ -62,8 +62,8 @@ plugins:
 | `GET`    | `/api/peers`                  | yes    | `{"peers":[…]}` (empty until PeerManager is wired in).  |
 | `GET`    | `/api/bots`                   | yes    | `{"bots":[…]}` registry stats (503 if disabled).        |
 | `POST`   | `/api/bots/{name}/policy`     | yes    | Set policy — body: `{"policy":"allow\|block\|monitor"}`. |
-| `GET`    | `/api/config`                 | yes    | `{"content":"<yaml>"}` — raw config file.               |
-| `PUT`    | `/api/config`                 | yes    | Replace config — body: `{"content":"<yaml>"}` (validated). |
+| `GET`    | `/api/config`                 | yes    | `{"content":"<yaml>"}` — config file with secrets (`auth_token`, `token`, `password`, `*_key` …) replaced by `"<redacted>"`; `${env:…}`/`${file:…}` placeholders shown as-is. |
+| `PUT`    | `/api/config`                 | yes    | Replace config — body: `{"content":"<yaml>"}`. Validated **without** expanding placeholders; refused (400) when it contains `<redacted>`, or a `${file:}` outside `/etc/hiveguard/` / `/run/credentials/` or a missing file / unset `${env:}`. |
 | `GET`    | `/api/config/detectors`       | yes    | Effective detector config as JSON.                      |
 | `PUT`    | `/api/config/detectors`       | yes    | Replace the `detectors:` block — body: detectors JSON.  |
 | `GET`    | `/api/fail2ban/preview`       | yes    | `?db=&jail=` — preview bans without importing.          |
@@ -99,12 +99,31 @@ without leaking them into URLs:
 Sec-WebSocket-Protocol: bearer.<auth_token>
 ```
 
-A `?token=<auth_token>` query parameter is accepted as a fallback for
-testing tools that cannot set subprotocol headers, but it is **not**
-recommended in production because query strings often end up in access
-logs.
+An `Authorization: Bearer` header also works for non-browser clients. A
+`?token=` query parameter is **not** accepted (since 2026-10-11): query
+strings end up in access and proxy logs.
 
-Token comparison is constant-time (`subtle::ConstantTimeEq`).
+**Read-only agent token.** When the daemon's `agent.read_token_file` names a
+readable, non-empty file, its content is a second, read-only token: every
+`GET` (except `/api/fail2ban/preview`), the read-only agent `POST`s
+(`/api/agent/logs/query`, `/api/agent/logs/stats`, `/api/agent/ip`,
+`/api/agent/config/validate`) and both streams. Every other request →
+`403 {"error": "read-only token: …"}`. Give AI agents this token, never
+`auth_token`.
+
+Token comparison is constant-time (`subtle::ConstantTimeEq`); both tokens
+are always compared.
+
+**Audit.** Every mutation (ban, unban, whitelist add/remove, config/detector
+PUT, bot policy, Sigma upsert/delete, fail2ban import) and every refused
+read-token request is logged with `target: "hiveguard::audit"`, fields `op`,
+`subject`, `source` (`rest`, or `agent` for the read token / a
+`hiveguard-mcp` / `hg-agent-proxy` User-Agent — best effort), `token`
+(`admin`/`read`), `status`, `outcome`.
+
+**Limits on mutations.** Ban and whitelist additions wider than /16 (IPv4) or
+/32 (IPv6) are refused with 400 (also on the socket CLI). Wider ranges belong
+in `config.yaml`.
 
 ### `BanRequest` body
 
@@ -192,9 +211,11 @@ Response: `{"accepted":N,"rejected":M}`. The endpoint uses its own Bearer token
 Since 2026-10 the plugin also mounts the AI-agent / analyst API documented in
 [`docs/AGENT_API.md`](../../docs/AGENT_API.md): `overview`, filtered `bans` /
 `threats`, `logs/sources|query|stats`, `ip`, `journal`, `detectors`,
-`catalog`, `config/validate` (all behind the same bearer token) and an SSE
-stream at `GET /api/agent/stream` (token via `Authorization` header or
-`?token=`). Behaviour is configured by the daemon's top-level `agent:` section,
+`catalog`, `config` (redacted config text), `config/validate` (admin or
+read-only token) and an SSE stream at `GET /api/agent/stream` (token via
+the `Authorization` header only; at most `agent.max_streams`, 429 beyond).
+Agent responses are sanitised and marked `"data_trust": "untrusted_log_data"`.
+Behaviour is configured by the daemon's top-level `agent:` section,
 not by this plugin. An MCP server for these endpoints lives in
 [`tools/mcp/`](../../tools/mcp/README.md). The classic `GET /api/bans` items
 now also carry `created_at`.

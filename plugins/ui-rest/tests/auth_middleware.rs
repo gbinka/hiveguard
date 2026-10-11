@@ -81,6 +81,8 @@ async fn ingest_requires_nonempty_token_and_explicit_bearer_header() {
             started_at: Instant::now(), tick_interval: Duration::from_secs(30),
             shutdown: CancellationToken::new(),
             ingest: IngestState { enabled: true, token: token.map(str::to_string), ..Default::default() },
+            read_token: None, max_streams: 4,
+            active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let router = build_router(state, None, &[]);
         let mut request = Request::builder().method("POST").uri("/api/ingest/logs");

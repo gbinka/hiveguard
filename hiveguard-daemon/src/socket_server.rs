@@ -7,7 +7,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use hiveguard_core::api::{ApiRequest, ApiResponse, BanInfo, ExportFormat};
+use hiveguard_core::api::{check_mutation_prefix, ApiRequest, ApiResponse, BanInfo, ExportFormat};
 use hiveguard_core::ban_store::BanStore;
 use hiveguard_core::config::parse_duration_string;
 use hiveguard_core::models::{BanRecord, BanSource};
@@ -171,7 +171,48 @@ impl SocketServer {
         Ok(())
     }
 
+    /// Process one request and write an audit record for every mutation
+    /// (`target: "hiveguard::audit"`, `source=socket`, `token=unix-socket`:
+    /// access is governed by the socket's file permissions, 0660).
     async fn process_request(
+        request: ApiRequest,
+        state: &Arc<Mutex<StateManager>>,
+        start_time: Instant,
+        enforcer: &Option<Arc<Mutex<Box<dyn Enforcer>>>>,
+        on_ban: &Option<BanHook>,
+    ) -> ApiResponse {
+        let audit_op = match &request {
+            ApiRequest::Ban { target, duration, .. } => {
+                Some(("ban", target.clone(), duration.clone().unwrap_or_else(|| "24h".into())))
+            }
+            ApiRequest::Unban { target } => Some(("unban", target.clone(), String::new())),
+            ApiRequest::WhitelistAdd { target } => Some(("whitelist_add", target.clone(), String::new())),
+            ApiRequest::WhitelistRemove { target } => Some(("whitelist_remove", target.clone(), String::new())),
+            _ => None,
+        };
+        let response = Self::process_request_inner(request, state, start_time, enforcer, on_ban).await;
+        if let Some((op, subject, duration)) = audit_op {
+            let (outcome, detail) = match &response {
+                ApiResponse::Error { message } => ("error", message.as_str()),
+                ApiResponse::Ok { message } => ("ok", message.as_str()),
+                _ => ("ok", ""),
+            };
+            info!(
+                target: "hiveguard::audit",
+                op,
+                subject = %subject,
+                duration = %duration,
+                source = "socket",
+                token = "unix-socket",
+                outcome,
+                detail,
+                "mutation"
+            );
+        }
+        response
+    }
+
+    async fn process_request_inner(
         request: ApiRequest,
         state: &Arc<Mutex<StateManager>>,
         start_time: Instant,
@@ -201,6 +242,9 @@ impl SocketServer {
                         return ApiResponse::Error { message: e };
                     }
                 };
+                if let Err(message) = check_mutation_prefix(&net, "ban") {
+                    return ApiResponse::Error { message };
+                }
 
                 let ban_duration = match duration {
                     Some(ref d) => match parse_duration_string(d) {
@@ -306,6 +350,10 @@ impl SocketServer {
                         return ApiResponse::Error { message: e };
                     }
                 };
+
+                if let Err(message) = check_mutation_prefix(&net, "whitelist") {
+                    return ApiResponse::Error { message };
+                }
 
                 // Adding to the whitelist must also revoke the bans it now
                 // covers — both in the store and in the firewall — otherwise
@@ -482,4 +530,36 @@ fn ban_record_to_info(record: &BanRecord) -> BanInfo {
 /// Get the default socket path.
 pub fn default_socket_path() -> PathBuf {
     PathBuf::from("/var/run/hiveguard/hiveguard.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hiveguard_core::persistence::wal::WalSyncMode;
+
+    async fn run(req: ApiRequest, state: &Arc<Mutex<StateManager>>) -> ApiResponse {
+        SocketServer::process_request(req, state, Instant::now(), &None, &None).await
+    }
+
+    #[tokio::test]
+    async fn socket_refuses_too_wide_ban_and_whitelist() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(StateManager::new(dir.path(), WalSyncMode::None).unwrap()));
+        for target in ["0.0.0.0/0", "100.0.0.0/8", "::/0", "2001:db8::/16"] {
+            let r = run(ApiRequest::Ban { target: target.into(), duration: None, reason: None }, &state).await;
+            assert!(matches!(&r, ApiResponse::Error { message } if message.contains("wider than")), "{target}: {r:?}");
+            let r = run(ApiRequest::WhitelistAdd { target: target.into() }, &state).await;
+            assert!(matches!(&r, ApiResponse::Error { message } if message.contains("wider than")), "{target}: {r:?}");
+        }
+        assert!(state.lock().await.ban_store().get_all_bans().is_empty());
+        assert!(state.lock().await.whitelist().entries().iter().all(|n| n.prefix_len() >= 16));
+
+        let r = run(ApiRequest::Ban { target: "100.64.0.0/16".into(), duration: Some("1h".into()), reason: None }, &state).await;
+        assert!(matches!(r, ApiResponse::Ok { .. }), "{r:?}");
+        let r = run(ApiRequest::WhitelistAdd { target: "100.65.1.0/24".into() }, &state).await;
+        assert!(matches!(r, ApiResponse::Ok { .. }), "{r:?}");
+        // Removing is never restricted.
+        let r = run(ApiRequest::WhitelistRemove { target: "100.65.1.0/24".into() }, &state).await;
+        assert!(matches!(r, ApiResponse::Ok { .. }), "{r:?}");
+    }
 }

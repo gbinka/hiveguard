@@ -6,6 +6,10 @@
   "properties": {
     "table": { "type": "string", "minLength": 1 },
     "set_name": { "type": "string", "minLength": 1 },
-    "batch_interval_secs": { "type": "integer", "minimum": 1, "maximum": 300 }
+    "batch_interval_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+    "prerouting_hook": {
+      "type": "boolean",
+      "description": "Also drop banned sources in an inet prerouting chain (priority -300, before DNAT) so Docker-published ports are covered. Default false."
+    }
   }
 }

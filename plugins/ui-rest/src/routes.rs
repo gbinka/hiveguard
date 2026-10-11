@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
     response::{IntoResponse, Json, Response},
@@ -24,7 +24,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use hiveguard_plugin_api::prelude::{BanRequest, PluginError};
 
 use crate::agent::{agent_routes, sse_handler};
-use crate::auth::{ct_eq, require_auth};
+use crate::auth::{ct_eq, require_auth, AuthContext};
 use crate::state::AppState;
 use crate::ws::ws_handler;
 
@@ -69,8 +69,8 @@ pub fn build_router(
     let public = Router::new()
         .route("/api/health", get(get_health))
         .route("/api/stream", get(ws_handler))
-        // SSE agent stream: token via Bearer header or `?token=` (checked in
-        // the handler, like the WebSocket route).
+        // SSE agent stream: Bearer header only (checked in the handler; the
+        // read-only agent token is accepted).
         .route("/api/agent/stream", get(sse_handler))
         .route("/metrics", get(get_metrics));
 
@@ -205,26 +205,38 @@ async fn get_plugins(State(state): State<Arc<AppState>>) -> Response {
 
 async fn post_ban(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(req): Json<BanRequest>,
 ) -> Response {
-    match state.api.add_ban(req).await {
-        Ok(()) => (StatusCode::CREATED, Json(json!({ "status": "created" }))).into_response(),
-        Err(e) => plugin_err_to_response(e),
-    }
+    let audit_subject: String = req.subject.to_string();
+    let resp: Response = (async {
+        match state.api.add_ban(req).await {
+            Ok(()) => (StatusCode::CREATED, Json(json!({ "status": "created" }))).into_response(),
+            Err(e) => plugin_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "ban", &audit_subject, &resp);
+    resp
 }
 
 async fn delete_ban(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Path(cidr): Path<String>,
 ) -> Response {
-    let net = match decode_target(&cidr) {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
-    match state.api.remove_ban(net).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => plugin_err_to_response(e),
-    }
+    let audit_subject: String = cidr.clone();
+    let resp: Response = (async {
+        let net = match decode_target(&cidr) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        match state.api.remove_ban(net).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => plugin_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "unban", &audit_subject, &resp);
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -238,38 +250,50 @@ async fn get_whitelist(State(state): State<Arc<AppState>>) -> Response {
 
 async fn post_whitelist(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<WhitelistAddRequest>,
 ) -> Response {
-    let net = match parse_target(&body.cidr) {
-        Ok(n) => n,
-        Err(e) => return bad_request(e),
-    };
-    match state.api.add_whitelist(net).await {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(json!({ "message": format!("Whitelisted {net}") })),
-        )
-            .into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = body.cidr.clone();
+    let resp: Response = (async {
+        let net = match parse_target(&body.cidr) {
+            Ok(n) => n,
+            Err(e) => return bad_request(e),
+        };
+        match state.api.add_whitelist(net).await {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(json!({ "message": format!("Whitelisted {net}") })),
+            )
+                .into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "whitelist_add", &audit_subject, &resp);
+    resp
 }
 
 async fn delete_whitelist(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Path(cidr): Path<String>,
 ) -> Response {
-    let net = match decode_target(&cidr) {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
-    match state.api.remove_whitelist(net).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "message": format!("Removed {net} from whitelist") })),
-        )
-            .into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = cidr.clone();
+    let resp: Response = (async {
+        let net = match decode_target(&cidr) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        match state.api.remove_whitelist(net).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "message": format!("Removed {net} from whitelist") })),
+            )
+                .into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "whitelist_remove", &audit_subject, &resp);
+    resp
 }
 
 async fn get_peers(State(state): State<Arc<AppState>>) -> Response {
@@ -289,17 +313,23 @@ async fn get_bots(State(state): State<Arc<AppState>>) -> Response {
 
 async fn post_bot_policy(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Path(name): Path<String>,
     Json(body): Json<SetBotPolicyRequest>,
 ) -> Response {
-    match state.api.set_bot_policy(name.clone(), body.policy.clone()).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "message": format!("Policy for '{name}' set to '{}'", body.policy.to_lowercase()) })),
-        )
-            .into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = format!("{name}={}", body.policy);
+    let resp: Response = (async {
+        match state.api.set_bot_policy(name.clone(), body.policy.clone()).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "message": format!("Policy for '{name}' set to '{}'", body.policy.to_lowercase()) })),
+            )
+                .into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "bot_policy", &audit_subject, &resp);
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -315,16 +345,22 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Response {
 
 async fn put_config(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<ConfigUpdateRequest>,
 ) -> Response {
-    match state.api.put_config(body.content).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "message": "Config saved. Restart daemon to apply changes." })),
-        )
-            .into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = String::from("config.yaml");
+    let resp: Response = (async {
+        match state.api.put_config(body.content).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "message": "Config saved. Restart daemon to apply changes." })),
+            )
+                .into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "config_put", &audit_subject, &resp);
+    resp
 }
 
 async fn get_detectors(State(state): State<Arc<AppState>>) -> Response {
@@ -336,16 +372,22 @@ async fn get_detectors(State(state): State<Arc<AppState>>) -> Response {
 
 async fn put_detectors(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<Value>,
 ) -> Response {
-    match state.api.put_detectors(body).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "message": "Detector rules saved. Restart daemon to apply changes." })),
-        )
-            .into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = String::new();
+    let resp: Response = (async {
+        match state.api.put_detectors(body).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "message": "Detector rules saved. Restart daemon to apply changes." })),
+            )
+                .into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "detectors_put", &audit_subject, &resp);
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -367,12 +409,18 @@ async fn get_fail2ban_preview(
 
 async fn post_fail2ban_import(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<Fail2banImportRequest>,
 ) -> Response {
-    match state.api.fail2ban_import(body.db, body.jail).await {
-        Ok(info) => Json(info).into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = body.jail.clone().unwrap_or_default();
+    let resp: Response = (async {
+        match state.api.fail2ban_import(body.db, body.jail).await {
+            Ok(info) => Json(info).into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "fail2ban_import", &audit_subject, &resp);
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +439,18 @@ async fn get_sigma_rules(State(state): State<Arc<AppState>>) -> Response {
 
 async fn post_sigma_rule(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Json(body): Json<SigmaUploadRequest>,
 ) -> Response {
-    match state.api.upsert_sigma_rule(body.yaml).await {
-        Ok(id) => Json(json!({ "message": format!("Rule '{id}' saved") })).into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = String::new();
+    let resp: Response = (async {
+        match state.api.upsert_sigma_rule(body.yaml).await {
+            Ok(id) => Json(json!({ "message": format!("Rule '{id}' saved") })).into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "sigma_upsert", &audit_subject, &resp);
+    resp
 }
 
 async fn get_sigma_rule(
@@ -416,12 +470,18 @@ async fn get_sigma_rule(
 
 async fn delete_sigma_rule(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.api.delete_sigma_rule(id.clone()).await {
-        Ok(()) => Json(json!({ "message": format!("Rule '{id}' deleted") })).into_response(),
-        Err(e) => mgmt_err_to_response(e),
-    }
+    let audit_subject: String = id.clone();
+    let resp: Response = (async {
+        match state.api.delete_sigma_rule(id.clone()).await {
+            Ok(()) => Json(json!({ "message": format!("Rule '{id}' deleted") })).into_response(),
+            Err(e) => mgmt_err_to_response(e),
+        }
+    }).await;
+    audit_mutation(&ctx, "sigma_delete", &audit_subject, &resp);
+    resp
 }
 
 async fn get_sigma_stats(State(state): State<Arc<AppState>>) -> Response {
@@ -597,6 +657,37 @@ fn decode_target(raw: &str) -> Result<IpNet, Response> {
         .map_err(|()| bad_request(format!("invalid CIDR: '{decoded}'")))
 }
 
+/// One audit record per REST mutation (`target: "hiveguard::audit"`).
+fn audit_mutation(ctx: &Option<Extension<AuthContext>>, op: &str, subject: &str, resp: &Response) {
+    let (token, source) = ctx
+        .as_ref()
+        .map(|Extension(c)| (c.token.as_str(), c.source))
+        .unwrap_or(("unknown", "rest"));
+    let status = resp.status().as_u16();
+    let outcome = if resp.status().is_success() { "ok" } else { "error" };
+    let subject = hiveguard_plugin_api::sanitize::sanitize_text(subject, 128);
+    tracing::info!(
+        target: "hiveguard::audit",
+        op,
+        subject = %subject,
+        source,
+        token,
+        status,
+        outcome,
+        "mutation"
+    );
+}
+
+/// `429 Too Many Requests` + `Retry-After` for `PluginError::Busy`.
+pub(crate) fn busy_response(msg: String) -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": msg }))).into_response();
+    resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECS));
+    resp
+}
+
+/// `Retry-After` value for 429 answers (seconds).
+pub(crate) const RETRY_AFTER_SECS: &str = "5";
+
 fn bad_request(msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
@@ -604,6 +695,9 @@ fn bad_request(msg: String) -> Response {
 /// Error mapping for the ban endpoints (legacy semantics: generic failures →
 /// 500, validation → 400).
 fn plugin_err_to_response(err: PluginError) -> Response {
+    if let PluginError::Busy(m) = err {
+        return busy_response(m);
+    }
     let status = match &err {
         PluginError::ConfigValidation(_) | PluginError::MissingConfig(_) => StatusCode::BAD_REQUEST,
         PluginError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -615,6 +709,9 @@ fn plugin_err_to_response(err: PluginError) -> Response {
 /// Error mapping for the management endpoints. Disabled subsystems surface as
 /// `Runtime` and map to `503`, matching the legacy `/api/v1` behaviour.
 fn mgmt_err_to_response(err: PluginError) -> Response {
+    if let PluginError::Busy(m) = err {
+        return busy_response(m);
+    }
     let status = match &err {
         PluginError::ConfigValidation(_) | PluginError::MissingConfig(_) => StatusCode::BAD_REQUEST,
         PluginError::NotFound(_) => StatusCode::NOT_FOUND,

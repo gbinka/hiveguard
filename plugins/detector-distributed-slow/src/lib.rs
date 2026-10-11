@@ -29,7 +29,7 @@ impl DistributedSlowPlugin {
         PluginManifest {
             id: PLUGIN_ID,
             version: PLUGIN_VERSION,
-            description: "Disabled legacy subnet-count detector (insufficient evidence for subnet bans).",
+            description: "No-op legacy subnet-count detector (logs a startup WARN; use detector.distributed_crawl).",
             kind: PluginKind::Detector,
             author: "HiveGuard",
             docs_url: Some("https://github.com/anthropics/hiveguard/blob/main/plugins/detector-distributed-slow/README.md"),
@@ -71,6 +71,7 @@ impl Plugin for DistributedSlowPlugin {
         let cfg: Config = serde_json::from_value(cfg)
             .map_err(|e| PluginError::ConfigValidation(e.to_string()))?;
         self.detector = Self::from_config(cfg);
+        DistributedSlowDetector::warn_noop_configured();
         Ok(())
     }
 }

@@ -1,10 +1,50 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 const MAX_UNKNOWN_BOTS: usize = 1024;
 const MAX_TRACKED_UA_BYTES: usize = 1024;
+
+/// Ban duration for `policy: block` rules without `ban_duration_secs`.
+pub const DEFAULT_BLOCK_BAN: Duration = Duration::from_secs(3600);
+
+/// Detector name of signals raised by a `policy: block` bot rule.
+pub const BOT_POLICY_DETECTOR: &str = "bot_policy";
+
+/// Result of [`BotRegistry::classify_rule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotMatch {
+    pub policy: BotPolicy,
+    /// Name of the matching rule.
+    pub name: String,
+    /// Ban duration when `policy` is `Block`.
+    pub block_ban: Duration,
+}
+
+impl BotMatch {
+    /// Ban signal for a request whose User-Agent matched a `policy: block`
+    /// rule: host-scoped, severity 150 × confidence 1.0 (≥ the default ban
+    /// threshold 100, so the first matching request bans), `Ban(block_ban)`.
+    pub fn block_signal(&self, event: &crate::models::NormalizedEvent) -> crate::models::DetectionSignal {
+        let evidence = format!(
+            "{}:{BOT_POLICY_DETECTOR}:{}:{}",
+            event.source_ip,
+            self.name,
+            event.timestamp.timestamp() / 60
+        );
+        crate::models::DetectionSignal {
+            source_ip: ipnet::IpNet::from(event.source_ip),
+            severity: 150,
+            confidence: 1.0,
+            reason: format!("Bot policy block: User-Agent matches bot rule '{}'", self.name),
+            evidence_hash: *blake3::hash(evidence.as_bytes()).as_bytes(),
+            suggested_action: crate::models::Action::Ban(self.block_ban),
+            detector_name: BOT_POLICY_DETECTOR.to_string(),
+            timestamp: event.timestamp,
+        }
+    }
+}
 
 /// Policy for a known bot pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +96,8 @@ pub struct BotRegistry {
     stats: HashMap<String, BotStats>,
     /// Unknown bots seen: keyed by a normalized UA prefix.
     unknown_bots: HashMap<String, BotStats>,
+    /// Per-rule ban duration for `policy: block` (rule name → duration).
+    block_bans: HashMap<String, Duration>,
 }
 
 impl BotRegistry {
@@ -83,7 +125,53 @@ impl BotRegistry {
             rules,
             stats,
             unknown_bots: HashMap::new(),
+            block_bans: HashMap::new(),
         }
+    }
+
+    /// Build the registry straight from the `bots:` config section,
+    /// including per-rule `ban_duration_secs` for `policy: block`.
+    pub fn from_rule_configs(cfgs: &[crate::config::BotRuleConfig]) -> Self {
+        let rules = cfgs
+            .iter()
+            .map(|rc| BotRule {
+                name: rc.name.clone(),
+                ua_contains: rc.ua_contains.clone(),
+                org: rc.org.clone(),
+                policy: match rc.policy.to_lowercase().as_str() {
+                    "block" => BotPolicy::Block,
+                    "allow" => BotPolicy::Allow,
+                    _ => BotPolicy::Monitor,
+                },
+            })
+            .collect();
+        Self::new(rules).with_block_ban_durations(
+            cfgs.iter()
+                .filter_map(|rc| rc.ban_duration_secs.map(|s| (rc.name.clone(), Duration::from_secs(s)))),
+        )
+    }
+
+    /// Set per-rule ban durations for `policy: block` (others: 1 h).
+    pub fn with_block_ban_durations(mut self, durations: impl IntoIterator<Item = (String, Duration)>) -> Self {
+        self.block_bans.extend(durations);
+        self
+    }
+
+    /// Like [`Self::classify`] but also returns the rule name and the ban
+    /// duration to use when the policy is `Block`.
+    pub fn classify_rule(&mut self, user_agent: &str, source_ip: &str) -> Option<BotMatch> {
+        let policy = self.classify(user_agent, source_ip)?;
+        let mut end = user_agent.len().min(MAX_TRACKED_UA_BYTES);
+        while !user_agent.is_char_boundary(end) { end -= 1; }
+        let ua_lower = user_agent[..end].to_lowercase();
+        let rule = self.rules.iter().find(|r| {
+            !r.ua_contains.trim().is_empty() && ua_lower.contains(&r.ua_contains.to_lowercase())
+        })?;
+        Some(BotMatch {
+            policy,
+            name: rule.name.clone(),
+            block_ban: self.block_bans.get(&rule.name).copied().unwrap_or(DEFAULT_BLOCK_BAN),
+        })
     }
 
     /// Match an event's User-Agent against known bot rules.
@@ -376,5 +464,45 @@ mod tests {
         let mut reg = BotRegistry::new(rules);
         assert!(reg.set_policy("Bingbot", BotPolicy::Allow));
         assert_eq!(reg.rules[0].policy, BotPolicy::Monitor);
+    }
+
+    #[test]
+    fn classify_rule_reports_name_and_block_duration() {
+        let mut reg = BotRegistry::new(vec![
+            BotRule { name: "BadBot".into(), ua_contains: "badbot".into(), org: String::new(), policy: BotPolicy::Block },
+            BotRule { name: "Googlebot".into(), ua_contains: "googlebot".into(), org: String::new(), policy: BotPolicy::Allow },
+        ])
+        .with_block_ban_durations([("BadBot".to_string(), Duration::from_secs(600))]);
+        let m = reg.classify_rule("Mozilla/5.0 BadBot/1.0", "100.64.0.1").unwrap();
+        assert_eq!(m.policy, BotPolicy::Block);
+        assert_eq!(m.name, "BadBot");
+        assert_eq!(m.block_ban, Duration::from_secs(600));
+        // Allow is downgraded to Monitor: never a block.
+        let g = reg.classify_rule("Googlebot/2.1", "100.64.0.2").unwrap();
+        assert_eq!(g.policy, BotPolicy::Monitor);
+        assert!(reg.classify_rule("Mozilla/5.0 Firefox", "100.64.0.3").is_none());
+    }
+
+    #[test]
+    fn from_rule_configs_maps_policy_and_default_duration() {
+        let cfgs = vec![
+            crate::config::BotRuleConfig {
+                name: "Scraper".into(),
+                ua_contains: "scrapy".into(),
+                org: String::new(),
+                policy: "BLOCK".into(),
+                ban_duration_secs: None,
+            },
+            crate::config::BotRuleConfig {
+                name: "Short".into(),
+                ua_contains: "shortbot".into(),
+                org: String::new(),
+                policy: "block".into(),
+                ban_duration_secs: Some(300),
+            },
+        ];
+        let mut reg = BotRegistry::from_rule_configs(&cfgs);
+        assert_eq!(reg.classify_rule("Scrapy/2.11", "100.64.0.1").unwrap().block_ban, DEFAULT_BLOCK_BAN);
+        assert_eq!(reg.classify_rule("ShortBot", "100.64.0.1").unwrap().block_ban, Duration::from_secs(300));
     }
 }

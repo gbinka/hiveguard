@@ -72,6 +72,17 @@ const POW_DIFFICULTY: u8 = 16;
 /// anti-entropy digest exchange.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Persistent digest mismatches are expected (records one side can never
+/// accept: permanent, too wide, whitelisted, independently detected, …).
+/// Report them at INFO at most this often, with a count; every round is DEBUG.
+const DIGEST_MISMATCH_REPORT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// A pinned seed unreachable for this long gets one WARN (then one per
+/// [`SEED_UNREACHABLE_REPEAT`]) so a retired host left in `node.seeds` is
+/// visible in a daily journal review.
+const SEED_UNREACHABLE_WARN_AFTER: Duration = Duration::from_secs(60 * 60);
+const SEED_UNREACHABLE_REPEAT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Cheap-to-clone handle the pipeline uses to announce locally-issued bans to
 /// the cluster. Dropping all clones does not stop the cluster (the actor task
 /// owns its own lifecycle and shuts down on the watch channel).
@@ -316,6 +327,8 @@ pub async fn spawn_cluster(
         remote_policy: config.trust.clone(),
         count_window: std::time::Instant::now(),
         ban_counts: HashMap::new(),
+        digest_mismatches: HashMap::new(),
+        seed_outages: HashMap::new(),
         connections: HashMap::new(),
         dialing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         state,
@@ -369,6 +382,10 @@ struct ClusterActor {
     count_window: std::time::Instant,
     /// node_id → number of ban records received (anti-poison quarantine input).
     ban_counts: HashMap<String, usize>,
+    /// peer → (mismatching rounds since last INFO report, time of that report).
+    digest_mismatches: HashMap<String, (u64, Option<std::time::Instant>)>,
+    /// seed address → (unreachable since, last WARN).
+    seed_outages: HashMap<String, (std::time::Instant, Option<std::time::Instant>)>,
     connections: HashMap<String, quinn::Connection>,
     /// Addresses with an in-flight dial, to avoid pile-ups.
     dialing: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -516,7 +533,13 @@ impl ClusterActor {
                     .coordinator
                     .handle_digest_exchange(&merkle_root, &local_bans, &from)
                 {
+                    self.note_digest_mismatch(&from, std::time::Instant::now());
                     self.send_to(&from, ClusterMessage::DiffRequest { missing_keys });
+                } else if let Some((count, _)) = self.digest_mismatches.get_mut(&from) {
+                    if *count > 0 {
+                        info!(peer = %from, rounds = *count, "cluster: ban digests converged with peer");
+                    }
+                    *count = 0;
                 }
             }
             ClusterMessage::DiffRequest { missing_keys } => {
@@ -538,6 +561,7 @@ impl ClusterActor {
                 let mut missing: Vec<_> = missing
                     .into_iter()
                     .filter(|r| !matches!(r.source, BanSource::ClusterPeer(_)))
+                    .filter(|r| r.expires_at.is_some())
                     .collect();
                 missing.sort_by_key(|r| r.subject.to_string());
                 let offset = self.diff_offsets.entry(from.clone()).or_default();
@@ -546,6 +570,12 @@ impl ClusterActor {
                     missing.rotate_left(*offset % len);
                     missing.truncate(256);
                     *offset = (*offset + missing.len()) % len;
+                    let now = chrono::Utc::now();
+                    let max_secs = self.announce_max_secs();
+                    let missing = missing
+                        .iter()
+                        .filter_map(|r| announced_form(r, max_secs, now))
+                        .collect();
                     self.send_signed_bans(vec![from.clone()], missing);
                 }
             }
@@ -610,8 +640,83 @@ impl ClusterActor {
         if matches!(rec.source, BanSource::ClusterPeer(_)) {
             return;
         }
+        // Long local bans are announced as a bounded window (the local ban
+        // itself keeps its full lifetime); permanent ones never replicate.
+        let Some(rec) = announced_form(&rec, self.announce_max_secs(), chrono::Utc::now()) else {
+            debug!(subject = %rec.subject, "cluster: local ban not announceable (permanent/expired)");
+            return;
+        };
         let targets = self.connections.keys().cloned().collect();
         self.send_signed_bans(targets, vec![rec]);
+    }
+
+    /// Longest lifetime a peer accepts (`trust.remote_max_ttl_secs`, default
+    /// 24 h — also the hard-coded default of older builds).
+    fn announce_max_secs(&self) -> i64 {
+        i64::try_from(self.remote_policy.remote_max_ttl_secs).unwrap_or(i64::MAX)
+    }
+
+    fn note_digest_mismatch(&mut self, peer: &str, now: std::time::Instant) {
+        let entry = self
+            .digest_mismatches
+            .entry(peer.to_string())
+            .or_insert((0, None));
+        entry.0 += 1;
+        let due = entry
+            .1
+            .is_none_or(|last| now.duration_since(last) >= DIGEST_MISMATCH_REPORT_INTERVAL);
+        if due {
+            info!(
+                peer = %peer,
+                rounds = entry.0,
+                "cluster: ban digest differs from peer — anti-entropy exchanging diffs \
+                 (expected while either side holds records the other does not accept; \
+                 reported at most every 30 min)"
+            );
+            *entry = (0, Some(now));
+        } else {
+            debug!(peer = %peer, "cluster: digest mismatch — requesting diff");
+        }
+    }
+
+    /// Track pinned seeds that stay unreachable and WARN once they exceed
+    /// [`SEED_UNREACHABLE_WARN_AFTER`] (repeated every 24 h).
+    fn track_seed_outage(&mut self, seed: &Seed, connected: bool, now: std::time::Instant) {
+        // Unpinned seeds cannot be mapped to a node id before the handshake.
+        let Some(fp) = &seed.fingerprint else { return };
+        if *fp == self.node_id {
+            return;
+        }
+        if connected {
+            if let Some((since, warned)) = self.seed_outages.remove(&seed.raw_addr) {
+                if warned.is_some() {
+                    info!(
+                        seed = %seed.raw_addr,
+                        hours = now.duration_since(since).as_secs() / 3600,
+                        "cluster: seed reachable again"
+                    );
+                }
+            }
+            return;
+        }
+        let (since, last_warn) = self
+            .seed_outages
+            .entry(seed.raw_addr.clone())
+            .or_insert((now, None));
+        let down = now.duration_since(*since);
+        let due = down >= SEED_UNREACHABLE_WARN_AFTER
+            && last_warn.is_none_or(|last| now.duration_since(last) >= SEED_UNREACHABLE_REPEAT);
+        if due {
+            warn!(
+                seed = %seed.raw_addr,
+                fingerprint = %fp,
+                hours = down.as_secs() / 3600,
+                "cluster: seed unreachable for {} h — if the host was retired, remove it from \
+                 node.seeds and node.founder_nodes",
+                down.as_secs() / 3600
+            );
+            *last_warn = Some(now);
+        }
     }
 
     fn on_probe(&mut self) {
@@ -656,6 +761,7 @@ impl ClusterActor {
 
     fn on_maintenance(&mut self) {
         // 1. (Re)dial seeds we are not currently connected to.
+        let now = std::time::Instant::now();
         for seed in self.seeds.clone() {
             let connected = match &seed.fingerprint {
                 Some(fp) => self.connections.contains_key(fp),
@@ -664,6 +770,7 @@ impl ClusterActor {
                 // peers at all" to bootstrap, then rely on SWIM afterwards.
                 None => !self.connections.is_empty(),
             };
+            self.track_seed_outage(&seed, connected, now);
             if connected {
                 continue;
             }
@@ -864,6 +971,46 @@ impl ClusterActor {
     }
 }
 
+/// The form in which a local ban is offered to peers, or `None` if it must
+/// not be offered at all.
+///
+/// Peers accept only records whose lifetime and remaining TTL are both
+/// `<= trust.remote_max_ttl_secs` (24 h by default, in every released build).
+/// A longer local ban (path_probe/scanner 72 h, ssh 48 h, …) is therefore
+/// offered as a fixed window: lifetime is cut into consecutive `max_secs`
+/// slices starting at `created_at` and the slice containing `now` is announced
+/// (`created_at' = created_at + k·max`, `expires_at' = min(expires_at,
+/// created_at' + max)`). Within a slice the record is byte-identical, so the
+/// PoW/signature come from the `SigningCache` (one new stamp per long ban per
+/// slice, not per anti-entropy round). When the peer's copy expires at a slice
+/// boundary, anti-entropy sends the next slice. Bans no longer than `max_secs`
+/// are returned unchanged (same signatures as before this change).
+///
+/// Permanent bans are never offered: every build rejects them
+/// (`remote_policy_allows`), and offering them only costs PoW. Expired ones
+/// neither. The prefix limit stays the receiver's decision.
+fn announced_form(
+    record: &BanRecord,
+    max_secs: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<BanRecord> {
+    let expiry = record.expires_at?;
+    if expiry <= now || expiry <= record.created_at || max_secs <= 0 {
+        return None;
+    }
+    let max = chrono::Duration::seconds(max_secs);
+    if expiry.signed_duration_since(record.created_at) <= max {
+        return Some(record.clone());
+    }
+    let elapsed = now.signed_duration_since(record.created_at).num_seconds().max(0);
+    let slice = elapsed / max_secs;
+    let created_at = record.created_at + chrono::Duration::seconds(slice.checked_mul(max_secs)?);
+    let mut windowed = record.clone();
+    windowed.created_at = created_at;
+    windowed.expires_at = Some(expiry.min(created_at + max));
+    Some(windowed)
+}
+
 /// A finite, locally configured blast-radius limit, applied before quorum.
 fn remote_policy_allows(
     policy: &TrustConfig,
@@ -1021,6 +1168,88 @@ mod security_tests {
         ban.created_at = now + chrono::Duration::days(2);
         ban.expires_at = Some(ban.created_at + chrono::Duration::hours(1));
         assert!(!remote_policy_allows(&policy, &ban, now));
+    }
+
+    fn local(subject: &str, created_ago_h: i64, ttl_h: Option<i64>) -> BanRecord {
+        let now = chrono::Utc::now();
+        let mut rec = record(subject);
+        rec.source = BanSource::LocalDetector("path_probe".into());
+        rec.created_at = now - chrono::Duration::hours(created_ago_h);
+        rec.expires_at = ttl_h.map(|h| rec.created_at + chrono::Duration::hours(h));
+        rec
+    }
+
+    #[test]
+    fn long_local_bans_are_announced_as_a_window_peers_accept() {
+        let policy = TrustConfig::default();
+        let max = policy.remote_max_ttl_secs as i64;
+        let now = chrono::Utc::now();
+        // (created hours ago, ttl hours) → expected announced (created offset, lifetime)
+        for (ago, ttl, slice_start_h, lifetime_h) in [
+            (0, 72, 0, 24),   // fresh path_probe/scanner ban
+            (30, 72, 24, 24), // second day of a 72 h ban
+            (50, 72, 48, 24), // last slice: expiry = original expiry
+            (10, 48, 0, 24),  // ssh 48 h
+            (25, 26, 24, 2),  // tail shorter than a slice
+        ] {
+            let rec = local("100.64.1.7/32", ago, Some(ttl));
+            assert!(!remote_policy_allows(&policy, &rec, now), "precondition: raw ban rejected");
+            let out = announced_form(&rec, max, now).expect("announceable");
+            assert_eq!(out.created_at, rec.created_at + chrono::Duration::hours(slice_start_h));
+            assert_eq!(
+                out.expires_at.unwrap(),
+                rec.expires_at.unwrap().min(out.created_at + chrono::Duration::hours(24))
+            );
+            assert_eq!(
+                out.expires_at.unwrap().signed_duration_since(out.created_at),
+                chrono::Duration::hours(lifetime_h)
+            );
+            assert!(out.expires_at.unwrap() <= rec.expires_at.unwrap());
+            assert!(remote_policy_allows(&policy, &out, now), "ago={ago} ttl={ttl}");
+            // Everything else is untouched (subject, reason, evidence, source).
+            assert_eq!((out.subject, &out.reason, out.severity), (rec.subject, &rec.reason, rec.severity));
+        }
+    }
+
+    #[test]
+    fn announced_window_is_stable_within_a_slice_so_pow_is_cached() {
+        let max = TrustConfig::default().remote_max_ttl_secs as i64;
+        let rec = local("100.64.1.8/32", 30, Some(72));
+        let now = chrono::Utc::now();
+        let a = announced_form(&rec, max, now).unwrap();
+        let b = announced_form(&rec, max, now + chrono::Duration::hours(5)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(GossipEngine::record_key(&a), GossipEngine::record_key(&b));
+        let next = announced_form(&rec, max, now + chrono::Duration::hours(20)).unwrap();
+        assert_ne!(a.created_at, next.created_at);
+    }
+
+    #[test]
+    fn short_permanent_and_expired_bans() {
+        let policy = TrustConfig::default();
+        let max = policy.remote_max_ttl_secs as i64;
+        let now = chrono::Utc::now();
+        let short = local("100.64.1.9/32", 1, Some(24));
+        assert_eq!(announced_form(&short, max, now), Some(short));
+        assert!(announced_form(&local("100.64.1.10/32", 1, None), max, now).is_none());
+        assert!(announced_form(&local("100.64.1.11/32", 80, Some(72)), max, now).is_none());
+    }
+
+    #[test]
+    fn subnet_scope_limits_for_replication() {
+        let policy = TrustConfig::default();
+        let now = chrono::Utc::now();
+        let max = policy.remote_max_ttl_secs as i64;
+        // /24 v4 and /64 v6 (single-host equivalent) replicate, also when long.
+        for subject in ["100.64.2.0/24", "2001:db8:1:2::/64", "2001:db8:1::/48"] {
+            let out = announced_form(&local(subject, 0, Some(72)), max, now).unwrap();
+            assert!(remote_policy_allows(&policy, &out, now), "{subject}");
+        }
+        // Wider than /24 (v4) or /48 (v6) never replicates.
+        for subject in ["100.64.0.0/23", "2001:db8::/47"] {
+            let out = announced_form(&local(subject, 0, Some(12)), max, now).unwrap();
+            assert!(!remote_policy_allows(&policy, &out, now), "{subject}");
+        }
     }
 
     #[test]
